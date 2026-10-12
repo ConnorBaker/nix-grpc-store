@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -25,7 +26,6 @@
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/strings.hh>
-#include <nix/util/util.hh>
 #include <nix/util/environment-variables.hh>
 
 #include "acl.hh"
@@ -47,6 +47,25 @@ auto parseLogLevel(std::string_view value) -> LogLevel
         throw nix::Error("--log-level must be 'info' or 'debug'");
     }
     return LogLevel::info;
+}
+
+auto parseSize(std::string_view value) -> uint64_t
+{
+    constexpr std::string_view units = "KMGT";
+    constexpr unsigned bitsPerUnit = 10;
+    unsigned shift = 0;
+    if (!value.empty()) {
+        auto unit = units.find(static_cast<char>(std::toupper(static_cast<unsigned char>(value.back()))));
+        if (unit != std::string_view::npos) {
+            shift = static_cast<unsigned>(unit + 1) * bitsPerUnit;
+            value.remove_suffix(1);
+        }
+    }
+    auto number = parseInt<uint64_t>(value);
+    if (!number || *number > (UINT64_MAX >> shift)) {
+        throw nix::Error("--min-free expects an integer with optional K/M/G/T suffix");
+    }
+    return *number << shift;
 }
 
 auto localHostName() -> std::string
@@ -181,7 +200,7 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         } else if (arg == "--sandbox-write") {
             options.sandboxWrite.emplace_back(next());
         } else if (arg == "--min-free") {
-            options.minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
+            options.minFree = parseSize(next());
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
