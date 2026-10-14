@@ -1662,3 +1662,76 @@ fn an_upload_cut_off_after_longer_than_the_restart_grace_is_retried() {
     // Cut off after the builder took the paths: a reset, no envoy reply.
     assert_journal(CLIENT, "held", ", retrying");
 }
+
+#[test]
+fn a_builder_stopped_mid_upload_lets_it_land_and_the_build_moves_on() {
+    farm_ready();
+    let big = succeed(
+        CLIENT,
+        &[
+            "sh",
+            "-c",
+            "head -c 16M /dev/urandom > /tmp/big && nix-store --add /tmp/big",
+        ],
+    )
+    .trim()
+    .to_string();
+    // ~16 s for the upload, so the stop lands while it is in flight.
+    succeed(
+        CLIENT,
+        &[
+            "tc", "qdisc", "add", "dev", "eth1", "root", "tbf", "rate", "8mbit", "burst", "32kbit",
+            "latency", "400ms",
+        ],
+    );
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "up",
+            "nix",
+            "build",
+            "--store",
+            // A worker leaving is not the job's fault, so no retry is spent on it.
+            &format!("{}&reschedule-retries=0", envoy()),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("DEP"),
+            "job",
+            "--argstr",
+            "tag",
+            "drain-upload",
+            "--argstr",
+            "inputPath",
+            &big,
+        ],
+    );
+    let uploading = |w: Node| gauge(w, r#"nix_grpc_inflight{kind="AddMultipleToStore"}"#) > 0;
+    let mut busy = None;
+    retry(60, "an upload is in flight", || {
+        busy = WORKERS.into_iter().find(|&w| uploading(w));
+        busy.is_some()
+    });
+    let busy = busy.unwrap();
+    let landed = || journal_count(busy, UNIT, "event=rpc method=AddMultipleToStore");
+    let landed0 = landed();
+    // Like a CI job leaving: one SIGTERM, nothing building there.
+    succeed(
+        busy,
+        &["systemctl", "stop", "--no-block", "nix-grpc-daemon.service"],
+    );
+    wait_unit_done("up", 180);
+    succeed(CLIENT, &["tc", "qdisc", "del", "dev", "eth1", "root"]);
+    assert_unit_success("up");
+    assert_no_journal(CLIENT, "up", "Cancelling all calls");
+    // The stopping builder took the upload in and answered it (published to
+    // niks3 too), rather than the client sending it again elsewhere.
+    assert!(
+        landed() > landed0,
+        "the stopping builder did not answer the upload in flight: {}",
+        journal(busy, UNIT)
+    );
+    restart_daemon(busy);
+}

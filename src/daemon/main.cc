@@ -523,7 +523,7 @@ public:
             nixgrpc::Metrics::Held const held(metrics, "AddMultipleToStore");
             nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
             std::vector<std::string> imported;
-            auto const cancelled = [&] -> bool { return context->IsCancelled() || stopping(); };
+            auto const cancelled = [&] -> bool { return context->IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; };
             auto const stats = importUploads(*localStore, source, repair, checkSigs, cancelled, imported);
             holdForSession(
                 rpc,
@@ -1132,11 +1132,15 @@ public:
 } // namespace
 
 namespace {
-// Claimed leases count too: their clients may still be uploading.
+// Claimed leases count too: their clients may still be uploading. So do
+// uploads in flight: Shutdown() would cut them off, and the client would
+// send them all again elsewhere.
 auto drained(nixgrpc::Coordinator & coord, nixgrpc::Metrics & metrics) -> bool
 {
     return (!coord.builder || coord.builder->holding() == 0)
-           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars") == 0;
+           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars")
+                      + metrics.inflightNow("AddMultipleToStore")
+                  == 0;
 }
 
 using nixgrpc::logLine;
