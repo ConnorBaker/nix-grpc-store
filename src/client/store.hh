@@ -215,6 +215,20 @@ public:
     auto openStore() const -> ref<Store> override;
 };
 
+// A failed RPC. Keeps the status, so that a caller can tell a worker that
+// left from a real error.
+struct GrpcStatusError : Error
+{
+    grpc::Status status;
+
+    template<typename... Args>
+    explicit GrpcStatusError(grpc::Status status, const std::string & format, const Args &... args)
+        : Error(format, args...)
+        , status(std::move(status))
+    {
+    }
+};
+
 // NOLINTNEXTLINE(misc-multiple-inheritance): inherited from Nix's store hierarchy
 struct GrpcStore : virtual RemoteStore
 {
@@ -261,7 +275,7 @@ private:
     auto connectHint(const std::string & msg) const -> std::string
 ;
 
-    auto statusError(const grpc::Status & status, const char * opName) const -> Error
+    auto statusError(const grpc::Status & status, const char * opName) const -> GrpcStatusError
 ;
 
     void checkStatus(const grpc::Status & status, const char * opName) const
@@ -502,6 +516,7 @@ public:
 
         struct Bounced {
       bool refused = false; // the worker answered that it cannot serve builds now, or was not reachable
+      bool left = false;    // it went away or did not take the build: see exec::Bounce
     };
         struct MissingInput {
       StorePath path;
