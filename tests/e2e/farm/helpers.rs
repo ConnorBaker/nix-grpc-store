@@ -404,3 +404,18 @@ pub fn build_dep_job(store: &str, tag: &str, job_features: &str, nondet: bool, s
         secs,
     )
 }
+
+/// Starts `w`'s daemon again unless it runs, then waits for the farm to settle.
+pub fn restart_daemon(w: Node) {
+    wait_until_succeeds(
+        w,
+        &[
+            "sh",
+            "-c",
+            "systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
+        ],
+        60,
+    );
+    wait_members(&system(), &WORKERS);
+    retry(90, "scheduler settled", settled);
+}
