@@ -122,9 +122,11 @@ public:
              .dependants = {},
              .failedInput = {},
              .bounced = 0,
+             .waits = 0,
              .leftBy = {},
              .refused = 0,
-             .followed = false});
+             .followed = false,
+             .refundable = {}});
         remaining++;
         size_t waiting = 0;
         for (auto const input : inputs) {
@@ -157,6 +159,7 @@ public:
             return;
         }
         jobs.at(input).dependants.push_back(jid);
+        job.refundable.reset();
         // Re-placed while waiting, it could hold the only slot that can build
         // the input.
         unfollow(jid);
@@ -272,6 +275,10 @@ public:
         }
         if (std::holds_alternative<state::Wanted>(job.state)) {
             progressed++;
+            if (auto const left = std::exchange(job.refundable, std::nullopt);
+                left && left->addr == placement.addr && left->assignId == placement.assignId) {
+                job.bounced--; // that worker still holds the build, only our stream to it broke
+            }
             to(jid, state::Assigned{.at = std::move(placement)});
             ready.push_back(jid);
         }
@@ -378,6 +385,11 @@ public:
             return;
         }
         bool const free = why.left && job.leftBy.insert(run->at.addr).second;
+        // Refunded if the scheduler sends us back to that very placement.
+        job.refundable.reset();
+        if (!free && !why.refused) {
+            job.refundable = run->at;
+        }
         if (!free && ++job.bounced > cfg.rescheduleRetries) {
             settle(
                 jid,
@@ -388,8 +400,9 @@ public:
         }
         job.refused = why.refused ? run->at.assignId : 0;
         // The scheduler may know no better worker than the one that just failed.
-        if (!free && job.bounced > 1 && !abandoned && !stopping) {
-            to(jid, state::Resting{.until = now + retryPause(job.bounced - 1)});
+        // Refunded bounces wait too: the worker may be out of reach for a while.
+        if (!free && ++job.waits > 1 && !abandoned && !stopping) {
+            to(jid, state::Resting{.until = now + retryPause(job.waits - 1)});
             return;
         }
         to(jid, state::Blocked{.waiting = 0});
@@ -420,11 +433,15 @@ private:
         std::vector<JobId> dependants;
         std::optional<JobId> failedInput;
         unsigned bounced;
+        unsigned waits; // counted bounces, refunded or not: how long the next one waits
         std::set<std::string> leftBy; // workers that went away or did not take it
         uint64_t refused; // assignment to name in the next Want
         // We sent a Want and no Cancel since. While set, the scheduler may
         // keep the job queued or placed for us.
         bool followed;
+        // A counted bounce off this placement: the build there may outlive
+        // our stream to it.
+        std::optional<Placement> refundable;
     };
 
     Config cfg;
