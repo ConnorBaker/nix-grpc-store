@@ -500,6 +500,13 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "AddMultipleToStore", nixgrpc::Role::write);
+            // The inputs of a drv this builder expects (x-nix-drv): a call for
+            // it, which keeps its Expect however long the upload takes.
+            std::optional<nixgrpc::Builder::Call> forDrv;
+            if (auto const drv = context->client_metadata().find("x-nix-drv");
+                coord.builder && drv != context->client_metadata().end()) {
+                forDrv.emplace(*coord.builder, std::string(drv->second.data(), drv->second.size()));
+            }
             auto localStore = openScopedStore();
 
             nix::remote::AddMultipleChunk first;
@@ -860,7 +867,7 @@ public:
         auto const drvName = std::string(drvPath.to_string());
         // The client is here: the lease holds through its upload. NOT_FOUND
         // makes it upload the closure and retry, so admit comes after.
-        builder.claim(drvName);
+        nixgrpc::Builder::Call const call(builder, drvName);
         if (!localStore.isValidPath(drvPath)) {
             try {
                 nixcompat::ensurePath(localStore, drvPath);

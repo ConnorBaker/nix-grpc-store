@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <variant>
@@ -23,6 +24,17 @@ struct Placement
     std::string addr;
     uint64_t assignId = 0;
     std::string system; // the worker's native one, empty from older schedulers
+};
+
+// Why a worker bounced a job, read off the call's status (build.cc).
+struct Bounce
+{
+    // The worker never got the call, turned it down or gave the build back:
+    // the next Want names the placement, and the scheduler places the job
+    // elsewhere instead of sending it back there.
+    bool notTaken = false;
+    // The worker went away under the call.
+    bool gone = false;
 };
 
 enum class Outcome : uint8_t {
@@ -95,7 +107,14 @@ public:
     auto add(double prio, const std::vector<JobId> & inputs) -> JobId
     {
         auto const jid = static_cast<JobId>(jobs.size());
-        jobs.push_back({.state = state::Blocked{.waiting = 0}, .prio = prio, .dependants = {}, .failedInput = {}, .bounced = 0});
+        jobs.push_back(
+            {.state = state::Blocked{.waiting = 0},
+             .prio = prio,
+             .dependants = {},
+             .failedInput = {},
+             .bounced = 0,
+             .leftBy = {},
+             .bouncedAssignId = 0});
         remaining++;
         size_t waiting = 0;
         for (auto const input : inputs) {
@@ -128,6 +147,7 @@ public:
             return;
         }
         jobs.at(input).dependants.push_back(jid);
+        job.bouncedAssignId = 0;
         // Placed again while it waits, it would hold a slot, maybe the only
         // one the input can build in: the scheduler forgets it until then.
         if (stream) {
@@ -149,6 +169,12 @@ public:
     [[nodiscard]] auto remainingJobs() const -> size_t
     {
         return remaining;
+    }
+
+    // For the next Want: the placement whose worker did not take the job.
+    [[nodiscard]] auto bouncedAssignId(JobId jid) const -> uint64_t
+    {
+        return jobs.at(jid).bouncedAssignId;
     }
 
     // A reconnect budget restarts when this moved.
@@ -235,6 +261,7 @@ public:
         }
         if (std::holds_alternative<state::Wanted>(job.state)) {
             progressed++;
+            job.bouncedAssignId = 0;
             to(jid, state::Assigned{.at = std::move(placement)});
             ready.push_back(jid);
         }
@@ -314,7 +341,9 @@ public:
         }
     }
 
-        void bounced(JobId jid)
+    // Not the job's fault, a worker that went away or did not take it: the
+    // first such bounce per worker does not count against reschedule-retries.
+        void bounced(JobId jid, Bounce why = {})
     {
         auto & job = jobs.at(jid);
         auto * run = std::get_if<state::Running>(&job.state);
@@ -327,7 +356,9 @@ public:
             ready.push_back(jid);
             return;
         }
-        if (++job.bounced > cfg.rescheduleRetries) {
+        bool const free = (why.gone || why.notTaken) && job.leftBy.insert(run->at.addr).second;
+        job.bouncedAssignId = why.notTaken ? run->at.assignId : 0;
+        if (!free && ++job.bounced > cfg.rescheduleRetries) {
             settle(
                 jid,
                 {.outcome = Outcome::gaveUp,
@@ -360,6 +391,8 @@ private:
         std::vector<JobId> dependants;
         std::optional<JobId> failedInput;
         unsigned bounced;
+        std::set<std::string> leftBy; // workers that went away or did not take it
+        uint64_t bouncedAssignId;
     };
 
     Config cfg;

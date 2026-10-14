@@ -2,6 +2,7 @@
 // in-memory session (no gRPC).
 
 #include <cassert>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <exception>
@@ -21,6 +22,7 @@ volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
 using nix::remote::Done;
 using nix::remote::WorkerMsg;
 using nixgrpc::Builder;
+using nixgrpc::Clock;
 using nixgrpc::Metrics;
 using nixgrpc::Options;
 
@@ -28,6 +30,8 @@ using nixgrpc::Options;
 namespace {
 
 constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+constexpr auto drvB = "/nix/store/11111111111111111111111111111111-b.drv";
+constexpr auto past = std::chrono::seconds(61); // Builder's expectTimeout is 60 s
 
 auto expect(const char * drv, uint64_t assignId) -> nix::remote::Expect
 {
@@ -95,12 +99,92 @@ void testExpectWhileDrainingIsGivenBackLater()
     assert(builder.holding() == 0);
 }
 
+// A client that reached the builder for a drv and went away without building
+// it (bounced elsewhere, or sent to a successor that took the node over) left
+// a claimed Expect nobody else ends. Once no call for it is in flight and
+// expectTimeout has passed, it is given back; one with a call in flight
+// stays.
+void testQuietClaimIsGivenBack()
+{
+    auto const opts = options();
+    Metrics metrics{""};
+    Builder builder(opts, metrics);
+    Session session;
+    session.attach(builder);
+    builder.onExpect(expect(drvA, 1));
+    builder.onExpect(expect(drvB, 2));
+    builder.claim(drvA);
+    builder.callEnded(drvA); // say NOT_FOUND: the client was to upload and retry
+    builder.claim(drvB);     // still in its call
+    auto const now = Clock::now();
+    builder.tick(now + std::chrono::seconds(30));
+    assert(session.dones().empty() && builder.holding() == 2);
+    builder.tick(now + past);
+    auto const dones = session.dones();
+    assert(dones.size() == 1 && dones[0].drv_path() == drvA && dones[0].assign_id() == 1);
+    assert(dones[0].outcome() == Done::GIVEN_BACK && dones[0].reason() == Done::UNREACHABLE);
+    assert(builder.holding() == 1);
+    builder.callEnded(drvB);
+    builder.tick(Clock::now() + past);
+    assert(session.dones().size() == 2 && builder.holding() == 0);
+}
+
+// Draining keeps a claimed Expect while its client may still upload, and
+// gives it back once that client has gone quiet, so the drain can end.
+void testDrainingGivesBackAQuietClaim()
+{
+    auto const opts = options();
+    Metrics metrics{""};
+    Builder builder(opts, metrics);
+    Session session;
+    session.attach(builder);
+    builder.onExpect(expect(drvA, 1));
+    builder.claim(drvA);
+    builder.callEnded(drvA);
+    builder.setDraining(true);
+    builder.tick();
+    assert(session.dones().empty() && builder.holding() == 1);
+    builder.tick(Clock::now() + past);
+    auto const dones = session.dones();
+    assert(dones.size() == 1 && dones[0].reason() == Done::DRAINING);
+    assert(builder.holding() == 0);
+}
+
+// A client claimed drvA (NOT_FOUND) and uploads its inputs to this builder
+// (x-nix-drv, a Call) for longer than expectTimeout. The claim stays while
+// the upload runs, and the end of the upload is the client's latest call:
+// the next tick keeps the claim, and only expectTimeout after that does a
+// quiet claim go.
+void testUploadKeepsTheClaim()
+{
+    auto const opts = options();
+    Metrics metrics{""};
+    Builder builder(opts, metrics);
+    Session session;
+    session.attach(builder);
+    builder.onExpect(expect(drvA, 1));
+    builder.claim(drvA);
+    builder.callEnded(drvA);
+    {
+        Builder::Call const upload(builder, drvA);
+        builder.tick(Clock::now() + past);
+        assert(session.dones().empty() && builder.holding() == 1);
+    }
+    builder.tick(Clock::now() + std::chrono::milliseconds(1));
+    assert(session.dones().empty() && builder.holding() == 1);
+    builder.tick(Clock::now() + past);
+    assert(session.dones().size() == 1 && builder.holding() == 0);
+}
+
 } // namespace
 // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access)
 
 auto main() -> int
 try {
     testExpectWhileDrainingIsGivenBackLater();
+    testQuietClaimIsGivenBack();
+    testDrainingGivesBackAQuietClaim();
+    testUploadKeepsTheClaim();
     return 0;
 } catch (std::exception & err) {
     std::cerr << err.what() << '\n';

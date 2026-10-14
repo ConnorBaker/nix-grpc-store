@@ -54,6 +54,7 @@ struct Expected
     // a give-back or a Revoke: the scheduler revokes it if its client leaves.
     bool claimed = false;
     bool running = false;
+    uint32_t calls = 0; // calls for it in flight (Call); `since` is when the last one began or ended
 
     // Second BuildDerivation for the same drv attaches here.
     struct Shared
@@ -103,7 +104,8 @@ public:
         bool attach = false;
     };
 
-    // Any BuildDerivation for the drv, also one answered NOT_FOUND.
+    // A call for the drv: any BuildDerivation, also one answered NOT_FOUND,
+    // and an upload of its inputs (x-nix-drv).
     void claim(const std::string & drvPath);
     auto admit(const std::string & drvPath) -> std::optional<Admission>;
     void finished(
@@ -135,8 +137,37 @@ public:
     // scheduler the new capacity. Called from the serve loop.
     void reloadNixConfig();
 
-    // Give back unclaimed Expects nobody came for. Called from the serve loop.
+    // Give back Expects nobody came for, or whose client went quiet. Called
+    // from the serve loop; `now` for tests.
     void tick();
+    void tick(Clock::time_point now);
+    // A call that claimed `drvPath` returns, however it went.
+    void callEnded(const std::string & drvPath);
+
+    // A call for a drv, from claim() to callEnded().
+    class Call
+    {
+        Builder & builder;
+        std::string drvPath;
+
+    public:
+        Call(Builder & builder, std::string drvPath)
+            : builder(builder)
+            , drvPath(std::move(drvPath))
+        {
+            builder.claim(this->drvPath);
+        }
+
+        Call(const Call &) = delete;
+        Call(Call &&) = delete;
+        auto operator=(const Call &) -> Call & = delete;
+        auto operator=(Call &&) -> Call & = delete;
+
+        ~Call()
+        {
+            builder.callEnded(drvPath);
+        }
+    };
 
     // Swapped by the session thread on every (re)connect.
     void setSend(SendFn send);
@@ -166,7 +197,7 @@ private:
         const std::vector<std::pair<std::string, uint64_t>> & outputs,
         nix::remote::Done::Reason reason = nix::remote::Done::REASON_UNSPECIFIED);
     void giveBack(const std::vector<std::pair<std::string, uint64_t>> & drvs, nix::remote::Done::Reason reason);
-    auto takeUnclaimed(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>;
+    auto take(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>;
 };
 
 // gRPC front for the Dispatcher: auth, then pump the stream into it.

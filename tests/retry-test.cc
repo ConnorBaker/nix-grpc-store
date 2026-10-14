@@ -32,11 +32,36 @@ void classifiesFarmErrors()
     assert(nixgrpc::streamBroken({grpc::StatusCode::UNKNOWN, "Stream removed (Socket closed)"}));
 }
 
+// An upload to the assigned worker that ends with one of these sends the
+// build to the scheduler again (buildAssigned, recover), as the same answer
+// to BuildDerivation does; NOT_FOUND and the like stay errors.
+void classifiesAWorkerThatLeft()
+{
+    for (auto const code :
+         {grpc::StatusCode::FAILED_PRECONDITION,
+          grpc::StatusCode::ABORTED,
+          grpc::StatusCode::UNAVAILABLE,
+          grpc::StatusCode::CANCELLED,
+          grpc::StatusCode::UNKNOWN,
+          grpc::StatusCode::INTERNAL}) {
+        assert(nixgrpc::workerLeft({code, "x"}));
+    }
+    for (auto const code :
+         {grpc::StatusCode::NOT_FOUND,
+          grpc::StatusCode::PERMISSION_DENIED,
+          grpc::StatusCode::UNAUTHENTICATED,
+          grpc::StatusCode::INVALID_ARGUMENT,
+          grpc::StatusCode::RESOURCE_EXHAUSTED}) {
+        assert(!nixgrpc::workerLeft({code, "x"}));
+    }
+}
+
 } // namespace
 
 auto main() -> int
 try {
     classifiesFarmErrors();
+    classifiesAWorkerThatLeft();
     return 0;
 } catch (...) {
     return 1;
