@@ -289,3 +289,18 @@ pub fn assert_unit_success(unit: &str) {
 pub fn wait_building() {
     retry(60, "a slow build is running", || !building().is_empty());
 }
+
+/// Starts `w`'s daemon again unless it runs, then waits for the farm to settle.
+pub fn restart_daemon(w: Node) {
+    wait_until_succeeds(
+        w,
+        &[
+            "sh",
+            "-c",
+            "systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
+        ],
+        60,
+    );
+    wait_members(&system(), &WORKERS);
+    retry(90, "scheduler settled", settled);
+}
