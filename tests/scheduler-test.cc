@@ -214,6 +214,107 @@ void testCancelAndClientGone()
     assert(!shard.cancel(9, "nope.drv"));
 }
 
+// The client could not reach w0. The drv goes to w1 once w1 has a slot, and
+// back to w0 only when nobody else can run it.
+// A drv that a client bounced off w0, and then off the worker it went to
+// next, is placed on the third, though w0 has more slots free: bounces
+// feed the same list as give-backs.
+void testBouncedOffTwiceTriesAThirdWorker()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 2);
+    auto const w1 = hello(shard, "w1", 1);
+    auto const w2 = hello(shard, "w2", 1);
+    auto const want = [&](uint64_t bounced) -> Core::WantResult {
+        return shard.want(
+            1,
+            {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = bounced},
+            0);
+    };
+    want(0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+    assert(want(out[0].assignId).bouncedOff == w0);
+    shard.dispatch(out);
+    assert(out.size() == 2 && (out[1].worker == w1 || out[1].worker == w2));
+    auto const second = out[1].worker;
+    assert(want(out[1].assignId).bouncedOff == second);
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker != w0 && out[2].worker != second);
+}
+
+// Two workers, w0 with two slots and w1 with one, and a client that
+// bounces off wherever the drv goes, five times: once both have, the one
+// it bounced off last is passed over, so they take turns rather than w0
+// getting it every time.
+void testRepeatBouncesTakeTurns()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 2);
+    auto const w1 = hello(shard, "w1", 1);
+    auto const want = [&](uint64_t bounced) -> Core::WantResult {
+        return shard.want(
+            1,
+            {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = bounced},
+            0);
+    };
+    want(0);
+    shard.dispatch(out);
+    std::vector<WorkerId> placed;
+    for (int round = 0; round < 5; round++) {
+        assert(out.size() == placed.size() + 1);
+        placed.push_back(out.back().worker);
+        assert(want(out.back().assignId).bouncedOff == placed.back());
+        shard.dispatch(out);
+    }
+    placed.push_back(out.back().worker);
+    assert((placed == std::vector<WorkerId>{w0, w1, w0, w1, w0, w1}));
+}
+
+void testBouncedOff()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    auto const w1 = hello(shard, "w1", 1);
+    shard.want(1, {.drvPath = "busy.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[0].worker == w0 && out[1].worker == w1);
+    auto const asg = out[0];
+    auto const busy = out[1];
+    // An id that is not the drv's own changes nothing.
+    auto res = shard.want(
+        1,
+        {.drvPath = "busy.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = asg.assignId},
+        0);
+    assert(res.assigned && res.assigned->first == w1 && !res.bouncedOff);
+    res = shard.want(
+        1,
+        {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = asg.assignId},
+        0);
+    assert(!res.assigned && res.bouncedOff == w0 && shard.worker(w0).running.empty());
+    out.clear();
+    shard.dispatch(out);
+    assert(out.empty()); // w0 is free but did not take it, w1 is busy
+    shard.done(w1, shard.entry(busy.drv)->drvPath, {});
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w1 && out[0].assignId != asg.assignId);
+    // Only w0 is left: it gets another try.
+    res = shard.want(
+        1,
+        {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = out[0].assignId},
+        0);
+    assert(!res.assigned && res.bouncedOff == w1);
+    shard.workerGone(w1);
+    out.clear();
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+}
+
 void testDraining()
 {
     Core shard;
@@ -519,6 +620,9 @@ try {
     testHelloReconciles();
     testHelloSupersedes();
     testCancelAndClientGone();
+    testBouncedOff();
+    testBouncedOffTwiceTriesAThirdWorker();
+    testRepeatBouncesTakeTurns();
     testDraining();
     testSetMaxJobs();
     testFeatures();

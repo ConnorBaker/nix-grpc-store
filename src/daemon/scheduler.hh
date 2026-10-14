@@ -295,7 +295,8 @@ struct Entry
     double enqMs = 0;
     double cpHint = 0;
     bool unplaceable = false; // as last told to the followers
-    // Gave it back: each used only if no other worker can run it.
+    // Gave it back, or a client bounced off it (Want.bounced_assign_id):
+    // each used only if no other worker can run it.
     std::vector<WorkerId> avoid;
 };
 
@@ -394,6 +395,7 @@ public:
     {
         DrvId drv = 0;
         std::optional<std::pair<WorkerId, uint64_t>> assigned;
+        std::optional<WorkerId> bouncedOff; // the worker the drv was taken back from
     };
 
     struct WantInfo
@@ -403,6 +405,7 @@ public:
         std::string_view system;
         std::vector<std::string> features;
         double cpHintMs = 0;
+        uint64_t bouncedAssignId = 0; // see Want.bounced_assign_id
     };
 
     // Caller handled the cache-hit case already.
@@ -432,11 +435,18 @@ public:
             follows[client].push_back(drv);
         }
         slot->cpHint = std::max(slot->cpHint, cpHintMs);
+        std::optional<WorkerId> bouncedOff;
+        if (slot->worker != noWorker && info.bouncedAssignId != 0 && slot->assignId == info.bouncedAssignId) {
+            // That worker was not reached or did not take it, so there is
+            // nothing to revoke: it gives back an Expect left there on its own.
+            bouncedOff = slot->worker;
+            giveBack(slot->worker, drv);
+        }
         if (slot->worker != noWorker) {
-            return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId)};
+            return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId), .bouncedOff = {}};
         }
         sys(slot->system).queue.set(drv, prio(*slot));
-        return {.drv = drv};
+        return {.drv = drv, .assigned = {}, .bouncedOff = bouncedOff};
     }
 
     // Worker to Revoke on, if the last follower left an assigned drv.
@@ -573,13 +583,16 @@ public:
     // The worker can't run it after all: place it elsewhere.
     void giveBack(WorkerId wid, std::string_view drvPath)
     {
-        auto found = findDrv(drvPath);
-        if (!found) {
-            return;
+        if (auto found = findDrv(drvPath)) {
+            giveBack(wid, *found);
         }
-        std::erase(workers.at(wid).running, *found);
+    }
+
+    void giveBack(WorkerId wid, DrvId drv)
+    {
+        std::erase(workers.at(wid).running, drv);
         refreshFree(wid);
-        auto & slot = entries.at(*found);
+        auto & slot = entries.at(drv);
         if (!slot || slot->worker != wid) {
             return;
         }
@@ -588,9 +601,9 @@ public:
         std::erase(slot->avoid, wid);
         slot->avoid.push_back(wid);
         if (slot->followers.empty()) {
-            retire(*found);
+            retire(drv);
         } else {
-            sys(slot->system).queue.set(*found, prio(*slot));
+            sys(slot->system).queue.set(drv, prio(*slot));
         }
     }
 

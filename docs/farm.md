@@ -38,8 +38,9 @@ What happens on a build:
   system and features it offers and how many builds it takes. The
   scheduler tells it which derivation to expect before the client shows
   up. A build nobody announced is turned away and the client asks the
-  scheduler again. A second client for a build that is already running
-  attaches to it.
+  scheduler again. So does a client the balancer could not connect to
+  that builder, and the scheduler picks another one. A second client for
+  a build that is already running attaches to it.
 * A builder that cannot get an input tries once more without the
   narinfos its nix-daemon cached, one of which may name a NAR the cache
   lost. If it still cannot, and the binary cache lost the input (niks3

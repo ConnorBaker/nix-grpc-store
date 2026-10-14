@@ -45,6 +45,25 @@ inline auto goneAway(const grpc::Status & status) -> bool
     }
 }
 
+// What a BuildDerivation, or the upload of its inputs, to the worker a
+// build was assigned to may answer when that worker went away or would not
+// take the call: the build goes to the scheduler again, which may place it
+// on another one.
+inline auto workerLeft(const grpc::Status & status) -> bool
+{
+    switch (status.error_code()) {
+    case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
+    case grpc::StatusCode::ABORTED:             // superseded: the scheduler already sent where to go
+    case grpc::StatusCode::UNAVAILABLE:         // worker gone or failing for a while
+    case grpc::StatusCode::CANCELLED:           // worker shut down (the client's own is checked first)
+    case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
+    case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The connection died under an open stream. Only callers that know what the
 // stream already delivered can retry this safely.
 inline auto streamBroken(const grpc::Status & status) -> bool

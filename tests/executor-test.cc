@@ -155,6 +155,32 @@ void missingInput()
     assert((exe.takeWants() == std::vector<JobId>{job}));
 }
 
+// A worker that went away, or did not take the job, costs no retry the
+// first time; the next Want names the placement that worker did not take.
+void freeBounces()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = 0, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    exe.connected();
+    exe.takeWants();
+    exe.onAssigned(job, {.addr = "a", .assignId = 2, .system = {}});
+    exe.next();
+    exe.bounced(job, {.notTaken = true, .gone = false});
+    assert(exe.bouncedAssignId(job) == 2);
+    assert((exe.takeWants() == std::vector<JobId>{job}));
+    exe.onAssigned(job, {.addr = "b", .assignId = 3, .system = {}});
+    assert(exe.bouncedAssignId(job) == 0);
+    exe.next();
+    exe.bounced(job, {.notTaken = false, .gone = true});
+    assert(exe.bouncedAssignId(job) == 0);
+    exe.takeWants();
+    // Back on b: its second bounce counts, and there are no retries.
+    exe.onAssigned(job, {.addr = "b", .assignId = 4, .system = {}});
+    exe.next();
+    exe.bounced(job, {.notTaken = false, .gone = true});
+    assert(outcome(exe, job) == Outcome::gaveUp);
+}
+
 } // namespace
 
 auto main() -> int
@@ -167,6 +193,7 @@ auto main() -> int
         unplaceableGrace();
         reconnectAndAbandon();
         missingInput();
+        freeBounces();
     } catch (const std::exception & err) {
         std::cerr << err.what() << "\n";
         return 1;
