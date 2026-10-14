@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <variant>
@@ -25,6 +26,18 @@ struct Placement
     std::string addr;
     uint64_t assignId = 0;
     std::string system; // the worker's native one, empty from older schedulers
+};
+
+// Why a worker bounced a job, read off the call's status (build.cc).
+struct Bounce
+{
+    // The worker did not start on it: the next Want names the placement
+    // (Want.refused), and the scheduler places the job elsewhere instead of
+    // sending it back there.
+    bool refused = false;
+    // The worker went away under the call, never got it or turned it down:
+    // not the job's fault, so the first such bounce per worker is free.
+    bool left = false;
 };
 
 enum class Outcome : uint8_t {
@@ -104,7 +117,14 @@ public:
     {
         auto const jid = static_cast<JobId>(jobs.size());
         jobs.push_back(
-            {.state = state::Blocked{.waiting = 0}, .prio = prio, .dependants = {}, .failedInput = {}, .bounced = 0, .refused = 0, .followed = false});
+            {.state = state::Blocked{.waiting = 0},
+             .prio = prio,
+             .dependants = {},
+             .failedInput = {},
+             .bounced = 0,
+             .leftBy = {},
+             .refused = 0,
+             .followed = false});
         remaining++;
         size_t waiting = 0;
         for (auto const input : inputs) {
@@ -340,8 +360,11 @@ public:
         }
     }
 
-    // `refused`: the worker did not start on it, so going back there is no use.
-    void bounced(JobId jid, Clock::time_point now, bool refused = false)
+    // `why.refused`: the worker did not start on it, so going back there is no
+    // use. Not the job's fault, a worker that went away or did not take it
+    // (`why.left`): the first such bounce per worker does not count against
+    // reschedule-retries, nor wait before the job is wanted again.
+    void bounced(JobId jid, Clock::time_point now, Bounce why = {})
     {
         auto & job = jobs.at(jid);
         auto * run = std::get_if<state::Running>(&job.state);
@@ -354,7 +377,8 @@ public:
             ready.push_back(jid);
             return;
         }
-        if (++job.bounced > cfg.rescheduleRetries) {
+        bool const free = why.left && job.leftBy.insert(run->at.addr).second;
+        if (!free && ++job.bounced > cfg.rescheduleRetries) {
             settle(
                 jid,
                 {.outcome = Outcome::gaveUp,
@@ -362,9 +386,9 @@ public:
                  .message = "gave up after " + std::to_string(job.bounced) + " reschedules"});
             return;
         }
-        job.refused = refused ? run->at.assignId : 0;
+        job.refused = why.refused ? run->at.assignId : 0;
         // The scheduler may know no better worker than the one that just failed.
-        if (job.bounced > 1 && !abandoned && !stopping) {
+        if (!free && job.bounced > 1 && !abandoned && !stopping) {
             to(jid, state::Resting{.until = now + retryPause(job.bounced - 1)});
             return;
         }
@@ -396,6 +420,7 @@ private:
         std::vector<JobId> dependants;
         std::optional<JobId> failedInput;
         unsigned bounced;
+        std::set<std::string> leftBy; // workers that went away or did not take it
         uint64_t refused; // assignment to name in the next Want
         // We sent a Want and no Cancel since. While set, the scheduler may
         // keep the job queued or placed for us.
