@@ -353,7 +353,8 @@ which also requires `trustClients` (see above).
   * `reschedule-retries` (default 8) — how often a derivation whose
     assigned worker went away is handed back to the scheduler. The first
     bounce by a worker that went away, or did not take the build, does
-    not count.
+    not count, nor does one after which the scheduler sends it back to the
+    same assignment, where the build still runs.
   * `max-builds` (default 64) — concurrent `BuildDerivation` streams.
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that

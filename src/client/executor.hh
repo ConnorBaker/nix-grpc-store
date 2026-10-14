@@ -114,7 +114,8 @@ public:
              .failedInput = {},
              .bounced = 0,
              .leftBy = {},
-             .bouncedAssignId = 0});
+             .bouncedAssignId = 0,
+             .refundable = {}});
         remaining++;
         size_t waiting = 0;
         for (auto const input : inputs) {
@@ -148,6 +149,7 @@ public:
         }
         jobs.at(input).dependants.push_back(jid);
         job.bouncedAssignId = 0;
+        job.refundable.reset();
         // Placed again while it waits, it would hold a slot, maybe the only
         // one the input can build in: the scheduler forgets it until then.
         if (stream) {
@@ -262,6 +264,10 @@ public:
         if (std::holds_alternative<state::Wanted>(job.state)) {
             progressed++;
             job.bouncedAssignId = 0;
+            if (auto const left = std::exchange(job.refundable, std::nullopt);
+                left && left->addr == placement.addr && left->assignId == placement.assignId) {
+                job.bounced--; // that worker still holds the build, only our stream to it broke
+            }
             to(jid, state::Assigned{.at = std::move(placement)});
             ready.push_back(jid);
         }
@@ -358,6 +364,11 @@ public:
         }
         bool const free = (why.gone || why.notTaken) && job.leftBy.insert(run->at.addr).second;
         job.bouncedAssignId = why.notTaken ? run->at.assignId : 0;
+        // Refunded if the scheduler sends us back to that very placement.
+        job.refundable.reset();
+        if (!free && !why.notTaken) {
+            job.refundable = run->at;
+        }
         if (!free && ++job.bounced > cfg.rescheduleRetries) {
             settle(
                 jid,
@@ -393,6 +404,9 @@ private:
         unsigned bounced;
         std::set<std::string> leftBy; // workers that went away or did not take it
         uint64_t bouncedAssignId;
+        // A counted bounce off this placement: the build there may outlive
+        // our stream to it.
+        std::optional<Placement> refundable;
     };
 
     Config cfg;

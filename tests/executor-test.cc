@@ -181,6 +181,31 @@ void freeBounces()
     assert(outcome(exe, job) == Outcome::gaveUp);
 }
 
+// A stream that broke under a build the worker keeps: the scheduler sends
+// the job back to the same placement, and that bounce is refunded. Sent
+// elsewhere, it counts.
+void refundsABrokenStream()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = 1, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    exe.connected();
+    exe.takeWants();
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    for (int round = 0; round < 3; round++) {
+        exe.bounced(job);
+        assert((exe.takeWants() == std::vector<JobId>{job}));
+        exe.onAssigned(job, place("a"));
+        exe.next();
+    }
+    exe.bounced(job);
+    exe.takeWants();
+    exe.onAssigned(job, place("b"));
+    exe.next();
+    exe.bounced(job);
+    assert(outcome(exe, job) == Outcome::gaveUp);
+}
+
 } // namespace
 
 auto main() -> int
@@ -194,6 +219,7 @@ auto main() -> int
         reconnectAndAbandon();
         missingInput();
         freeBounces();
+        refundsABrokenStream();
     } catch (const std::exception & err) {
         std::cerr << err.what() << "\n";
         return 1;

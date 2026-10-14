@@ -759,14 +759,12 @@ public:
         -> std::optional<std::string>
     {
         log({.text = "attached to the build already running on this worker"});
-        shared.attached++;
         auto const completed = nixgrpc::followSpill(
             shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
             [&] -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
             [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
                 log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
             });
-        shared.attached--;
         if (!completed) {
             return std::nullopt;
         }
@@ -960,9 +958,9 @@ public:
         nix::remote::Done::Outcome & outcome,
         std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
     {
-        auto const cancelled = [&] -> bool {
-            return (context.IsCancelled() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
-        };
+        // Not when our caller's stream breaks: the scheduler sends it back here
+        // to attach. It revokes the build once no client wants it any more.
+        auto const cancelled = [&] -> bool { return shared.revoked || stopSignal >= nixgrpc::kCancelBuilds; };
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto const roots = openScopedStore();
