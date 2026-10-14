@@ -40,7 +40,8 @@ What happens on a build:
   up. A build nobody announced is turned away and the client asks the
   scheduler again. So does a client the balancer could not connect to
   that builder, and the scheduler picks another one. A second client for
-  a build that is already running attaches to it.
+  a build that is already running attaches to it, and so does a client
+  whose stream to it broke: the build goes on until no client wants it.
 * A builder that cannot get an input tries once more without the
   narinfos its nix-daemon cached, one of which may name a NAR the cache
   lost. If it still cannot, and the binary cache lost the input (niks3
