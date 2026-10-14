@@ -183,10 +183,11 @@ let
     }
   '';
   slowExpr = pkgs.writeText "slow.nix" ''
-    { tag, unique ? false }:
+    { tag, unique ? false, features ? [ ] }:
     derivation {
       name = "slow-''${tag}";
       system = builtins.currentSystem;
+      requiredSystemFeatures = features;
       builder = "/bin/sh";
       # Inner sh so a test can pkill it to let the build succeed early.
       args = [

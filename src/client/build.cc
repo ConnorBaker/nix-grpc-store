@@ -142,11 +142,12 @@ auto notTaken(const grpc::Status & status) -> bool {
 }
 
 // A worker that went away or would not take the call. `refused` names the
-// assignment in the next Want, so the scheduler places it elsewhere; `left`
+// assignment in the next Want, so the scheduler places it elsewhere and
+// revokes it there: only for a worker that does not hold the build, as a
+// worker whose stream to us broke builds on and we attach again. `left`
 // makes the first such bounce per worker free (Executor::bounced).
 auto bounced(const grpc::Status & status) -> GrpcStore::Bounced {
-  return {.refused = status.error_code() == grpc::StatusCode::UNAVAILABLE,
-          .left = notTaken(status) || nixgrpc::goneAway(status)};
+  return {.refused = notTaken(status), .left = notTaken(status) || nixgrpc::goneAway(status)};
 }
 } // namespace
 
