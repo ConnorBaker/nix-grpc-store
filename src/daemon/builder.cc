@@ -63,6 +63,8 @@ auto Builder::claim(const std::string & drvPath, uint64_t assignId) -> bool
     for (bool waited = false;; waited = true) {
         if (auto const found = lck->expected.find(drvPath); found != lck->expected.end()) {
             found->second.claimed = true;
+            found->second.calls++;
+            found->second.since = config.now();
             if (waited) {
                 metrics.event("expect_late");
             }
@@ -73,6 +75,15 @@ auto Builder::claim(const std::string & drvPath, uint64_t assignId) -> bool
         if (assignId <= lck->newestExpect || lck.wait_until(expectArrived, deadline) == std::cv_status::timeout) {
             return false;
         }
+    }
+}
+
+void Builder::callEnded(const std::string & drvPath)
+{
+    auto lck = state.lock();
+    if (auto const found = lck->expected.find(drvPath); found != lck->expected.end() && found->second.calls > 0) {
+        found->second.calls--;
+        found->second.since = config.now();
     }
 }
 
@@ -256,17 +267,16 @@ void Builder::setUnavailable(Unavailable why, bool holds)
     }
     send(load());
     if (draining) {
-        giveBack(takeUnclaimed([](const Expected &) -> bool { return true; }), nix::remote::Done::DRAINING);
+        giveBack(take([](const Expected & ent) -> bool { return !ent.claimed; }), nix::remote::Done::DRAINING);
     }
 }
 
-auto Builder::takeUnclaimed(const std::function<bool(const Expected &)> & pred)
-    -> std::vector<std::pair<std::string, uint64_t>>
+auto Builder::take(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>
 {
     std::vector<std::pair<std::string, uint64_t>> taken;
     auto lck = state.lock();
     for (auto iter = lck->expected.begin(); iter != lck->expected.end();) {
-        if (!iter->second.claimed && pred(iter->second)) {
+        if (pred(iter->second)) {
             taken.emplace_back(iter->first, iter->second.assignId);
             iter = lck->expected.erase(iter);
         } else {
@@ -294,8 +304,20 @@ void Builder::tick()
     const auto now = config.now();
     // While draining, also what an Expect racing setUnavailable() left behind.
     bool const draining = this->draining();
+    // A claimed one whose client went quiet goes too: no call for it here
+    // (BuildDerivation, or an upload of its inputs) for expectTimeout. Its
+    // client was sent elsewhere or reached a successor that took this node
+    // over, and nobody else ends it.
     giveBack(
-        takeUnclaimed([&](const Expected & ent) -> bool { return draining || now - ent.since > expectTimeout; }),
+        take([&](const Expected & ent) -> bool {
+            if (ent.running) {
+                return false;
+            }
+            if (!ent.claimed) {
+                return draining || now - ent.since > expectTimeout;
+            }
+            return ent.calls == 0 && now - ent.since > expectTimeout;
+        }),
         draining ? nix::remote::Done::DRAINING : nix::remote::Done::UNREACHABLE);
 }
 

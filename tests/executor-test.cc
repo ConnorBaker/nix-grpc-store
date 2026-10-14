@@ -141,7 +141,7 @@ void refusedPlacementIsNamedOnce()
     exe.takeWants();
     exe.onAssigned(job, place("a"));
     exe.next();
-    exe.bounced(job, Clock::now(), true);
+    exe.bounced(job, Clock::now(), {.refused = true, .left = false});
     assert(exe.refused(job) == place("a").assignId);
     exe.takeWants();
     exe.onAssigned(job, place("b"));
@@ -259,6 +259,31 @@ void disconnectForgetsFollows()
     assert(exe.takeCancels().empty());
 }
 
+// A worker that went away, or did not take the job, costs no retry the
+// first time, and the job is wanted again at once.
+void freeBounces()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = 0, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    exe.connected();
+    exe.takeWants();
+    exe.onAssigned(job, {.addr = "a", .assignId = 2, .system = {}});
+    exe.next();
+    exe.bounced(job, Clock::now(), {.refused = true, .left = true});
+    assert(exe.refused(job) == 2);
+    assert((exe.takeWants() == std::vector<JobId>{job}));
+    exe.onAssigned(job, {.addr = "b", .assignId = 3, .system = {}});
+    exe.next();
+    exe.bounced(job, Clock::now(), {.refused = false, .left = true});
+    assert(exe.refused(job) == 0);
+    assert((exe.takeWants() == std::vector<JobId>{job}));
+    // Back on b: its second bounce counts, and there are no retries.
+    exe.onAssigned(job, {.addr = "b", .assignId = 4, .system = {}});
+    exe.next();
+    exe.bounced(job, Clock::now(), {.refused = false, .left = true});
+    assert(outcome(exe, job) == Outcome::gaveUp);
+}
+
 } // namespace
 
 auto main() -> int
@@ -276,6 +301,7 @@ auto main() -> int
         missingInput();
         everyEndCancels();
         disconnectForgetsFollows();
+        freeBounces();
     } catch (const std::exception & err) {
         std::cerr << err.what() << "\n";
         return 1;
