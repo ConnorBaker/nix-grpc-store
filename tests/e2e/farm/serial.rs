@@ -1435,3 +1435,230 @@ fn sighup_rereads_nix_max_jobs_and_the_scheduler_counts_it() {
     });
     assert_eq!(pid(), pid0, "nix-grpc-daemon restarted");
 }
+
+#[test]
+fn an_upload_slower_than_the_expect_timeout_keeps_the_assignment() {
+    farm_ready();
+    let big = succeed(
+        CLIENT,
+        &[
+            "sh",
+            "-c",
+            "head -c 24M /dev/urandom > /tmp/slow && nix-store --add /tmp/slow",
+        ],
+    )
+    .trim()
+    .to_string();
+    // ~96 s for the upload, longer than a builder keeps an Expect nobody claimed (60 s).
+    succeed(
+        CLIENT,
+        &[
+            "tc", "qdisc", "add", "dev", "eth1", "root", "tbf", "rate", "2mbit", "burst", "32kbit",
+            "latency", "400ms",
+        ],
+    );
+    let o = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("DEP"),
+            "job",
+            "--argstr",
+            "tag",
+            "slow-upload",
+            "--argstr",
+            "inputPath",
+            &big,
+        ],
+        300,
+    );
+    succeed(CLIENT, &["tc", "qdisc", "del", "dev", "eth1", "root"]);
+    let out = o.combined();
+    assert_eq!(o.code, 0, "{out}");
+    // Before, the Expect ran out mid-upload: "not scheduled here", and the
+    // next worker got the same upload.
+    assert!(!out.contains("asking the scheduler again"), "{out}");
+}
+
+#[test]
+fn a_draining_builder_lets_a_client_attach_to_the_build_it_runs() {
+    farm_ready();
+    spawn_build("da1", "drain-attach");
+    wait_building();
+    let busy = building()[0];
+    let draining = "event=draining";
+    let before = journal_count(busy, UNIT, draining);
+    succeed(
+        busy,
+        &["systemctl", "stop", "--no-block", "nix-grpc-daemon.service"],
+    );
+    wait_journal_above(busy, UNIT, draining, before, 30);
+    // The scheduler sends whoever wants the drv to the worker that runs it,
+    // draining or not. Like a client whose stream to it broke.
+    let attached = events(busy, "attached");
+    spawn_build("da2", "drain-attach");
+    retry(60, "the second client attached", || {
+        events(busy, "attached") > attached
+    });
+    release_slow();
+    wait_unit_done("da1 da2", 90);
+    for unit in ["da1", "da2"] {
+        assert_unit_success(unit);
+    }
+    // Before, the worker answered "worker draining" until reschedule-retries ran out.
+    assert_no_journal(CLIENT, "da2", "asking the scheduler again");
+    restart_daemon(busy);
+}
+
+#[test]
+fn a_builder_killed_mid_build_sends_the_build_elsewhere() {
+    farm_ready();
+    spawn_build("killed", "killed");
+    wait_building();
+    let busy = building()[0];
+    succeed(
+        busy,
+        &["systemctl", "kill", "-s", "KILL", "nix-grpc-daemon.service"],
+    );
+    // How the stream ends depends on the path to the worker: here a reset,
+    // in a farm behind tunnels also CANCELLED. Neither may fail the build.
+    retry(180, "the build finished elsewhere", || {
+        release_slow();
+        run_t(CLIENT, &["systemctl", "is-active", "killed"], 60).code != 0
+    });
+    assert_unit_success("killed");
+    restart_daemon(busy);
+}
+
+#[test]
+fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
+    farm_ready();
+    let sys = system();
+    // The query has to be in flight on the builder that stops.
+    let (gone, other) = (leader(), standby());
+    succeed(other, &["systemctl", "stop", "nix-grpc-daemon.service"]);
+    wait_members(&sys, &[gone]);
+    // Socket-activated, so there is one to stop whichever tests ran before.
+    succeed(gone, &["systemctl", "start", "nix-daemon.service"]);
+    succeed(gone, &["pkill", "-STOP", "-x", "nix-daemon"]);
+    // QueryMissing, or QueryValidPaths where Nix hands queryMissing its
+    // evaluation store (NixOS/nix#16433): then the client walks the graph
+    // itself and sends no QueryMissing.
+    let pattern = "event=rpc_start method=Query";
+    let before = journal_count(gone, UNIT, pattern);
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "qm",
+            "nix",
+            "build",
+            "--dry-run",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("JOB"),
+            "--argstr",
+            "tag",
+            "qm",
+        ],
+    );
+    wait_journal_above(gone, UNIT, pattern, before, 60);
+    // Nothing builds there, so it shuts down at once and cuts the query off.
+    succeed(
+        gone,
+        &["systemctl", "stop", "--no-block", "nix-grpc-daemon.service"],
+    );
+    succeed(other, &["systemctl", "start", "nix-grpc-daemon.service"]);
+    // Stopped, not just stopping: while it deactivates the server still
+    // holds the query, and a nix-daemon resumed then answers it.
+    wait_until_succeeds(
+        gone,
+        &[
+            "sh",
+            "-c",
+            "systemctl is-active nix-grpc-daemon.service | grep -qxE 'inactive|failed'",
+        ],
+        60,
+    );
+    succeed(gone, &["pkill", "-CONT", "-x", "nix-daemon"]);
+    wait_unit_done("qm", 120);
+    assert_unit_success("qm");
+    // The server cancelled the query when it stopped, and the client asked
+    // again instead of failing.
+    assert_journal(CLIENT, "qm", "Cancelling all calls, retrying");
+    restart_daemon(gone);
+}
+
+#[test]
+fn an_upload_cut_off_after_longer_than_the_restart_grace_is_retried() {
+    farm_ready();
+    // An upload is answered once niks3 has it, so a stopped niks3 push holds it.
+    // Bracketed so pkill does not stop the shell running it.
+    let push = "push --[s]tdin";
+    for w in WORKERS {
+        let path = succeed(
+            CLIENT,
+            &[
+                "sh",
+                "-c",
+                &format!("echo prime-{} > /tmp/prime && nix-store --add /tmp/prime", w.0),
+            ],
+        )
+        .trim()
+        .to_string();
+        succeed(
+            CLIENT,
+            &["nix", "copy", "--no-check-sigs", "--to", &direct(w), &path],
+        );
+        succeed(w, &["pkill", "-STOP", "-f", push]);
+    }
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "held",
+            "nix",
+            "build",
+            "--store",
+            &format!("{}&restart-grace=10", envoy()),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("JOB"),
+            "--argstr",
+            "tag",
+            "held",
+        ],
+    );
+    let uploading = |w: Node| gauge(w, r#"nix_grpc_inflight{kind="AddMultipleToStore"}"#) > 0;
+    let mut busy = None;
+    retry(60, "the derivations are uploading", || {
+        busy = WORKERS.into_iter().find(|&w| uploading(w));
+        busy.is_some()
+    });
+    let busy = busy.unwrap();
+    // In CI a busy niks3 held the derivation upload for minutes.
+    sleep(15);
+    assert!(uploading(busy), "the upload did not wait for niks3");
+    // Like the builder's tunnel going away: "reset reason: connection termination".
+    let ip = env(&format!("NGS_{}_IP", busy.0.to_uppercase()));
+    succeed(LB, &["ss", "-tK", "dst", &ip, "dport", "=", ":50051"]);
+    for w in WORKERS {
+        succeed(w, &["pkill", "-CONT", "-f", push]);
+    }
+    wait_unit_done("held", 180);
+    assert_unit_success("held");
+    // Cut off after the builder took the paths: a reset, no envoy reply.
+    assert_journal(CLIENT, "held", ", retrying");
+}
