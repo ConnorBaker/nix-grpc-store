@@ -128,14 +128,15 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
 
 namespace {
 // The worker does not hold the build: it never got the call (the balancer
-// could not connect to it) or turned it down.
+// could not connect to it), turned it down, or built it and gave it back
+// unpublished.
 auto notTaken(const grpc::Status & status) -> bool {
   auto const & msg = status.error_message();
   switch (status.error_code()) {
   case grpc::StatusCode::FAILED_PRECONDITION: // not scheduled there
     return true;
   case grpc::StatusCode::UNAVAILABLE:
-    return msg.contains("connection failure") || msg.contains("connection timeout");
+    return msg.contains("connection failure") || msg.contains("connection timeout") || msg.contains("publish failed");
   default:
     return false;
   }

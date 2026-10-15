@@ -233,6 +233,7 @@ auto Builder::hello() const -> WorkerMsg
         hel->add_features(feat);
     }
     hel->set_max_jobs(maxJobs_.load());
+    hel->set_publish_failing(publishFailing);
     auto lck = state.lock();
     for (const auto & [drv, ent] : lck->expected) {
         auto * run = hel->add_running();
@@ -261,11 +262,21 @@ void Builder::setDraining(bool draining)
     }
 }
 
+void Builder::published(bool works)
+{
+    if (publishFailing.exchange(!works) == !works) {
+        return;
+    }
+    logLine(LogLevel::info, {{"event", works ? "publishing" : "publish_failing"}});
+    sendLoad();
+}
+
 auto Builder::sendLoad() const -> bool
 {
     WorkerMsg msg;
     msg.mutable_load()->set_draining(draining_);
     msg.mutable_load()->set_max_jobs(maxJobs_);
+    msg.mutable_load()->set_publish_failing(publishFailing);
     return send(msg);
 }
 

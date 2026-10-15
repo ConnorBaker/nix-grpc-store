@@ -1844,3 +1844,66 @@ fn a_build_whose_stream_breaks_goes_on_and_the_client_follows_it_again() {
     wait_unit_done("flap", 90);
     assert_unit_success("flap");
 }
+
+#[test]
+fn a_builder_that_cannot_publish_gets_no_work_while_another_can_take_it() {
+    farm_ready();
+    let sys = system();
+    // Like a CI builder whose niks3 token file came out empty.
+    let broken = standby();
+    let token = succeed(broken, &["sh", "-c", "ls /nix/store/*-niks3-token"])
+        .trim()
+        .to_string();
+    succeed(
+        broken,
+        &[
+            "sh",
+            "-c",
+            // The next push starts afresh and reads it.
+            r#": > /tmp/empty-token && mount --bind /tmp/empty-token "$1" && { pkill -f 'push --[s]tdin' || true; }"#,
+            "sh",
+            &token,
+        ],
+    );
+    let failing = || journal_count(leader(), UNIT, "event=publish_failing");
+    let before = failing();
+    let tags = (0..4)
+        .map(|i| format!("\"nopub{i}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let o = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "--store",
+            // Before, the scheduler sent a build back to the builder that
+            // had just failed to publish it until the retries ran out, and
+            // an upload or query that landed there failed outright.
+            &format!("{}&reschedule-retries=0", envoy()),
+            "--eval-store",
+            "auto",
+            "--impure",
+            "--expr",
+            &format!("map (tag: import {} {{ inherit tag; }}) [ {tags} ]", expr("JOB")),
+        ],
+        300,
+    );
+    succeed(broken, &["umount", &token]);
+    assert_eq!(o.code, 0, "{}", o.combined());
+    assert!(failing() > before, "the broken builder got no work");
+    // Out of the balancer until a publish works there again.
+    assert!(!members(&sys).contains(&broken));
+    let path = succeed(
+        CLIENT,
+        &["sh", "-c", "echo republish > /tmp/republish && nix-store --add /tmp/republish"],
+    )
+    .trim()
+    .to_string();
+    succeed(
+        CLIENT,
+        &["nix", "copy", "--no-check-sigs", "--to", &direct(broken), &path],
+    );
+    wait_members(&sys, &WORKERS);
+    retry(60, "scheduler settled", settled);
+}
