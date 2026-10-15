@@ -120,6 +120,9 @@ public:
     // False if the session is gone.
     auto greet() const -> bool;
     void setDraining(bool draining);
+    // Every publish to the cache reports how it went. The scheduler hears
+    // when that changes, see Load.publish_failing.
+    void published(bool works);
 
     [[nodiscard]] auto draining() const -> bool
     {
@@ -184,6 +187,7 @@ private:
     mutable nix::Sync<State> state;
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<bool> draining_{false};
+    std::atomic<bool> publishFailing{false};
     std::atomic<unsigned> maxJobs_;
     static constexpr std::chrono::seconds expectTimeout{60};
 

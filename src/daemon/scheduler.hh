@@ -308,6 +308,9 @@ struct Worker
     int32_t maxJobs = 0;
     bool up = false;
     bool draining = false;
+    // Its last publish to the cache failed: it gets builds only while no
+    // other worker has a slot, until it reports that publishing works again.
+    bool faulty = false;
     std::vector<DrvId> running;
 };
 
@@ -506,6 +509,7 @@ public:
         std::vector<std::string> features;
         uint32_t maxJobs = 0;
         std::vector<std::pair<std::string_view, uint64_t>> running; // running + expecting, with assignId
+        bool faulty = false;
     };
 
     // A reported drv that followers wait for: the caller sends them a fresh
@@ -530,6 +534,7 @@ public:
         wkr.up = true;
         workersUp_++;
         wkr.draining = false;
+        setFaulty(wid, info.faulty);
         wkr.systems = info.systems;
         for (const auto & name : wkr.systems) {
             sys(name).free.push(wid);
@@ -611,6 +616,19 @@ public:
     {
         workers.at(wid).draining = draining;
         refreshFree(wid);
+    }
+
+    void setFaulty(WorkerId wid, bool faulty)
+    {
+        auto & wkr = workers.at(wid);
+        if (std::exchange(wkr.faulty, faulty) == faulty) {
+            return;
+        }
+        if (faulty) {
+            faultyCount++;
+        } else {
+            faultyCount--;
+        }
     }
 
     // Capacity changed while connected. Below what runs, free goes negative
@@ -831,6 +849,7 @@ private:
     // only, so on overflow the table is simply dropped.
     PathMap<std::pair<WorkerId, uint64_t>> lastBuilder;
     uint64_t lastAssignId = 0;
+    size_t faultyCount = 0; // workers with `faulty` set
 
     // Entry is finished or abandoned: free the slot and its id for reuse.
     void retire(DrvId drv)
@@ -940,8 +959,9 @@ private:
                   });
     }
 
-    // Most free among workers offering system and features. O(1) without
-    // features, O(workers) with.
+    // Most free among workers offering system and features, a faulty one
+    // only if no other has a slot. O(1) without features while no worker is
+    // faulty, O(workers) otherwise.
     [[nodiscard]] auto emptiestFor(const Entry & ent) const -> std::optional<WorkerId>
     {
         auto const iter = systems.find(ent.system);
@@ -949,17 +969,19 @@ private:
             return std::nullopt;
         }
         const auto & fidx = iter->second.free;
-        if (ent.features.empty()) {
+        if (ent.features.empty() && faultyCount == 0) {
             return fidx.emptiest();
         }
         std::optional<WorkerId> best;
+        std::optional<WorkerId> faulty;
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
-            if (workers.at(wid).up && fidx.get(wid) > 0 && offers(workers.at(wid), ent)
-                && (!best || fidx.get(wid) > fidx.get(*best))) {
-                best = wid;
+            const auto & wkr = workers.at(wid);
+            auto & pick = wkr.faulty ? faulty : best;
+            if (wkr.up && fidx.get(wid) > 0 && offers(wkr, ent) && (!pick || fidx.get(wid) > fidx.get(*pick))) {
+                pick = wid;
             }
         }
-        return best;
+        return best ? best : faulty;
     }
 
     [[nodiscard]] static auto avoided(const Entry & ent, WorkerId wid) -> bool
@@ -969,12 +991,13 @@ private:
 
     // The emptiest worker it was not given back by. If each one that can run
     // it gave it back, the emptiest but the last of them; `fallback` (one it
-    // was given back by) if nobody else can run it. None while those it may
-    // go to have no slot.
+    // was given back by) if nobody else can run it. A faulty one only if no
+    // other has a slot. None while those it may go to have no slot.
     [[nodiscard]] auto avoiding(const Entry & ent, WorkerId fallback) const -> std::optional<WorkerId>
     {
         auto const among = [&](auto passed) -> std::optional<std::optional<WorkerId>> {
             std::optional<WorkerId> best;
+            std::optional<WorkerId> faulty;
             bool others = false;
             for (WorkerId wid = 0; wid < workers.size(); wid++) {
                 const auto & wkr = workers.at(wid);
@@ -982,14 +1005,15 @@ private:
                     continue;
                 }
                 others = true;
-                if (freeOf(wid) > 0 && (!best || freeOf(wid) > freeOf(*best))) {
-                    best = wid;
+                auto & pick = wkr.faulty ? faulty : best;
+                if (freeOf(wid) > 0 && (!pick || freeOf(wid) > freeOf(*pick))) {
+                    pick = wid;
                 }
             }
             if (!others) {
                 return std::nullopt;
             }
-            return best;
+            return best ? best : faulty;
         };
         if (auto const placed = among([&](WorkerId wid) -> bool { return avoided(ent, wid); })) {
             return *placed;
@@ -1021,8 +1045,8 @@ private:
                 continue;
             }
             auto [wid, size] = iter->second;
-            if (wid >= workers.size() || avoided(ent, wid) || !workers.at(wid).up || freeOf(wid) <= 0
-                || !offers(workers.at(wid), ent)) {
+            if (wid >= workers.size() || avoided(ent, wid) || !workers.at(wid).up || workers.at(wid).faulty
+                || freeOf(wid) <= 0 || !offers(workers.at(wid), ent)) {
                 continue;
             }
             auto const cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });

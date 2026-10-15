@@ -233,6 +233,8 @@ message Hello {
   // Builds in progress and Expects not yet claimed, so a restarted scheduler
   // neither double-assigns them nor counts their slots as free.
   repeated RunningBuild running = 5;
+  // See Load.
+  bool publish_failing = 6;
 }
 
 message Done {
@@ -263,6 +265,10 @@ message Done {
 
 message Load {
   bool draining = 1;
+  // Its last publish to the binary cache failed. The scheduler sends it
+  // builds only if no other worker has a free slot, and the balancer sends
+  // it nothing else, until a publish succeeds again.
+  bool publish_failing = 2;
   // The worker's capacity, as Hello.max_jobs, which says 0 while draining.
   // Absent from workers that predate it.
   optional uint32 max_jobs = 3;

@@ -42,6 +42,10 @@ What happens on a build:
   that builder, and the scheduler picks another one. A second client for
   a build that is already running attaches to it, and so does a client
   whose stream to it broke: the build goes on until no client wants it.
+* A builder that cannot publish to the binary cache gives the build
+  back, and the scheduler places it on another builder. Until a publish
+  works there again, that builder gets builds only when no other one
+  has a free slot, and the balancer sends it nothing else.
 * A builder that cannot get an input tries once more without the
   narinfos its nix-daemon cached, one of which may name a NAR the cache
   lost. If it still cannot, and the binary cache lost the input (niks3
