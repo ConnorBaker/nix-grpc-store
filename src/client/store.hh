@@ -351,20 +351,30 @@ public:
     static constexpr int minReconnectBackoffMs = 2000;
     template<typename F>
     void retrying(const char * what, const F & attempt) {
-      // From the first failure, not the call's start: a long upload cut
-      // off late still gets the whole budget.
+      retryingWithProgress(what, [&](bool & /*progressed*/) -> grpc::Status { return attempt(); });
+    }
+
+    // `attempt` sets `progressed` once the server took the call. The budget
+    // counts from the first failure, not the call's start, so a long upload
+    // cut off late still gets all of it; and anew after an attempt that
+    // progressed and was then cut off: the server was reachable.
+    template<typename F>
+    void retryingWithProgress(const char * what, const F & attempt) {
       std::optional<nixgrpc::Backoff> backoff;
       for (;;) {
-        auto const status = attempt();
+        bool progressed = false;
+        auto const status = attempt(progressed);
         checkInterrupt();
-        if (status.ok()) {
+        if (status.ok() || progressed) {
           everConnected = true;
         }
-        if (!nixgrpc::goneAway(status)) {
+        // Not when the server answered with an error after all.
+        bool const cut = progressed && nixgrpc::cutOff(status);
+        if (!(nixgrpc::goneAway(status) || cut)) {
           checkStatus(status, what);
           return;
         }
-        if (!backoff) {
+        if (!backoff || cut) {
           backoff.emplace(retryBudget());
         }
         if (backoff->exhausted()) {
@@ -782,9 +792,10 @@ private:
         PathsSource pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, const Metadata & headers)
 ;
 
+    // `accepted`: a worker took the call, before it imports and publishes.
     auto addMultipleToStoreOnce(
         std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-        CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+        CheckSigsFlag checkSigs, const Metadata & headers, bool & accepted) -> grpc::Status
 ;
 
 public:

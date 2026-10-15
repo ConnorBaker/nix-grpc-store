@@ -521,6 +521,11 @@ public:
             if (!reader->Read(&first)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "empty AddMultipleToStore stream"};
             }
+            // Importing and publishing can take minutes. A client cut off
+            // meanwhile retries without counting that against its window:
+            // it reached the farm.
+            context->AddInitialMetadata("x-nix-accepted", "1");
+            reader->SendInitialMetadata();
             auto repair = first.repair() ? nix::Repair : nix::NoRepair;
             // The nix-daemon downgrades this to CheckSigs if we are not a
             // trusted user, same as for the tunnelled protocol.

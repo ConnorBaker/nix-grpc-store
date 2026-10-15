@@ -71,6 +71,14 @@ inline auto streamBroken(const grpc::Status & status) -> bool
     return status.error_message().contains("Stream removed");
 }
 
+// The call broke or its server left, as opposed to the server answering with
+// an error. A failed publish is an answer: worth a retry elsewhere, but not
+// progress, so the retries end when they stop getting anywhere.
+inline auto cutOff(const grpc::Status & status) -> bool
+{
+    return !status.error_message().contains("publish failed") && (streamBroken(status) || goneAway(status));
+}
+
 // Doubling pause under a deadline.
 class Backoff
 {
