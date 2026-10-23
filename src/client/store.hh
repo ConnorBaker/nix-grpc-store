@@ -478,6 +478,7 @@ public:
     struct Job {
       StorePath drvPath;
       BasicDerivation drv;
+      BuildMode mode = bmNormal;
       std::vector<Job *> dependants;
       std::vector<Job *> inputs;
       size_t waiting = 0;
@@ -502,13 +503,13 @@ public:
 
     // One BuildDerivation against the assigned worker. NOT_FOUND: upload the
     // drv closure there and ask again. Returns nullopt if the worker bounced us.
-    auto buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult>;
+    auto buildAssigned(Job & job, Store & evalStore) -> std::optional<BuildResult>;
 
     // The build hook and plain `--store grpc://` pass no eval store but
     // usually have the derivations in the local store.
     auto localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store>;
 
-    auto runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, Store & evalStore) -> void;
+    auto runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) -> void;
     auto scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::Status;
 
     // Single drv without a DAG (build hook, legacy buildDerivation callers).
