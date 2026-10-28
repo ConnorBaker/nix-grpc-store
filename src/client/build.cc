@@ -737,10 +737,11 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
 // slow: with a remote cache configured, the daemon publishes every path it
 // holds before it answers.
 //
-// NoSubstitute: a daemon with a shared cache also reports what its
-// substituters offer, without fetching it just to answer. Substitute: what a
-// needed derivation still lacks, the server fetches, as nix does before it
-// builds. What it cannot fetch, e.g. for an untrusted signature, is built.
+// NoSubstitute: a daemon with a shared cache also reports the paths that
+// cache has as closure roots, without fetching them just to answer.
+// Substitute: what a needed derivation still lacks, the server fetches, as
+// nix does before it builds. What it cannot fetch, e.g. for an untrusted
+// signature, is built.
 auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore)
     -> StorePathSet {
   std::map<StorePath, Derivation> drvs;
