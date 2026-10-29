@@ -150,14 +150,15 @@ let
     mk' top "farm-top" [ a b ]
   '';
   depExpr = pkgs.writeText "dep.nix" ''
-    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features }:
+    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features, nondet ? false }:
     rec {
       input = if inputPath != null then builtins.storePath inputPath else derivation {
         name = "local-input-''${tag}";
         system = builtins.currentSystem;
         requiredSystemFeatures = features;
         builder = "/bin/sh";
-        args = [ "-c" "echo ''${tag} > $out" ];
+        # nondet: other bytes on every build, as many real builds have.
+        args = [ "-c" (if nondet then "read u < /proc/sys/kernel/random/uuid; echo ''${tag} $u > $out" else "echo ''${tag} > $out") ];
       };
       referrer = derivation {
         name = "refers-to-input-''${tag}";

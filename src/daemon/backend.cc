@@ -40,8 +40,9 @@
 namespace nixgrpc {
 
 namespace {
-// No build hook: it would bypass the scheduler.
-void buildLocally(Backend::Conn & conn, Backends::Limits limits)
+// No build hook: it would bypass the scheduler. Of `overrides`, nix-daemon
+// takes some, narinfo-cache-positive-ttl among them, from a trusted user only.
+void buildLocally(Backend::Conn & conn, Backends::Limits limits, std::map<std::string, std::string> overrides = {})
 {
     constexpr uint64_t off = 0;
     constexpr uint64_t yes = 1;
@@ -49,8 +50,8 @@ void buildLocally(Backend::Conn & conn, Backends::Limits limits)
             << off /* tryFallback */ << off /* verbosity */ << yes /* maxBuildJobs */
             << limits.maxSilentTime << yes << off /* verbosity */ << off << off
             << uint64_t{nixcompat::buildCores()} << yes /* useSubstitutes */;
-    std::map<std::string, std::string> const overrides{
-        {"builders", ""}, {"timeout", std::to_string(limits.buildTimeout)}};
+    overrides.insert_or_assign("builders", "");
+    overrides.insert_or_assign("timeout", std::to_string(limits.buildTimeout));
     conn.to << overrides.size();
     for (const auto & [name, value] : overrides) {
         conn.to << name << value;
@@ -134,6 +135,22 @@ auto Backends::storedBuild(
         throw nix::Error("nix-daemon returned %d results for one derivation", results.size());
     }
     return std::move(results.front());
+}
+
+void Backends::ensureUncached(nix::Store & localStore, const nix::StorePath & path) const
+{
+    // A connection is a nix-daemon process of its own: the others keep
+    // their narinfos, and this one looks every narinfo up again.
+    auto backend = connect(localStore);
+    auto & conn = backend->conn;
+    buildLocally(conn, {}, {{"narinfo-cache-positive-ttl", "0"}});
+    conn.to << nix::WorkerProto::Op::EnsurePath << localStore.printStorePath(path);
+    for (int block = 0; block < 2; block++) { // SetOptions', EnsurePath's
+        if (auto exc = conn.processStderrReturn()) {
+            std::rethrow_exception(exc);
+        }
+    }
+    nix::readInt(conn.from);
 }
 
 void encodeResult(nix::Store & localStore, nix::BuildResult & res, nix::remote::BuildDerivationDone * done)
