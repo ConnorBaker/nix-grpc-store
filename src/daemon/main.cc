@@ -660,7 +660,14 @@ public:
                     continue;
                 }
                 missing = localStore.printStorePath(input);
-                nixcompat::ensurePath(localStore, input);
+                try {
+                    nixcompat::ensurePath(localStore, input);
+                } catch (nix::Error &) {
+                    // nix keeps a narinfo for narinfo-cache-positive-ttl (30 days by
+                    // default), also once the NAR it names is gone and the cache has a
+                    // new narinfo, for an input built again with other bytes.
+                    backends.ensureUncached(localStore, input);
+                }
                 missing.clear();
                 counted.bytes += localStore.queryPathInfo(input)->narSize;
             }

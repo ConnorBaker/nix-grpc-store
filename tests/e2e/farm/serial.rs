@@ -457,8 +457,21 @@ test "$(curl -s -o /dev/null -w '%{http_code}' "$1/$nar")" = 404"#,
 /// Its users, one on each worker, miss it at the same time and both wait.
 #[test]
 fn an_input_whose_nar_the_cache_lost_is_built_again() {
+    users_of_a_lost_input("lostnar", false);
+}
+
+/// As above, but the input has other bytes on every build, so niks3 puts up
+/// a narinfo for the rebuild's NAR. worker2's nix-daemon, which kept the old
+/// narinfo when it missed the input, looks the input up again.
+#[test]
+fn an_input_whose_nar_the_cache_lost_is_built_again_with_other_bytes() {
+    users_of_a_lost_input("lostnondet", true);
+}
+
+fn users_of_a_lost_input(tag: &str, nondet: bool) {
     farm_ready();
-    let (tag, dep) = ("lostnar", expr("DEP"));
+    let dep = expr("DEP");
+    let nondet = if nondet { "true" } else { "false" };
     // Only worker1 can build it (vip). It reaches niks3 through worker1.
     let input = succeed(
         CLIENT,
@@ -477,6 +490,9 @@ fn an_input_whose_nar_the_cache_lost_is_built_again() {
             "--arg",
             "features",
             r#"["vip"]"#,
+            "--arg",
+            "nondet",
+            nondet,
         ],
     )
     .trim()
@@ -498,7 +514,7 @@ fn an_input_whose_nar_the_cache_lost_is_built_again() {
     let missed = |w| events(w, "input_not_substitutable");
     let (missed1, missed2) = (missed(WORKER1), missed(WORKER2));
     let users = format!(
-        r#"map (f: (import {dep} {{ tag = "{tag}"; salt = f; features = [ "vip" ]; jobFeatures = [ f ]; }}).job) [ "vip" "w2" ]"#
+        r#"map (f: (import {dep} {{ tag = "{tag}"; salt = f; features = [ "vip" ]; jobFeatures = [ f ]; nondet = {nondet}; }}).job) [ "vip" "w2" ]"#
     );
     let o = run_t(
         CLIENT,

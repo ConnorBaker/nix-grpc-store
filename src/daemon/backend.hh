@@ -73,6 +73,9 @@ struct Backends
         nix::BuildMode mode,
         Limits limits,
         const BuildEventSink & sendLogLine) const -> nix::BuildResult;
+
+    // EnsurePath with narinfo-cache-positive-ttl 0. Throws as ensurePath does.
+    void ensureUncached(nix::Store & localStore, const nix::StorePath & path) const;
 };
 
 template<typename Chunk>
