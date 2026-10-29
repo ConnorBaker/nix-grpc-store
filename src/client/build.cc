@@ -200,7 +200,7 @@ struct GrpcStore::Run {
   nixgrpc::exec::Executor exe;
   std::deque<Job *> byId; // deque: build threads keep references while jobs are added
   std::map<std::string, JobId, std::less<>> byName;
-  std::set<StorePath> recovered; // missing inputs, each handled once
+  std::set<std::pair<JobId, StorePath>> recovered; // missing inputs, each handled once per job
   bool closed = false;           // WritesDone sent
   grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
 
@@ -347,9 +347,13 @@ struct GrpcStore::Run {
     auto const pathS = store.printStorePath(path);
     {
       std::scoped_lock const lock(mutex);
-      if (!recovered.insert(path).second) {
-        return nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
-                                 fmt("input '%s' is missing on the farm", pathS));
+      if (!recovered.emplace(work.jid, path).second) {
+        // Missed again although recovered once: the farm may still be
+        // getting it (a worker whose nix-daemon cached a stale narinfo).
+        // Placed again like after any bounce, within reschedule-retries.
+        printError("%s: input '%s' is still missing on the farm, asking the scheduler again",
+                   work.job->drvPath.to_string(), pathS);
+        return Bounced{};
       }
     }
     auto const producer = work.job->farmInputs.find(path);
