@@ -496,6 +496,8 @@ public:
       uint64_t cpHintMs = 0;
       // Outputs of input drvs left to the farm, and their drv: a missing one becomes a job.
       std::map<StorePath, StorePath> farmInputs;
+      // Such a job: the farm counted its outputs as held, yet a worker could not get them.
+      bool cacheLost = false;
       std::optional<BuildResult> result;
     };
     struct Run;
