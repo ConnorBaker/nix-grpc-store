@@ -2,6 +2,14 @@
 // Farm scheduler protocol (sim/README.md) for one derivation. Messages are
 // sets in flight (reordered, duplicated); crashes drop them. Scheduler state
 // is soft and rebuilt from worker session reports.
+//
+// Not modelled: a worker's sessions overlapping. Here a worker has one
+// session at a time (WState.session). In the daemon a builder that
+// reconnects says Hello on its new session before the scheduler sees the
+// old one end, and the old session's messages can arrive after that. A new
+// Hello ends the older session (Dispatcher::onHello), which then takes no
+// message, and a Done ends only the placement its assign_id names;
+// dispatcher-test.cc tests them, and this model does not check them.
 
 module scheduler {
 

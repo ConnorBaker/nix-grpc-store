@@ -95,14 +95,16 @@ auto expectsIn(const std::vector<SchedCmd> & cmds) -> size_t
     return static_cast<size_t>(std::ranges::count_if(cmds, [](const SchedCmd & cmd) -> bool { return cmd.has_expect(); }));
 }
 
-// A builder's Hello (Builder::hello), for x86_64-linux.
-auto helloFrom(const char * addr, unsigned maxJobs) -> WorkerMsgs
+// A builder's Hello (Builder::hello), for x86_64-linux. `namesPlacements`
+// false: a builder from before Hello.names_placements.
+auto helloFrom(const char * addr, unsigned maxJobs, bool namesPlacements = true) -> WorkerMsgs
 {
     WorkerMsgs msgs;
     auto * hel = msgs.add_msgs()->mutable_hello();
     hel->set_addr(addr);
     hel->add_systems("x86_64-linux");
     hel->set_max_jobs(maxJobs);
+    hel->set_names_placements(namesPlacements);
     return msgs;
 }
 
@@ -369,6 +371,123 @@ void testLateFirstHelloEndsInAReconnect()
     disp.workerGone(nextSession);
 }
 
+// A builder can send a Done on its new session after that session's Hello,
+// for a drv the Hello left out: the Done was made first (the builder drops
+// the drv from what it expects before it sends it), and the Hello was built
+// in between. The Hello made the scheduler place the drv on the builder
+// again. That Done names the earlier placement and must end nothing: the
+// new placement keeps its slot until its own Done.
+void testDoneEndsOnlyThePlacementItNames()
+{
+    constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+    constexpr auto drvB = "/nix/store/11111111111111111111111111111111-b.drv";
+    Metrics metrics{""};
+    Dispatcher disp(debugConfig(), metrics);
+    std::vector<SchedCmd> toOld;
+    std::vector<SchedCmd> toNew;
+    std::vector<SchedMsg> toFirst;
+    std::vector<SchedMsg> toSecond;
+    Dispatcher::Worker oldSession{.send = recordInto(toOld), .abort = {}, .id = {}};
+    disp.workerMsgs(oldSession, helloFrom("w1:50051", 1));
+    auto first = disp.connectClient(recordMsgsInto(toFirst), [] -> void {});
+    disp.clientMsgs(first, wantOf(drvA));
+    assert(expectsIn(toOld) == 1);
+    Dispatcher::Worker newSession{.send = recordInto(toNew), .abort = {}, .id = {}};
+    disp.workerMsgs(newSession, helloFrom("w1:50051", 1));
+    assert(expectsIn(toNew) == 1);
+
+    // The first placement was given back (nobody came); that Done comes now.
+    auto back = doneOf(drvA, toOld.back().expect().assign_id(), nix::remote::Done::GIVEN_BACK);
+    back.mutable_msgs(0)->mutable_done()->set_reason(nix::remote::Done::UNREACHABLE);
+    disp.workerMsgs(newSession, back);
+
+    // drvA's new placement stands: another client is told where it runs,
+    // and drvB finds w1's one slot taken.
+    auto second = disp.connectClient(recordMsgsInto(toSecond), [] -> void {});
+    disp.clientMsgs(second, wantOf(drvA));
+    assert(expectsIn(toNew) == 1);
+    assert(assigned(toSecond) == 1);
+    assert(toSecond.back().assigned().assign_id() == toNew.back().expect().assign_id());
+    disp.clientMsgs(second, wantOf(drvB));
+    assert(expectsIn(toNew) == 1);
+
+    // Its own Done ends it, and drvB takes the slot.
+    disp.workerMsgs(newSession, doneOf(drvA, toNew.back().expect().assign_id(), nix::remote::Done::BUILT));
+    assert(expectsIn(toNew) == 2);
+    assert(toNew.back().expect().drv_path() == drvB);
+    // The stale give-back did not go unnoticed.
+    assert(metrics.eventCounter("done_other_placement").Value() == 1);
+
+    disp.clientGone(first);
+    disp.clientGone(second);
+    disp.workerGone(oldSession);
+    disp.workerGone(newSession);
+}
+
+// A client bounces off the builder that runs its drv (it could not reach
+// it), and no other builder can run it: the scheduler places the drv there
+// again, with a new assign id. The slot is free again after that build's
+// Done if the Done names the placement the scheduler holds: the new one
+// from a builder that names placements, which adopts the new id for the
+// build it runs, or any one from a builder that predates that
+// (Hello.names_placements unset), which keeps the first id. A Done naming
+// the first placement from a builder that names placements ends nothing.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): two flags, named at each call
+auto slotFreeAfterBounce(bool namesPlacements, bool doneNamesFirst, Metrics & metrics) -> bool
+{
+    constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+    constexpr auto drvB = "/nix/store/11111111111111111111111111111111-b.drv";
+    Dispatcher disp(debugConfig(), metrics);
+    std::vector<SchedCmd> toBuilder;
+    std::vector<SchedMsg> toFirst;
+    std::vector<SchedMsg> toSecond;
+    std::vector<SchedMsg> toThird;
+    Dispatcher::Worker builder{.send = recordInto(toBuilder), .abort = {}, .id = {}};
+    disp.workerMsgs(builder, helloFrom("w1:50051", 1, namesPlacements));
+    auto first = disp.connectClient(recordMsgsInto(toFirst), [] -> void {});
+    disp.clientMsgs(first, wantOf(drvA));
+    assert(expectsIn(toBuilder) == 1);
+    auto const firstId = toBuilder.back().expect().assign_id();
+    auto second = disp.connectClient(recordMsgsInto(toSecond), [] -> void {});
+    disp.clientMsgs(second, wantOf(drvA));
+    assert(assigned(toSecond) == 1);
+    auto bounce = wantOf(drvA);
+    bounce.mutable_msgs(0)->mutable_want()->set_bounced_assign_id(firstId);
+    disp.clientMsgs(second, bounce);
+    assert(expectsIn(toBuilder) == 2 && toBuilder.back().expect().drv_path() == drvA);
+    auto const againId = toBuilder.back().expect().assign_id();
+    assert(againId != firstId);
+    disp.workerMsgs(builder, doneOf(drvA, doneNamesFirst ? firstId : againId, nix::remote::Done::BUILT));
+    auto const cancel = [](const char * drv) -> ClientMsgs {
+        ClientMsgs msgs;
+        msgs.add_msgs()->mutable_cancel()->set_drv_path(drv);
+        return msgs;
+    };
+    disp.clientMsgs(first, cancel(drvA));
+    disp.clientMsgs(second, cancel(drvA));
+    auto third = disp.connectClient(recordMsgsInto(toThird), [] -> void {});
+    disp.clientMsgs(third, wantOf(drvB));
+    bool const freed = expectsIn(toBuilder) == 3;
+    disp.clientGone(first);
+    disp.clientGone(second);
+    disp.clientGone(third);
+    disp.workerGone(builder);
+    return freed;
+}
+
+void testBounceOntoTheBuildingWorker()
+{
+    Metrics adopts{""};
+    assert(slotFreeAfterBounce(true, false, adopts));
+    assert(adopts.eventCounter("done_other_placement").Value() == 0);
+    Metrics late{""};
+    assert(!slotFreeAfterBounce(true, true, late));
+    assert(late.eventCounter("done_other_placement").Value() == 1);
+    Metrics older{""};
+    assert(slotFreeAfterBounce(false, true, older));
+    assert(older.eventCounter("done_other_placement").Value() == 0);
+}
+
 } // namespace
 
 auto main() -> int
@@ -377,6 +496,8 @@ auto main() -> int
     testOldSessionMessagesAfterTheNewHello();
     testReplacedSessionAfterTheWorkerLeft();
     testLateFirstHelloEndsInAReconnect();
+    testDoneEndsOnlyThePlacementItNames();
+    testBounceOntoTheBuildingWorker();
     testLoadRestoresSlotsAfterDrainingHello();
     return 0;
 }

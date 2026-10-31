@@ -99,6 +99,32 @@ void testExpectWhileDrainingIsGivenBackLater()
     assert(builder.holding() == 0);
 }
 
+// The scheduler can place a drv that this builder already runs on it once
+// more, with a new assign id (a client bounced, and no other worker can run
+// it). The running build then stands for the new placement: clients attach
+// to it, and the next Hello and its Done name the new id, which Core::done
+// needs to end that placement.
+void testRunningBuildTakesTheNewPlacement()
+{
+    auto const opts = options();
+    Metrics metrics{""};
+    Builder builder(opts, metrics);
+    Session session;
+    session.attach(builder);
+    builder.onExpect(expect(drvA, 1));
+    auto const building = builder.admit(drvA);
+    assert(building && !building->attach && building->assignId == 1);
+    builder.onExpect(expect(drvA, 2));
+    auto const attached = builder.admit(drvA);
+    assert(attached && attached->attach);
+    auto const hello = builder.hello();
+    assert(hello.hello().names_placements());
+    assert(hello.hello().running_size() == 1 && hello.hello().running(0).assign_id() == 2);
+    builder.finished(drvA, Done::BUILT, {}, "");
+    auto const dones = session.dones();
+    assert(dones.size() == 1 && dones[0].assign_id() == 2);
+}
+
 // A client that reached the builder for a drv and went away without building
 // it (bounced elsewhere, or sent to a successor that took the node over) left
 // a claimed Expect nobody else ends. Once no call for it is in flight and
@@ -182,6 +208,7 @@ void testUploadKeepsTheClaim()
 auto main() -> int
 try {
     testExpectWhileDrainingIsGivenBackLater();
+    testRunningBuildTakesTheNewPlacement();
     testQuietClaimIsGivenBack();
     testDrainingGivesBackAQuietClaim();
     testUploadKeepsTheClaim();

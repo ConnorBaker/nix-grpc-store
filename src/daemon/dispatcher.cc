@@ -641,7 +641,8 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
          .features = {hel.features().begin(), hel.features().end()},
          .maxJobs = hel.max_jobs(),
          .running = std::move(running),
-         .faulty = hel.publish_failing()},
+         .faulty = hel.publish_failing(),
+         .namesPlacements = hel.names_placements()},
         superseded);
     workers[*worker.id] = &worker;
     membershipChangedLocked();
@@ -661,19 +662,32 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
 void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
 {
     metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
-    if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
-        core.giveBack(wid, done.drv_path());
-        metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
-        placeabilityChangedLocked(); // its followers may have no worker left
-        return;
-    }
+    bool const givenBack =
+        done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW;
     std::vector<std::pair<std::string_view, uint64_t>> outputs;
     if (done.outcome() == nix::remote::Done::BUILT) {
         for (const auto & out : done.outputs()) {
             outputs.emplace_back(out.path(), out.nar_size());
         }
     }
-    core.done(wid, done.drv_path(), outputs);
+    bool const ended = givenBack ? core.giveBack(wid, done.drv_path(), done.assign_id())
+                                 : core.done(wid, done.drv_path(), outputs, done.assign_id());
+    if (!ended) {
+        // Made before the Hello that let the drv be placed here again.
+        metrics.event("done_other_placement");
+        logLine(
+            LogLevel::info,
+            {{"event", "done_other_placement"},
+             {"drv", done.drv_path()},
+             {"assign_id", std::to_string(done.assign_id())},
+             {"outcome", nix::remote::Done::Outcome_Name(done.outcome())},
+             {"worker", core.worker(wid).addr}});
+        return;
+    }
+    if (givenBack) {
+        metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
+        placeabilityChangedLocked(); // its followers may have no worker left
+    }
 }
 
 void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg)
