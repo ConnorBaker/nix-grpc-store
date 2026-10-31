@@ -207,6 +207,7 @@ if build_server
     'src/daemon/options.cc',
     'src/daemon/tunnel.cc',
     'src/daemon/tunnels.cc',
+    'src/daemon/takeover.cc',
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
 
@@ -293,6 +294,18 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  max_jobs_conf = meson.current_build_dir() / 'max-jobs-test-conf'
+  test('max-jobs', executable('max-jobs-test',
+    sources : ['tests/max-jobs-test.cc'],
+    include_directories : [src_inc],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+    dependencies : [nix_store_dep, nix_util_dep],
+  ), env : {
+    'NIX_CONF_DIR' : max_jobs_conf,
+    'NIX_USER_CONF_FILES' : max_jobs_conf / 'no-user.conf',
+    'NIX_CONFIG' : '',
+  })
+
   test('sbpl', executable('sbpl-test',
     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
@@ -307,6 +320,13 @@ if build_server
       dependencies : [nix_util_dep],
       cpp_args : ['-UNDEBUG'],
     ))
+
+    test('takeover', executable('takeover-test',
+      sources : ['tests/takeover-test.cc', 'src/daemon/takeover.cc'],
+      include_directories : [src_inc, include_directories('src/daemon')],
+      dependencies : [nix_util_dep, threads_dep],
+      cpp_args : ['-UNDEBUG'],
+    ), timeout : 60)
   endif
 
   test('acl', executable('acl-test',

@@ -43,8 +43,39 @@ What happens on a build:
   system and features it offers and how many builds it takes. The
   scheduler tells it which derivation to expect before the client shows
   up. A build nobody announced is turned away and the client asks the
-  scheduler again. A second client for a build that is already running
-  attaches to it.
+  scheduler again. So does a client the balancer could not connect to
+  that builder, and the scheduler picks another one. A second client for
+  a build that is already running attaches to it, and so does a client
+  whose stream to it broke: the build goes on until no client wants it.
+* A builder that cannot get an input tries once more without the
+  narinfos its nix-daemon cached, one of which may name a NAR the cache
+  lost. If it still cannot, and the binary cache lost the input (niks3
+  lists it as a closure root, but the bucket has no narinfo for it or
+  its NAR answers 404, which the builder checks at `--niks3-cache-url`),
+  the builder names it. The client then builds that input too, without
+  the scheduler's cache lookup; the builder that makes it publishes it
+  with niks3 checking the bucket (`--verify-s3-integrity`), which takes
+  the lost objects again and, for a rebuild with other bytes, puts up a
+  narinfo naming the new NAR, so every builder can get it again. The
+  build waits for it and is placed anew. A build that misses the same
+  input again goes to the scheduler again, and so does any other failure
+  to get an input, up to the client's
+  `reschedule-retries`: a cache that did not answer, or an input niks3
+  does not list, which only another substituter offers or which niks3
+  holds only inside another root's closure (niks3 lists closure roots
+  only). Any client that may build can ask for that check (header
+  `x-nix-cache-lost`); it costs an S3 lookup per object of the outputs'
+  closure.
+
+  Known limitation: nix keeps a narinfo it looked up for
+  `narinfo-cache-positive-ttl` (30 days by default), even once the NAR
+  it names answers 404. Builders get past that as above. Any other
+  machine that substitutes from the cache, and looked an input up before
+  it was built again with other bytes, fails to fetch it until that
+  narinfo expires: a client of the farm that reads the cache directly
+  (`nix copy --from` the cache), for example. Clients that read through
+  the farm are not affected. The fix belongs in nix: drop a cached
+  narinfo whose NAR answers 404, and look the path up again.
 * The balancer (envoy) sends scheduler traffic to the active scheduler,
   sends each build to the builder the scheduler named, and spreads
   everything else (uploads, queries, downloads) over the builders of
@@ -143,7 +174,7 @@ services.nix-grpc-daemon = {
 | `roles` | `builder`, `scheduler` or both (the default). Only fixed machines should have `scheduler`. |
 | `scheduler` | Where a builder finds the scheduler: that node's address, or the balancer's when several nodes have the role (see [failover](#managing-the-farm)). Unset on a node that is the only scheduler. |
 | `advertise` | The address the balancer reaches this node at. A builder's must be `IP:port`, since the scheduler passes it to envoy as an endpoint. It routes requests and grants no access: only peers with the `trusted` role can open a session. A scheduler node's must match its entry in the balancer's `scheduler`. |
-| `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`. |
+| `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`, read again on SIGHUP. |
 | `lookupThreads` | Cache lookups a scheduler runs at once for incoming build requests, 32 by default. Raise it when requests wait on a slow cache while the scheduler is idle. |
 | `minFree` | Below this much free disk the node takes no new builds until space returns. |
 | `buildLogRetention` | How long a builder keeps Nix's build logs, `"30d"` by default. `null` keeps them forever, as Nix does. |
@@ -331,8 +362,49 @@ arriving, hands assignments no client has claimed yet back to the
 scheduler, and returns once the claimed ones have published. After
 `TimeoutStopSec` (1h) the rest is killed and the clients are sent to
 another worker. A second SIGTERM cancels right away. `nixos-rebuild
-switch` only signals the worker and the next connection starts the new
-generation.
+switch` reloads the unit, which drains the same way but returns at once.
+The new generation starts once the old process has exited: systemd
+starts no second process of the unit, and the old one holds the port.
+Until then the balancer sends new builds to the other builders.
+
+**Upgrade a single node.** A node that is its own scheduler's only
+builder (both roles, no `scheduler`, socket-activated) has no other
+builder to take new builds while it drains. There a reload, and so
+`nixos-rebuild switch`, starts the new generation at once instead: it
+takes over the socket and the scheduler, becomes the unit's main
+process, and the old process finishes the builds it runs beside it and
+then exits (`event=handed_over` and `event=predecessor_exited` in the
+journal). New builds go to the new generation from the moment the
+reload returns. The new one does not stop or idle out before the old
+one has exited, so its builds keep their process, and a stop drains
+both. Until then the node runs the builds of both, up to twice
+`max-jobs`; a reload while an older one still drains adds another
+generation. If the new generation crashes, systemd stops the unit and
+the old one's builds go with it: their clients build them again. If it
+cannot start, the reload fails and the old one serves on. If it hangs
+once it has the sockets, systemd's reload timeout does not end it: the
+old one serves on after 120 s, and if the hung one had started
+accepting, it keeps taking a share of new connections until it is
+killed. A reload can also report failure although the takeover went
+through, when systemd's timeout falls after the new generation last
+checked the reload and before systemd read MAINPID=; `event=handed_over`
+says which process serves. By hand, upgrade with `systemctl reload`:
+`stop` and `restart` still drain first and take no builds meanwhile. A
+daemon too old to hand over fails the reload and keeps running
+unchanged.
+
+**Upgrade the module or the chart.** Both pass the daemon
+`--niks3-cache-url` (from `niks3.cacheUrl`, the chart's `niks3.cacheURL`). A
+`nix-grpc-daemon` older than that flag exits on it, so deploy the
+package with the module or chart it came with, not behind it.
+
+**Change a builder's capacity.** Without `maxJobs` a builder takes nix's
+`max-jobs`. After changing it in nix.conf, or in a file nix.conf includes,
+`systemctl kill --kill-whom=main --signal=SIGHUP nix-grpc-daemon` makes the
+builder read it again and tell the scheduler. Running builds carry on; if
+the new value is lower, no new ones arrive until enough have finished.
+Nothing is re-read without the signal. `systemctl reload` starts a new
+generation, see above.
 
 **Restart the scheduler.** Safe at any time, see [How it works](#how-it-works).
 New builds wait until it is back, or until another scheduler node has

@@ -1,9 +1,7 @@
 // Command line of nix-grpc-daemon.
 
 #include "options.hh"
-#include "nix-compat.hh"
 
-#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -192,6 +190,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.oidcConfig = next();
         } else if (arg == "--niks3") {
             options.niks3.url = next();
+        } else if (arg == "--niks3-cache-url") {
+            options.niks3.cacheUrl = next();
         } else if (arg == "--niks3-token-file") {
             options.niks3.tokenFile = next();
         } else if (arg == "--niks3-client-cert") {
@@ -248,6 +248,13 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.sandboxWrite.emplace_back(next());
         } else if (arg == "--min-free") {
             options.minFree = parseSize(next());
+        } else if (arg == "--take-over") {
+            // NOLINTNEXTLINE(misc-include-cleaner): pid_t comes from <unistd.h>.
+            auto pid = parseInt<pid_t>(next());
+            if (!pid || *pid <= 1) {
+                throw nix::Error("--take-over expects the PID of the unit's main process");
+            }
+            options.takeOverFrom = pid;
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
@@ -266,8 +273,6 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     }
     if (!options.builder) {
         options.maxJobs = 0;
-    } else if (options.maxJobs == 0) {
-        options.maxJobs = std::clamp(nixcompat::maxBuildJobs(), 1U, static_cast<unsigned>(sched::FreeIndex::maxSlots));
     }
     if (options.schedulerAddr.empty() && !options.scheduler) {
         throw nix::Error("--role builder without --scheduler has nobody to take work from");
@@ -289,6 +294,9 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         options.advertise = tunnel::nodeName(tunnel::certName(options.tlsCert), options.workerName);
     }
     options.advertise = bracketHost(options.advertise);
+    if (options.takeOverFrom && !options.handsOver()) {
+        throw nix::Error("--take-over is for a node that is its own scheduler's only builder (--role builder,scheduler without --scheduler)");
+    }
     if (options.advertise.empty()) {
         options.advertise = options.listen;
     }

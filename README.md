@@ -393,7 +393,11 @@ which also requires `trustClients` (see above).
     scheduler says no worker can take a build.
   * `reschedule-retries` (default 8) — how often a derivation whose
     assigned worker went away is handed back to the scheduler. The first
-    time at once, then after 0.5 s, 1 s, 2 s and from then on 4 s.
+    time at once, then after 0.5 s, 1 s, 2 s and from then on 4 s. The
+    first bounce by each worker that went away, or did not take the
+    build, does not count and is not waited for, nor does one after which
+    the scheduler sends it back to the same assignment, where the build
+    still runs.
   * `max-builds` (default 64) — concurrent `BuildDerivation` streams.
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that
@@ -414,7 +418,7 @@ which also requires `trustClients` (see above).
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
   * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--extra-system SYSTEM`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
   * `--lookup-threads N` — how many cache lookups a scheduler runs at once for incoming Wants, default 32. Raise it when Wants wait on a slow cache while the scheduler is idle
-  * `--niks3 URL [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both
+  * `--niks3 URL [--niks3-cache-url URL] [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both. `--niks3-cache-url` is the cache as nodes substitute from it: with it, a builder that cannot get an input which the cache lost (niks3 lists it as a closure root, but the bucket has no narinfo for it or its NAR answers 404) names it, so the client builds it
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring

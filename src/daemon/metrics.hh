@@ -19,6 +19,7 @@ namespace nixgrpc {
 class Metrics
 {
     std::shared_ptr<prometheus::Registry> registry = std::make_shared<prometheus::Registry>();
+    std::string listen;
     std::unique_ptr<prometheus::Exposer> exposer;
 
     prometheus::Family<prometheus::Counter> * rpcs =
@@ -107,6 +108,7 @@ class Metrics
     prometheus::Gauge * schedWorkersGauge = &sched->Add({{"kind", "workers"}});
     prometheus::Gauge * schedRestedGauge = &sched->Add({{"kind", "rested"}});
     prometheus::Gauge * schedLeaderGauge = &sched->Add({{"kind", "leader"}});
+    prometheus::Gauge * buildSlotsGauge = nullptr;
 
     // NOLINTNEXTLINE(*-magic-numbers)
     prometheus::Histogram::BucketBoundaries buckets{0.05, 0.25, 1, 2, 5, 10, 30, 60, 120, 300, 900, 3600};
@@ -210,14 +212,17 @@ public:
             .Set(1);
     }
 
+    // Builders only: registered on first use, then set again on SIGHUP.
     void buildSlots(unsigned count)
     {
-        prometheus::BuildGauge()
-            .Name("nix_grpc_build_slots")
-            .Help("Configured concurrent builds (--max-jobs)")
-            .Register(*registry)
-            .Add({})
-            .Set(count);
+        if (buildSlotsGauge == nullptr) {
+            buildSlotsGauge = &prometheus::BuildGauge()
+                                   .Name("nix_grpc_build_slots")
+                                   .Help("Concurrent builds taken: --max-jobs, else nix's max-jobs as last read")
+                                   .Register(*registry)
+                                   .Add({});
+        }
+        buildSlotsGauge->Set(count);
     }
 
     void unavailable(std::string_view reason, bool holds) const
@@ -308,9 +313,19 @@ public:
     }
 
     // `listen` empty: keep counting but do not serve /metrics.
-    explicit Metrics(const std::string & listen)
+    explicit Metrics(std::string listen)
+        : listen(std::move(listen))
     {
-        if (!listen.empty()) {
+        serve(true);
+    }
+
+    // Off frees the port for a successor taking over, on serves again if the
+    // takeover failed. From one thread.
+    void serve(bool serving)
+    {
+        if (!serving) {
+            exposer.reset();
+        } else if (!exposer && !listen.empty()) {
             exposer = std::make_unique<prometheus::Exposer>(listen);
             exposer->RegisterCollectable(registry);
         }

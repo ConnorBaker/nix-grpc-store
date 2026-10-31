@@ -17,6 +17,16 @@ let
     nixPkgs = nixPackages;
     clientModule = nixosModule;
   };
+  # One check per part of tests/farm.nix, so each fits in one build client.
+  farm =
+    part:
+    import ../tests/farm.nix {
+      e2eTests = pkgs.callPackage ../tests/e2e { };
+      inherit pkgs niks3 part;
+      mockOidc = niks3.packages.${pkgs.stdenv.hostPlatform.system}.mock-oidc-server;
+      nixPkgs = nixPackages;
+      module = nixosModule;
+    };
   # Drop once NixOS/nixpkgs#563394 reaches nixos-unstable.
   clangTools = pkgs.llvmPackages_22.clang-tools.overrideAttrs (old: {
     buildInputs = (old.buildInputs or [ ]) ++ [ pkgs.bash ];
@@ -134,6 +144,22 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     phase = "upload";
   };
 
+  handover-upgrade = import ../tests/handover.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+    part = "upgrade";
+  };
+
+  handover-failures = import ../tests/handover.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+    part = "failures";
+  };
+
   helm = import ../tests/helm.nix {
     inherit pkgs;
     chart = ../deploy/helm/nix-grpc-farm;
@@ -147,12 +173,8 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     module = nixosModule;
   };
 
-  farm = import ../tests/farm.nix {
-    e2eTests = pkgs.callPackage ../tests/e2e { };
-    inherit pkgs niks3;
-    mockOidc = niks3.packages.${pkgs.stdenv.hostPlatform.system}.mock-oidc-server;
-    nixPkgs = nixPackages;
-    module = nixosModule;
-  };
+  farm-scheduling = farm "scheduling";
+  farm-restarts = farm "restarts";
+  farm-cutoffs = farm "cutoffs";
 }
 // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") { inherit k3s; }

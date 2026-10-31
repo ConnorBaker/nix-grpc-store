@@ -38,14 +38,14 @@ struct Expected
     // a give-back or a Revoke: the scheduler revokes it if its client leaves.
     bool claimed = false;
     bool running = false;
+    uint32_t calls = 0; // calls for it in flight (Call); `since` is when the last one began or ended
 
     // Second BuildDerivation for the same drv attaches here.
     struct Shared
     {
         std::mutex mutex;
         std::condition_variable cv;
-        std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along
-        std::atomic<unsigned> attached{0};  // callers waiting in attach(); the build outlives its first caller for them
+        std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along, or nobody wants it
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
         // Written before `finished`.
@@ -97,8 +97,9 @@ public:
         bool attach = false;
     };
 
-    // Any BuildDerivation for the drv, also one answered NOT_FOUND.
-    // False if the worker does not expect the drv. `assignId` names the
+    // A call for the drv: any BuildDerivation, also one answered NOT_FOUND,
+    // and an upload of its inputs (x-nix-drv); see Call, which pairs it with
+    // callEnded(). False if the worker does not expect the drv. `assignId` names the
     // caller's assignment, 0 if it does not say. Waits a short while for an
     // assignment that is still on its way.
     auto claim(const std::string & drvPath, uint64_t assignId = 0) -> bool;
@@ -144,8 +145,51 @@ public:
         return unavailable_ != 0;
     }
 
-    // Give back unclaimed Expects nobody came for. Called from the serve loop.
+    // Builds taken at once: Config::maxJobs, then the last setMaxJobs().
+    [[nodiscard]] auto maxJobs() const -> uint32_t
+    {
+        return maxJobs_;
+    }
+    // The capacity changed (nix's max-jobs read anew): tell the scheduler.
+    void setMaxJobs(uint32_t maxJobs);
+
+    // Give back Expects nobody came for, or whose client went quiet. Called
+    // from the serve loop.
     void tick();
+    // A call that claimed `drvPath` returns, however it went.
+    void callEnded(const std::string & drvPath);
+
+    // A call for a drv, from claim() to callEnded().
+    class Call
+    {
+        Builder & builder;
+        std::string drvPath;
+        bool expected_;
+
+    public:
+        Call(Builder & builder, std::string drvPath, uint64_t assignId = 0)
+            : builder(builder)
+            , drvPath(std::move(drvPath))
+            , expected_(builder.claim(this->drvPath, assignId))
+        {
+        }
+
+        // The drv was expected here when the call began.
+        [[nodiscard]] auto expected() const -> bool
+        {
+            return expected_;
+        }
+
+        Call(const Call &) = delete;
+        Call(Call &&) = delete;
+        auto operator=(const Call &) -> Call & = delete;
+        auto operator=(Call &&) -> Call & = delete;
+
+        ~Call()
+        {
+            builder.callEnded(drvPath);
+        }
+    };
 
     // Swapped by the session thread on every (re)connect.
     void setSend(SendFn send);
@@ -164,8 +208,9 @@ private:
     mutable nix::Sync<State> state;
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<uint8_t> unavailable_{0};
-    // Orders the Load messages of concurrent setUnavailable() calls, and
-    // keeps them behind the Hello of their session.
+    std::atomic<uint32_t> maxJobs_;
+    // Orders the Load messages of concurrent setUnavailable() and
+    // setMaxJobs() calls, and keeps them behind the Hello of their session.
     std::mutex unavailableMutex;
     std::function<void(bool)> availability_;
     bool greeted_ = false;
@@ -175,6 +220,8 @@ private:
     static constexpr std::chrono::seconds expectLag{5};
     std::condition_variable expectArrived;
 
+    // Draining and capacity. Under unavailableMutex.
+    [[nodiscard]] auto load() const -> nix::remote::WorkerMsg;
     void sendDone(
         const std::string & drvPath,
         uint64_t assignId,
@@ -182,7 +229,7 @@ private:
         const std::vector<std::pair<std::string, uint64_t>> & outputs,
         nix::remote::Done::Reason reason = nix::remote::Done::REASON_UNSPECIFIED);
     void giveBack(const std::vector<std::pair<std::string, uint64_t>> & drvs, nix::remote::Done::Reason reason);
-    auto takeUnclaimed(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>;
+    auto take(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>;
 };
 
 } // namespace nixgrpc

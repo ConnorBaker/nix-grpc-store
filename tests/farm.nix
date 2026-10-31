@@ -1,6 +1,8 @@
 # Multi-node end to end: niks3 + S3, two builder nodes (both may
 # schedule, niks3 picks one) behind envoy, a CI client using the build hook and an OIDC
-# developer.
+# developer. `part` picks the tests (`parts` below), so that each check fits
+# in one build client: every part boots this farm afresh and runs some of
+# tests/e2e/farm's modules.
 {
   pkgs,
   nixPkgs,
@@ -8,6 +10,7 @@
   niks3,
   mockOidc,
   e2eTests,
+  part,
 }:
 
 let
@@ -127,6 +130,8 @@ let
         };
       };
       nix.settings.extra-substituters = [ "${offerUrl}?want-mass-query=true" ];
+      # A test resets one NAR download of worker1's nix-daemon (root).
+      environment.systemPackages = [ pkgs.iptables ];
       programs.nix-grpc-store.enable = true;
       networking.firewall.allowedTCPPorts = [ 50051 ];
       testCerts.neededBy = [ "nix-grpc-daemon.service" ];
@@ -149,14 +154,15 @@ let
     mk' top "farm-top" [ a b ]
   '';
   depExpr = pkgs.writeText "dep.nix" ''
-    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features }:
+    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features, nondet ? false }:
     rec {
       input = if inputPath != null then builtins.storePath inputPath else derivation {
         name = "local-input-''${tag}";
         system = builtins.currentSystem;
         requiredSystemFeatures = features;
         builder = "/bin/sh";
-        args = [ "-c" "echo ''${tag} > $out" ];
+        # nondet: other bytes on every build, as many real builds have.
+        args = [ "-c" (if nondet then "read u < /proc/sys/kernel/random/uuid; echo ''${tag} $u > $out" else "echo ''${tag} > $out") ];
       };
       referrer = derivation {
         name = "refers-to-input-''${tag}";
@@ -169,7 +175,8 @@ let
         system = builtins.currentSystem;
         requiredSystemFeatures = jobFeatures;
         builder = "/bin/sh";
-        args = [ "-c" "read x < ''${input}; echo $x > $out" ];
+        # Other bytes than the input's, so its NAR is another object.
+        args = [ "-c" "read x < ''${input}; echo used-$x > $out" ];
       };
     }
   '';
@@ -183,10 +190,11 @@ let
     }
   '';
   slowExpr = pkgs.writeText "slow.nix" ''
-    { tag, unique ? false }:
+    { tag, unique ? false, features ? [ ] }:
     derivation {
       name = "slow-''${tag}";
       system = builtins.currentSystem;
+      requiredSystemFeatures = features;
       builder = "/bin/sh";
       # Inner sh so a test can pkill it to let the build succeed early.
       args = [
@@ -197,10 +205,40 @@ let
       ];
     }
   '';
+
+  # Subtests per part, each an e2e module run with that many test threads.
+  parts = {
+    scheduling = [
+      {
+        title = "independent builds";
+        module = "independent";
+        threads = 3;
+      }
+      {
+        title = "scheduling, placement and the cache";
+        module = "scheduling";
+        threads = 1;
+      }
+    ];
+    restarts = [
+      {
+        title = "schedulers and builders restarting, draining and dying";
+        module = "restarts";
+        threads = 1;
+      }
+    ];
+    cutoffs = [
+      {
+        title = "calls, streams and uploads cut off";
+        module = "cutoffs";
+        threads = 1;
+      }
+    ];
+  };
 in
 pkgs.testers.runNixOSTest {
-  name = "nix-grpc-farm";
-  globalTimeout = 1800;
+  name = "nix-grpc-farm-${part}";
+  globalTimeout = 540;
 
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
@@ -212,6 +250,8 @@ pkgs.testers.runNixOSTest {
       imports = [ (worker "worker1") ];
       testCerts.certs.worker1 = cert "worker-1" "DNS:worker1,DNS:lb,IP:${ip.worker1}";
       nix.settings.system-features = [ "vip" ];
+      # Rewritten under the running daemon by the max-jobs e2e test.
+      nix.extraOptions = "!include /run/nix-max-jobs.conf";
       services.nix-grpc-daemon.workerName = "node-a";
       # With worker2, two builders for a system other than the default.
       services.nix-grpc-daemon.extraSystems = [ "riscv64-linux" ];
@@ -350,19 +390,19 @@ pkgs.testers.runNixOSTest {
     }
     nodes = {"client": client, "lb": lb, "worker1": worker1, "worker2": worker2}
 
-    with subtest("extraSystems are advertised"):
-        # Either worker may hold the scheduler role.
-        def advertised(last_try: bool) -> bool:
-            return any(
-                w.execute("journalctl -u nix-grpc-daemon -o cat | grep worker_hello | grep '${ip.worker2}' | grep -q riscv64-linux")[0] == 0
-                for w in [worker1, worker2]
-            )
-        retry(advertised, timeout_seconds=60)
-
-    with subtest("independent builds"):
-        run_e2e(nodes, env, "farm::independent::", "--test-threads=3")
-
-    with subtest("scheduler and lifecycle"):
-        run_e2e(nodes, env, "farm::serial::", "--test-threads=1")
+    ${lib.optionalString (part == "scheduling") ''
+      with subtest("extraSystems are advertised"):
+          # Either worker may hold the scheduler role.
+          def advertised(last_try: bool) -> bool:
+              return any(
+                  w.execute("journalctl -u nix-grpc-daemon -o cat | grep worker_hello | grep '${ip.worker2}' | grep -q riscv64-linux")[0] == 0
+                  for w in [worker1, worker2]
+              )
+          retry(advertised, timeout_seconds=60)
+    ''}
+    ${lib.concatMapStringsSep "\n" (s: ''
+      with subtest("${s.title}"):
+          run_e2e(nodes, env, "farm::${s.module}::", "--test-threads=${toString s.threads}")
+    '') parts.${part}}
   '';
 }
