@@ -4,17 +4,26 @@
 // ourselves.
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <mutex>
 #include <optional>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -24,6 +33,7 @@
 #include <nix/util/file-descriptor.hh>
 
 #include "parse-int.hh"
+#include "sd-notify.hh"
 
 namespace nixgrpc {
 
@@ -54,28 +64,6 @@ inline auto systemdListenFds() -> std::vector<int>
     return fds;
 }
 
-// sd_notify(3) without libsystemd. Best effort, errors are ignored.
-inline void sdNotify(std::string_view state)
-{
-    auto path = nix::getEnv("NOTIFY_SOCKET");
-    if (!path || path->size() < 2 || path->size() >= sizeof(sockaddr_un::sun_path)) {
-        return;
-    }
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::ranges::copy(*path, std::begin(addr.sun_path));
-    if (path->starts_with('@')) {
-        addr.sun_path[0] = '\0'; // abstract namespace
-    }
-    auto const addrLen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path->size());
-    nix::AutoCloseFD const sock(::socket(AF_UNIX, SOCK_DGRAM, 0));
-    if (!sock) {
-        return;
-    }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): sockaddr API.
-    ::sendto(sock.get(), state.data(), state.size(), 0, reinterpret_cast<const sockaddr *>(&addr), addrLen);
-}
-
 // Half of WatchdogSec=, or zero if the watchdog is off.
 inline auto sdWatchdogInterval() -> std::chrono::microseconds
 {
@@ -83,34 +71,102 @@ inline auto sdWatchdogInterval() -> std::chrono::microseconds
     return std::chrono::microseconds(usec.value_or(0) / 2);
 }
 
-// The threads live until process exit: the listen fds belong to systemd and
-// must not be shut down. After Server::Shutdown() the acceptor drops new
-// connections itself.
-inline void
-acceptInto(const std::vector<int> & listenFds, const std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> & acceptor)
+// Accepts on the listen fds and hands the connections to gRPC, one thread per
+// fd. The fds stay open: they belong to systemd, and after a takeover the
+// successor accepts on them too. After Server::Shutdown() the acceptor drops
+// new connections itself.
+class Acceptor
 {
-    for (int const listenFd : listenFds) {
-        std::thread([listenFd, acceptor] -> void {
-            while (true) {
-                // No accept4 on macOS.
-                int const conn = ::accept(listenFd, nullptr, nullptr);
-                if (conn < 0) {
-                    if (errno == EINTR || errno == ECONNABORTED || errno == EMFILE || errno == ENFILE) {
-                        continue;
-                    }
-                    return;
-                }
-                // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg): C API.
-                ::fcntl(conn, F_SETFD, FD_CLOEXEC);
-                ::fcntl(conn, F_SETFL, static_cast<unsigned>(std::max(0, ::fcntl(conn, F_GETFL))) | unsigned{O_NONBLOCK});
-                // NOLINTEND(cppcoreguidelines-pro-type-vararg)
-                grpc::experimental::ExternalConnectionAcceptor::NewConnectionParameters params;
-                params.listener_fd = listenFd;
-                params.fd = conn;
-                acceptor->HandleNewConnection(&params);
-            }
-        }).detach();
+public:
+    using Grpc = grpc::experimental::ExternalConnectionAcceptor;
+
+    Acceptor(std::vector<int> listenFds, std::shared_ptr<Grpc> acceptor)
+        : listenFds(std::move(listenFds))
+        , acceptor(std::move(acceptor))
+    {
     }
-}
+
+    void start()
+    {
+        run = std::make_shared<Run>();
+        run->wake.create();
+        run->running = listenFds.size();
+        for (int const listenFd : listenFds) {
+            std::thread([listenFd, acceptor = acceptor, run = run] -> void { loop(listenFd, *acceptor, *run); })
+                .detach();
+        }
+    }
+
+    // For a successor to accept instead. True once no thread of ours accepts
+    // any more. Only another process accepting on the same fds can leave one
+    // blocked in accept() past `grace`, on the connection poll() announced:
+    // it then hands the next one it gets to gRPC and leaves.
+    auto stop(std::chrono::milliseconds grace) -> bool
+    {
+        auto const current = std::exchange(run, nullptr);
+        if (!current) {
+            return true;
+        }
+        current->stopping = true;
+        char const wake = 0;
+        static_cast<void>(::write(current->wake.writeSide.get(), &wake, 1));
+        std::unique_lock lock(current->mutex);
+        return current->stopped.wait_for(lock, grace, [&] -> bool { return current->running == 0; });
+    }
+
+private:
+    struct Run
+    {
+        nix::Pipe wake;
+        std::atomic<bool> stopping{false};
+        std::mutex mutex;
+        std::condition_variable stopped;
+        size_t running = 0;
+    };
+
+    std::vector<int> listenFds;
+    std::shared_ptr<Grpc> acceptor;
+    std::shared_ptr<Run> run;
+
+    static void loop(int listenFd, Grpc & acceptor, Run & run)
+    {
+        while (!run.stopping) {
+            // poll() first, so stop() can wake us: the listen fds are shared,
+            // so neither shutdown() nor O_NONBLOCK on them is ours to use.
+            std::array<pollfd, 2> fds{{
+                {.fd = listenFd, .events = POLLIN, .revents = 0},
+                {.fd = run.wake.readSide.get(), .events = POLLIN, .revents = 0},
+            }};
+            if (::poll(fds.data(), fds.size(), -1) < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (std::get<1>(fds).revents != 0) {
+                break;
+            }
+            // No accept4 on macOS.
+            int const conn = ::accept(listenFd, nullptr, nullptr);
+            if (conn < 0) {
+                if (errno == EINTR || errno == ECONNABORTED || errno == EMFILE || errno == ENFILE || errno == EAGAIN) {
+                    continue;
+                }
+                break;
+            }
+            // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg): C API.
+            ::fcntl(conn, F_SETFD, FD_CLOEXEC);
+            ::fcntl(conn, F_SETFL, static_cast<unsigned>(std::max(0, ::fcntl(conn, F_GETFL))) | unsigned{O_NONBLOCK});
+            // NOLINTEND(cppcoreguidelines-pro-type-vararg)
+            Grpc::NewConnectionParameters params;
+            params.listener_fd = listenFd;
+            params.fd = conn;
+            acceptor.HandleNewConnection(&params);
+        }
+        const std::scoped_lock lock(run.mutex);
+        --run.running;
+        run.stopped.notify_all();
+    }
+};
 
 } // namespace nixgrpc
