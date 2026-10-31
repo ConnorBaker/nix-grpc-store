@@ -47,6 +47,13 @@ struct Options
     std::string advertise;
     unsigned maxJobs = 0; // 0 = nix's max-jobs, read at start and on SIGHUP (Builder::reloadNixConfig)
     uint64_t minFree = 0;
+    // The longest a departed client's lease may keep a build, and its slot,
+    // for it (Want.linger_s). 600 s because most revoked builds that were
+    // asked for again were asked for within it: 892 of 1,093 on one farm's
+    // scheduler over 13 days, 2026-10-14..27, from the revoke to the next
+    // BuildDerivation, which includes the wait for the slot the revoke freed.
+    static constexpr std::chrono::seconds defaultMaxLinger{600};
+    std::chrono::seconds maxLinger = defaultMaxLinger;
     std::string storeDir;
     // --take-over: start as the successor of this main process, see takeover.hh.
     std::optional<pid_t> takeOverFrom;

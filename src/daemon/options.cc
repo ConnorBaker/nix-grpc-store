@@ -220,6 +220,12 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
                 throw nix::Error("--take-over expects the PID of the unit's main process");
             }
             options.takeOverFrom = pid;
+        } else if (arg == "--max-linger") {
+            auto secs = parseInt<unsigned>(next());
+            if (!secs) {
+                throw nix::Error("--max-linger expects a non-negative integer");
+            }
+            options.maxLinger = std::chrono::seconds(*secs);
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }

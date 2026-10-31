@@ -286,6 +286,16 @@ in
       default = null;
       description = "Concurrent builds. Defaults to `nix.settings.max-jobs`, read again on SIGHUP.";
     };
+    maxLinger = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.unsigned;
+      default = null;
+      example = 0;
+      description = ''
+        Seconds a scheduler keeps a build at most once its clients left, when
+        a client asked for that with its `grpc-linger` setting. `0` turns
+        lingering off. Defaults to the daemon's 600.
+      '';
+    };
     minFree = lib.mkOption {
       type = lib.types.str;
       default = "10G";

@@ -82,6 +82,7 @@ stdenv.mkDerivation {
         ../../tests/retry-test.cc
         ../../tests/builder-test.cc
         ../../tests/scheduler-test.cc
+        ../../tests/lease-invariants-test.cc
         ../../tests/dispatcher-test.cc
         ../../tests/max-jobs-test.cc
         ../../tests/dispatcher-bench.cc

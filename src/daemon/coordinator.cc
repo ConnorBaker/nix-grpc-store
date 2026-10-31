@@ -480,7 +480,8 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
             Dispatcher::Config{
                 .defaultSystem = nix::settings.thisSystem.get(),
                 .present = std::move(present),
-                .logLevel = options.logLevel},
+                .logLevel = options.logLevel,
+                .maxLingerMs = static_cast<double>(std::chrono::milliseconds(options.maxLinger).count())},
             metrics);
         scheduler = std::make_unique<SchedulerService>(*dispatcher, auth, idle);
         eds = std::make_unique<EdsService>(*dispatcher, auth, idle);

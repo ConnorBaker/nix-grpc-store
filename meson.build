@@ -309,6 +309,12 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('lease-invariants', executable('lease-invariants-test',
+    sources : ['tests/lease-invariants-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep] + absl_dep,
+  ))
+
   test('dispatcher', executable('dispatcher-test',
     sources : ['tests/dispatcher-test.cc'],
     dependencies : [dispatcher_dep],

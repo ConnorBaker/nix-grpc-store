@@ -162,16 +162,40 @@ message Want {
   // scheduler takes it back from that worker and places it on another one
   // that can run it, if there is any.
   uint64 bounced_assign_id = 8;
+  // Seconds to keep this drv's build once no client follows it any more,
+  // because this client will ask for it again: a chain of time-bounded
+  // `nix build`s, each started as the last one ends. Until that long after
+  // its last follower left, the build stays assigned and running, whatever
+  // else waits, and a Want for it follows it again. Capped by the
+  // scheduler's --max-linger. 0, the default: this client keeps nothing.
+  uint32 linger_s = 9;
+  // Whose promise linger_s is: one id for every client of a chain (a
+  // lease). The scheduler keeps a build while any lease on it is live: a
+  // client holding it follows the build, or its last such client left less
+  // than its linger ago. A client without a lease (linger_s 0) never ends
+  // another's, and Release ends a lease by id. Empty with a linger (older
+  // clients): a lease of its own, the longest such linger, never released.
+  string lease_id = 10;
 }
 
 message Cancel {
   string drv_path = 1;
 }
 
+// The chain is over: end this lease on every build it holds, as if its
+// clients' lingers were over. Builds still followed by a client of the
+// lease run on for it, but are no longer kept for the lease once it leaves,
+// and a later Want with this lease keeps nothing. Answered by Released;
+// schedulers that predate it ignore it.
+message Release {
+  string lease_id = 1;
+}
+
 message ClientMsg {
   oneof msg {
     Want want = 1;
     Cancel cancel = 2;
+    Release release = 3;
   }
 }
 
@@ -205,6 +229,12 @@ message Placeable {
   string drv_path = 1;
 }
 
+// A Release applied: `builds` held the lease (0 for a lease it never saw).
+message Released {
+  string lease_id = 1;
+  uint32 builds = 2;
+}
+
 message SchedMsg {
   oneof msg {
     Assigned assigned = 1;
@@ -212,6 +242,7 @@ message SchedMsg {
     Unplaceable unplaceable = 3;
     Restarting restarting = 4;
     Placeable placeable = 5;
+    Released released = 6;
   }
 }
 

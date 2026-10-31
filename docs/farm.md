@@ -344,12 +344,28 @@ their native system. So a plain x86_64 group scales on
 counts queued builds that no connected builder could take at all, so a
 group does not grow for builds it cannot run. The number to scale a
 group on is therefore `queued - unplaceable` for its label set.
+`running` counts every build placed on a builder, which holds its slot
+until it ends, whether a client still follows it or not: one revoked
+and not yet ended, and one a builder reported to a restarted scheduler,
+which knows nothing else of it and counts it under the builder's native
+system.
+`lingering` counts builds kept for a lease (`grpc-lease`, `grpc-linger`)
+after its clients left, or for the 10 s a client whose stream broke has
+to come back: a running one is also in `running`, since it
+holds its slot, and a queued one is not in `queued`, since nobody wants
+it placed until its client is back.
 Scale-down is a drain, see below. [kubernetes.md](kubernetes.md#autoscale-a-worker-group)
 has a KEDA example.
 
 **Drain a builder.** `systemctl stop nix-grpc-daemon` stops new builds
 arriving, hands assignments no client has claimed yet back to the
-scheduler, and returns once the claimed ones have published. After
+scheduler, and returns once the claimed ones have published. A build
+kept for a lease still runs, so the drain waits for it too: for it to
+end, or for its lease to end and the scheduler to revoke it
+(`--max-linger` at most); a client of the lease may come back to it
+meanwhile. A restarted scheduler has lost its leases, and a build a
+builder reports to it then has no client and no lease: it runs to its
+end. After
 `TimeoutStopSec` (1h) the rest is killed and the clients are sent to
 another worker. A second SIGTERM cancels right away. `nixos-rebuild
 switch` reloads the unit, which drains the same way but returns at once.
@@ -421,7 +437,7 @@ assignment.
 scrape envoy's admin port (`/stats/prometheus`). The scheduler adds
 `nix_grpc_sched{kind="queued|workers|clients|leader"}` and, per system
 and feature set,
-`nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|slots|free"}`.
+`nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|slots|free|lingering"}`.
 Only the node holding the lock has `leader` 1 and non-zero values, so
 aggregate with `max by (system, kind)` over the scheduler nodes. A
 Grafana dashboard for all of it ships as `deploy/helm/nix-grpc-farm/files/farm.json`
