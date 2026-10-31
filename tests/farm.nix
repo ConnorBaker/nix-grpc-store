@@ -127,6 +127,8 @@ let
         };
       };
       nix.settings.extra-substituters = [ "${offerUrl}?want-mass-query=true" ];
+      # A test resets one NAR download of worker1's nix-daemon (root).
+      environment.systemPackages = [ pkgs.iptables ];
       programs.nix-grpc-store.enable = true;
       networking.firewall.allowedTCPPorts = [ 50051 ];
       testCerts.neededBy = [ "nix-grpc-daemon.service" ];
@@ -170,7 +172,8 @@ let
         system = builtins.currentSystem;
         requiredSystemFeatures = jobFeatures;
         builder = "/bin/sh";
-        args = [ "-c" "read x < ''${input}; echo $x > $out" ];
+        # Other bytes than the input's, so its NAR is another object.
+        args = [ "-c" "read x < ''${input}; echo used-$x > $out" ];
       };
     }
   '';
