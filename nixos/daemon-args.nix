@@ -66,6 +66,10 @@
   "--max-jobs"
   (toString cfg.maxJobs)
 ]
+++ lib.optionals (cfg.maxLinger != null) [
+  "--max-linger"
+  (toString cfg.maxLinger)
+]
 ++ lib.optionals (cfg.scheduler != null) [
   "--scheduler"
   cfg.scheduler

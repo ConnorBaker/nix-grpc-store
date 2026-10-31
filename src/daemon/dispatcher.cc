@@ -34,17 +34,19 @@ using nix::remote::SchedMsg;
 
 namespace {
 constexpr size_t maxSystemLen = 64;
+// A lease id is a client's own name for its chain (build-client.sh: a UUID).
+constexpr size_t maxLeaseIdLen = 128;
+// Whoever knows a lease id can end that lease: the journal shows its start.
+constexpr size_t leaseIdLogged = 8;
 constexpr double statsEveryMs = 1000;
 constexpr double msPerSecond = 1000;
-// A client whose stream broke reconnects within its backoff and Wants its
-// assigned drvs again. Until then their builds keep running.
-constexpr double orphanGraceMs = 10'000;
 } // namespace
 
 Dispatcher::Dispatcher(Config config_, Metrics & metrics)
     : config(std::move(config_))
     , metrics(metrics)
     , assignedCtr(metrics.eventCounter("assigned"))
+    , core(sched::Config{.departedGraceMs = config.departedGraceMs})
 {
     if (config.present) {
         for (unsigned i = 0; i < config.lookupThreads; i++) {
@@ -79,10 +81,10 @@ void Dispatcher::statsLoop()
         if (statsStop) {
             return;
         }
-        revokeOrphans();
         if (statsPending) {
             exportStats(true);
         }
+        expireLingersLocked();
     }
 }
 
@@ -299,6 +301,7 @@ void Dispatcher::exportStats(bool force)
             metrics.schedSystem(key.system, key.features, "running", sst.running),
             metrics.schedSystem(key.system, key.features, "slots", sst.slots),
             metrics.schedSystem(key.system, key.features, "free", sst.free),
+            metrics.schedSystem(key.system, key.features, "lingering", sst.lingering),
         };
         previous.erase(key);
     }
@@ -344,19 +347,29 @@ void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath)
     }
 }
 
-void Dispatcher::revokeOrphans()
+void Dispatcher::expireLingersLocked()
 {
-    auto const now = nowMs();
-    std::erase_if(orphans, [&](const Orphan & orphan) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) -> bool {
-        if (orphan.dueMs > now) {
-            return false;
+    std::vector<std::pair<sched::DrvId, sched::WorkerId>> revokes;
+    auto const forgotten = core.expireLingers(nowMs(), revokes);
+    for (const auto & drvPath : forgotten) {
+        logLine(LogLevel::info, {{"event", "linger_expired"}, {"drv", drvPath}, {"state", "queued"}});
+    }
+    for (auto [drv, wid] : revokes) {
+        const auto & ent = core.entry(drv);
+        if (!ent) {
+            continue;
         }
-        const auto & ent = core.entry(orphan.drv);
-        if (ent && ent->assignId == orphan.assignId && ent->worker != sched::noWorker && ent->followers.empty()) {
-            revokeOn(ent->worker, ent->drvPath);
+        logLine(LogLevel::info, {{"event", "linger_expired"}, {"drv", ent->drvPath}, {"state", "assigned"}});
+        // A scheduler handing over lets its builds run on.
+        if (!lettingGo) {
+            revokeOn(wid, ent->drvPath);
         }
-        return true;
-    });
+    }
+    // Nothing else need happen for a while: without this the gauges kept
+    // a forgotten build `lingering` until some other event exported them.
+    if (!forgotten.empty() || !revokes.empty()) {
+        exportStats(true);
+    }
 }
 
 auto Dispatcher::assignedMsg(sched::DrvId drv) const -> SchedMsg
@@ -493,6 +506,8 @@ void Dispatcher::applyClientMsgs(
                 onWant(client, msg.want(), cached.at(static_cast<size_t>(i)));
             } else if (msg.has_cancel()) {
                 onCancel(client, msg.cancel());
+            } else if (msg.has_release()) {
+                onRelease(client, msg.release());
             }
         }
     }
@@ -542,13 +557,24 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
          .system = system,
          .features = {want.required_features().begin(), want.required_features().end()},
          .cpHintMs = static_cast<double>(want.cp_hint_ms()),
-         .bouncedAssignId = want.bounced_assign_id()},
+         .bouncedAssignId = want.bounced_assign_id(),
+         .lingerMs = want.lease_id().size() > maxLeaseIdLen
+                         ? 0
+                         : std::min(static_cast<double>(want.linger_s()) * msPerSecond, config.maxLingerMs),
+         .leaseId = want.lease_id()},
         nowMs());
     if (res.bouncedOff) {
         metrics.event("bounced");
         logLine(
             LogLevel::info,
             {{"event", "bounced"}, {"drv", want.drv_path()}, {"worker", core.worker(*res.bouncedOff).addr}});
+    }
+    if (res.idleMs) {
+        logLine(
+            LogLevel::info,
+            {{"event", "linger_followed"},
+             {"drv", want.drv_path()},
+             {"idle_s", std::to_string(static_cast<int64_t>(*res.idleMs / msPerSecond))}});
     }
     if (res.assigned) {
         client.send(assignedMsg(res.drv));
@@ -568,9 +594,39 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
 // Under the lock.
 void Dispatcher::onCancel(Client & client, const nix::remote::Cancel & cancel)
 {
-    if (auto wid = core.cancel(client.id, cancel.drv_path())) {
+    if (auto wid = core.cancel(client.id, cancel.drv_path(), nowMs())) {
         revokeOn(*wid, cancel.drv_path());
     }
+}
+
+// Under the lock.
+void Dispatcher::onRelease(Client & client, const nix::remote::Release & release)
+{
+    auto const & lease = release.lease_id();
+    std::vector<std::pair<sched::DrvId, sched::WorkerId>> revokes;
+    size_t held = 0;
+    if (!lease.empty() && lease.size() <= maxLeaseIdLen) {
+        auto const now = nowMs();
+        // As long as any Want could have asked to keep a build for it.
+        held = core.release(lease, now, now + config.maxLingerMs, revokes);
+    }
+    for (auto [drv, wid] : revokes) {
+        // A scheduler handing over lets its builds run on.
+        if (const auto & ent = core.entry(drv); ent && !lettingGo) {
+            revokeOn(wid, ent->drvPath);
+        }
+    }
+    logLine(
+        LogLevel::info,
+        {{"event", "released"},
+         {"lease", lease.substr(0, leaseIdLogged)},
+         {"builds", std::to_string(held)},
+         {"revoked", std::to_string(revokes.size())}});
+    SchedMsg reply;
+    reply.mutable_released()->set_lease_id(lease);
+    reply.mutable_released()->set_builds(static_cast<uint32_t>(held));
+    client.send(reply);
+    exportStats(false);
 }
 
 void Dispatcher::clientGone(const ClientPtr & clientPtr)
@@ -579,11 +635,32 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
     const Lock lock(*this);
     client.gone = true;
     clients.erase(client.id);
+    auto const now = nowMs();
     std::vector<std::pair<sched::DrvId, sched::WorkerId>> revokes;
-    core.clientGone(client.id, revokes);
+    std::vector<sched::DrvId> kept;
+    core.clientGone(client.id, now, revokes, kept);
     for (auto [drv, wid] : revokes) {
-        if (const auto & ent = core.entry(drv)) {
-            orphans.push_back({.drv = drv, .assignId = ent->assignId, .dueMs = nowMs() + orphanGraceMs});
+        // A scheduler handing over lets its builds run on.
+        if (const auto & ent = core.entry(drv); ent && !lettingGo) {
+            revokeOn(wid, ent->drvPath);
+        }
+    }
+    // Kept, queued or assigned, for a client that will be back: until its
+    // lease is over or released, or its reconnect grace is. Only a lease's
+    // keep is logged; a reconnect grace alone is every broken stream's.
+    for (auto const drv : kept) {
+        if (const auto & ent = core.entry(drv); ent && !ent->leases.empty()) {
+            std::string ids;
+            for (const auto & lse : ent->leases) {
+                ids += (ids.empty() ? "" : ",") + (lse.id.empty() ? std::string("-") : lse.id.substr(0, leaseIdLogged));
+            }
+            logLine(
+                LogLevel::info,
+                {{"event", "lingering"},
+                 {"drv", ent->drvPath},
+                 {"state", ent->worker == sched::noWorker ? "queued" : "assigned"},
+                 {"leases", ids},
+                 {"linger_s", std::to_string(static_cast<int64_t>((ent->keptUntilMs - now) / msPerSecond))}});
         }
     }
     metrics.schedClients(-1);

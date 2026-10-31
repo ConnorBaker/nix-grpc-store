@@ -374,6 +374,7 @@ which also requires `trustClients` (see above).
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
   * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
   * `--niks3 URL [--niks3-cache-url URL] [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both. `--niks3-cache-url` is the cache as nodes substitute from it: with it, a builder that cannot get an input which the cache lost (niks3 lists it as a closure root, but the bucket has no narinfo for it or its NAR answers 404) names it, so the client builds it
+  * `--max-linger SECS` — the longest a client's `grpc-linger` keeps a build once its clients left, default 600; `0` turns lingering off
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring
@@ -410,7 +411,7 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | `nix_grpc_nar_bytes_total` | direction, cn | uncompressed NAR bytes imported/exported |
 | `nix_grpc_build_info` | version, worker, system, features | constant 1, for joins and version skew |
 | `nix_grpc_sched` | kind = queued, workers, clients, leader | scheduler state |
-| `nix_grpc_sched_system` | system, features, kind = queued, unplaceable, running, slots, free | queue (by required features) and capacity (by offered features), for autoscaling |
+| `nix_grpc_sched_system` | system, features, kind = queued, unplaceable, running, slots, free, lingering | queue (by required features) and capacity (by offered features), for autoscaling; `lingering`: builds kept for a departed client's lease, or for 10 s after its stream broke (running ones are in `running` too) |
 | `nix_grpc_events_total` | kind | assigned, cached, attached, give_back, given_back_<reason>, unexpected_build, … |
 | `nix_grpc_build_failures_total` | reason | failed builds, by Nix failure status: PermanentFailure, TimedOut, TransientFailure, … |
 

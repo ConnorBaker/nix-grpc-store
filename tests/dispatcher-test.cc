@@ -1,11 +1,18 @@
 // Unit tests for the Dispatcher's worker messages, with in-memory peers (no gRPC).
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
+#include <string>
+#include <thread>
 #include <vector>
+
+#include <absl/base/thread_annotations.h>
 
 #include "logfmt.hh"
 
@@ -424,6 +431,267 @@ void testDoneEndsOnlyThePlacementItNames()
     disp.workerGone(newSession);
 }
 
+// A client that will be back (Want.linger_s) has its build kept once it
+// leaves, for no longer than the scheduler's cap: the stats thread revokes
+// it when the cap is over, not the 600 s asked for. A client that asked for
+// nothing has its build revoked once its reconnect grace is over.
+void testLingerCappedThenRevoked()
+{
+    constexpr double capMs = 1000;
+    constexpr uint32_t askedS = 600;
+    constexpr auto patience = std::chrono::seconds(10);
+    constexpr auto poll = std::chrono::milliseconds(100);
+    Metrics metrics{""};
+    constexpr double graceMs = 300;
+    Dispatcher disp(
+        Dispatcher::Config{
+            .defaultSystem = "x86_64-linux",
+            .present = {},
+            .lookupThreads = 0,
+            .maxLingerMs = capMs,
+            .departedGraceMs = graceMs},
+        metrics);
+    std::atomic<int> revokes{0};
+    Dispatcher::Worker worker{
+        .send = [&revokes](const SchedCmd & cmd) -> bool {
+            if (cmd.has_revoke()) {
+                revokes++;
+            }
+            return true;
+        },
+        .abort = {},
+        .id = {}};
+    WorkerMsgs hello;
+    auto * hel = hello.add_msgs()->mutable_hello();
+    hel->set_addr("w0:50051");
+    hel->add_systems("x86_64-linux");
+    hel->set_max_jobs(2);
+    disp.workerMsgs(worker, hello);
+
+    auto const follow = [&disp](const char * drv, uint32_t lingerS) -> Dispatcher::ClientPtr {
+        auto client = disp.connectClient([](const SchedMsg &) -> bool { return true; }, [] -> void {});
+        ClientMsgs want;
+        auto * wnt = want.add_msgs()->mutable_want();
+        wnt->set_drv_path(drv);
+        wnt->set_linger_s(lingerS);
+        disp.clientMsgs(client, want);
+        return client;
+    };
+    auto const chain = follow("/nix/store/00000000000000000000000000000000-chain.drv", askedS);
+    auto const plain = follow("/nix/store/11111111111111111111111111111111-plain.drv", 0);
+    auto const plainLeft = std::chrono::steady_clock::now();
+    disp.clientGone(plain);
+    assert(revokes == 0);
+    while (revokes < 1 && std::chrono::steady_clock::now() - plainLeft < patience) {
+        std::this_thread::sleep_for(poll);
+    }
+    assert(revokes == 1);
+    assert(std::chrono::steady_clock::now() - plainLeft >= std::chrono::milliseconds(static_cast<int64_t>(graceMs)));
+    auto const left = std::chrono::steady_clock::now();
+    disp.clientGone(chain);
+    assert(revokes == 1);
+    while (revokes < 2 && std::chrono::steady_clock::now() - left < patience) {
+        std::this_thread::sleep_for(poll);
+    }
+    assert(revokes == 2);
+    assert(std::chrono::steady_clock::now() - left >= std::chrono::milliseconds(static_cast<int64_t>(capMs)));
+    disp.workerGone(worker);
+}
+
+// A chain's build kept for its lease (Want.lease_id) shows as the sixth
+// series of its feature set, `lingering`. A Release from another stream
+// ends the lease: answered with Released and the number of builds it held,
+// the build revoked on its worker. Once nobody asks for or offers the
+// feature set, its six series go, on the stats thread's next round
+// (workerGone does not force an export).
+void testReleaseAndTheStatsSeries()
+{
+    constexpr uint32_t lingerS = 600;
+    constexpr double capMs = 600e3;
+    constexpr auto patience = std::chrono::seconds(10);
+    constexpr auto poll = std::chrono::milliseconds(100);
+    Metrics metrics{""};
+    Dispatcher disp(
+        Dispatcher::Config{.defaultSystem = "x86_64-linux", .present = {}, .lookupThreads = 0, .maxLingerMs = capMs},
+        metrics);
+    std::vector<std::string> revoked;
+    Dispatcher::Worker worker{
+        .send = [&revoked](const SchedCmd & cmd) -> bool {
+            if (cmd.has_revoke()) {
+                revoked.push_back(cmd.revoke().drv_path());
+            }
+            return true;
+        },
+        .abort = {},
+        .id = {}};
+    WorkerMsgs hello;
+    auto * hel = hello.add_msgs()->mutable_hello();
+    hel->set_addr("w0:50051");
+    hel->add_systems("x86_64-linux");
+    hel->add_features("kvm");
+    hel->set_max_jobs(1);
+    disp.workerMsgs(worker, hello);
+    auto const series = [&metrics](const char * kind) -> std::optional<double> {
+        return metrics.schedSystemNow("x86_64-linux", "kvm", kind);
+    };
+    constexpr auto drv = "/nix/store/00000000000000000000000000000000-chain.drv";
+
+    auto link = disp.connectClient([](const SchedMsg &) -> bool { return true; }, [] -> void {});
+    ClientMsgs want;
+    auto * wnt = want.add_msgs()->mutable_want();
+    wnt->set_drv_path(drv);
+    wnt->add_required_features("kvm");
+    wnt->set_linger_s(lingerS);
+    wnt->set_lease_id("chain-1");
+    disp.clientMsgs(link, want);
+    disp.clientGone(link);
+    // Exported within a round of the stats thread (Dispatcher::exportStats).
+    auto const settle = [&](const char * kind, double want) -> void {
+        auto const since = std::chrono::steady_clock::now();
+        while (series(kind) != want && std::chrono::steady_clock::now() - since < patience) {
+            std::this_thread::sleep_for(poll);
+        }
+    };
+    settle("lingering", 1.0);
+    assert(series("lingering") == 1.0 && series("running") == 1.0 && series("slots") == 1.0);
+    assert(revoked.empty());
+
+    std::vector<SchedMsg> answers;
+    auto releaser = disp.connectClient(
+        [&answers](const SchedMsg & msg) -> bool {
+            answers.push_back(msg);
+            return true;
+        },
+        [] -> void {});
+    auto const release = [&](const char * lease) -> void {
+        ClientMsgs msgs;
+        msgs.add_msgs()->mutable_release()->set_lease_id(lease);
+        disp.clientMsgs(releaser, msgs);
+    };
+    release("unknown");
+    release("chain-1");
+    assert(answers.size() == 2 && answers.at(0).has_released() && answers.at(1).has_released());
+    assert(answers.at(0).released().lease_id() == "unknown" && answers.at(0).released().builds() == 0);
+    assert(answers.at(1).released().lease_id() == "chain-1" && answers.at(1).released().builds() == 1);
+    assert(revoked == std::vector<std::string>{drv});
+    // Revoked, it holds its slot until its Done: running, no longer lingering.
+    settle("lingering", 0.0);
+    assert(series("lingering") == 0.0 && series("free") == 0.0 && series("running") == 1.0);
+    disp.clientGone(releaser);
+
+    disp.workerGone(worker);
+    auto const gone = std::chrono::steady_clock::now();
+    while (series("slots") && std::chrono::steady_clock::now() - gone < patience) {
+        std::this_thread::sleep_for(poll);
+    }
+    for (const auto * kind : {"queued", "unplaceable", "running", "slots", "free", "lingering"}) {
+        assert(!series(kind));
+    }
+}
+
+// A chain's build kept in the scheduler's own queue (the one slot busy) is
+// forgotten once its lease is over, and the stats thread exports that as it
+// happens: `lingering` drops to 0 with nothing else going on.
+void testKeptQueuedExpiryExported()
+{
+    constexpr uint32_t lingerS = 600;
+    constexpr double capMs = 3000;
+    constexpr auto patience = std::chrono::seconds(10);
+    constexpr auto poll = std::chrono::milliseconds(100);
+    Metrics metrics{""};
+    Dispatcher disp(
+        Dispatcher::Config{.defaultSystem = "x86_64-linux", .present = {}, .lookupThreads = 0, .maxLingerMs = capMs},
+        metrics);
+    Dispatcher::Worker worker{.send = [](const SchedCmd &) -> bool { return true; }, .abort = {}, .id = {}};
+    WorkerMsgs hello;
+    auto * hel = hello.add_msgs()->mutable_hello();
+    hel->set_addr("w0:50051");
+    hel->add_systems("x86_64-linux");
+    hel->add_features("kvm");
+    hel->set_max_jobs(1);
+    disp.workerMsgs(worker, hello);
+    auto const series = [&metrics](const char * kind) -> std::optional<double> {
+        return metrics.schedSystemNow("x86_64-linux", "kvm", kind);
+    };
+    auto const follow = [&disp](const char * drv, uint32_t linger, const char * lease) -> Dispatcher::ClientPtr {
+        auto client = disp.connectClient([](const SchedMsg &) -> bool { return true; }, [] -> void {});
+        ClientMsgs want;
+        auto * wnt = want.add_msgs()->mutable_want();
+        wnt->set_drv_path(drv);
+        wnt->add_required_features("kvm");
+        wnt->set_linger_s(linger);
+        wnt->set_lease_id(lease);
+        disp.clientMsgs(client, want);
+        return client;
+    };
+    auto const busy = follow("/nix/store/00000000000000000000000000000000-busy.drv", 0, "");
+    auto const chain = follow("/nix/store/11111111111111111111111111111111-chain.drv", lingerS, "chain-1");
+    auto const left = std::chrono::steady_clock::now();
+    disp.clientGone(chain);
+    // Exported within a round of the stats thread, before the cap is over.
+    while (series("lingering") != 1.0 && std::chrono::steady_clock::now() - left < patience) {
+        std::this_thread::sleep_for(poll);
+    }
+    assert(series("lingering") == 1.0 && series("queued") == 0.0 && series("running") == 1.0);
+    while (series("lingering") != 0.0 && std::chrono::steady_clock::now() - left < patience) {
+        std::this_thread::sleep_for(poll);
+    }
+    assert(series("lingering") == 0.0 && series("queued") == 0.0);
+    assert(std::chrono::steady_clock::now() - left >= std::chrono::milliseconds(static_cast<int64_t>(capMs)));
+    disp.clientGone(busy);
+    disp.workerGone(worker);
+}
+
+// A kept build's linger runs out with nothing else going on: the stats
+// thread revokes it, and the Revoke must reach a worker whose send only
+// queues the write for after the unlock, as WorkerSession's does
+// (sched-reactor.hh: afterUnlock(writeNext)). The stats thread takes its
+// Lock afresh each round, and that Lock's release runs the queue: with one
+// Lock held across rounds the queued write waited for some other thread's
+// unlock.
+void testExpiryRevokeReachesAWorker()
+{
+    constexpr double capMs = 1000;
+    constexpr uint32_t lingerS = 600;
+    constexpr auto patience = std::chrono::seconds(10);
+    constexpr auto poll = std::chrono::milliseconds(100);
+    Metrics metrics{""};
+    Dispatcher disp(
+        Dispatcher::Config{.defaultSystem = "x86_64-linux", .present = {}, .lookupThreads = 0, .maxLingerMs = capMs},
+        metrics);
+    std::atomic<int> written{0};
+    Dispatcher::Worker worker{
+        .send = [&disp, &written](const SchedCmd & cmd) ABSL_EXCLUSIVE_LOCKS_REQUIRED(disp.sendLock()) -> bool {
+            if (cmd.has_revoke()) {
+                disp.afterUnlock([&written] -> void { written++; });
+            }
+            return true;
+        },
+        .abort = {},
+        .id = {}};
+    WorkerMsgs hello;
+    auto * hel = hello.add_msgs()->mutable_hello();
+    hel->set_addr("w0:50051");
+    hel->add_systems("x86_64-linux");
+    hel->set_max_jobs(1);
+    disp.workerMsgs(worker, hello);
+    auto chain = disp.connectClient([](const SchedMsg &) -> bool { return true; }, [] -> void {});
+    ClientMsgs want;
+    auto * wnt = want.add_msgs()->mutable_want();
+    wnt->set_drv_path("/nix/store/22222222222222222222222222222222-chain.drv");
+    wnt->set_linger_s(lingerS);
+    wnt->set_lease_id("chain-1");
+    disp.clientMsgs(chain, want);
+    disp.clientGone(chain);
+    assert(written == 0);
+    auto const left = std::chrono::steady_clock::now();
+    while (written < 1 && std::chrono::steady_clock::now() - left < patience) {
+        std::this_thread::sleep_for(poll);
+    }
+    assert(written == 1);
+    disp.workerGone(worker);
+}
+
 // A client bounces off the builder that runs its drv (it could not reach
 // it), and no other builder can run it: the scheduler places the drv there
 // again, with a new assign id. The slot is free again after that build's
@@ -499,5 +767,9 @@ auto main() -> int
     testDoneEndsOnlyThePlacementItNames();
     testBounceOntoTheBuildingWorker();
     testLoadRestoresSlotsAfterDrainingHello();
+    testLingerCappedThenRevoked();
+    testReleaseAndTheStatsSeries();
+    testKeptQueuedExpiryExported();
+    testExpiryRevokeReachesAWorker();
     return 0;
 }
