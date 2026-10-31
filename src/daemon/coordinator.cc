@@ -22,7 +22,6 @@
 
 #include <sys/statvfs.h>
 
-#include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/client_context.h>
 #include <grpcpp/create_channel.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -44,7 +43,6 @@
 #include "auth.hh"
 #include "cache.hh"
 #include "client/channel.hh"
-#include "keepalive.hh"
 #include "logfmt.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
@@ -64,7 +62,6 @@ using nix::remote::WorkerMsg;
 using nix::remote::WorkerMsgs;
 
 namespace {
-constexpr int minReconnectBackoffMs = 2'000;
 constexpr std::chrono::milliseconds minBackoff{200};
 constexpr std::chrono::milliseconds maxBackoff{5000};
 
@@ -547,12 +544,7 @@ void Coordinator::start(grpc::Server & server)
 void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 {
     auto const creds = schedulerCreds(options);
-    grpc::ChannelArguments args;
-    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
-    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
-    args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
-    // A replaced balancer pod blackholes the first SYN; do not sit out gRPC's 20s.
-    args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
+    auto const args = daemonChannelArgs();
     auto const target = options.schedulerAddr.starts_with(plaintextScheme) ? options.schedulerAddr.substr(plaintextScheme.size())
                                                                     : options.schedulerAddr;
     auto const channel = grpc::CreateCustomChannel(target, creds, args);

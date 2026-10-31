@@ -1,6 +1,6 @@
 #pragma once
-// Client channel setup: credential file lookup, per-call bearer token, fixed
-// routing headers and gRPC runtime lifetime.
+// Client channel setup: arguments, credential file lookup, per-call bearer
+// token, fixed routing headers and gRPC runtime lifetime.
 
 #include <exception>
 #include <map>
@@ -12,6 +12,7 @@
 #include <grpcpp/client_context.h>
 #include <grpcpp/security/auth_context.h>
 #include <grpcpp/security/credentials.h>
+#include <grpcpp/support/channel_arguments.h>
 #include <grpcpp/support/client_interceptor.h>
 #include <grpcpp/support/config.h>
 #include <grpcpp/support/interceptor.h>
@@ -23,6 +24,11 @@
 #include <nix/util/util.hh>
 
 namespace nixgrpc {
+
+// What every client of a nix-grpc-daemon, or of the balancer in front of
+// one, connects with: the plugin's store channels and a builder's
+// WorkerSession to its scheduler.
+auto daemonChannelArgs() -> grpc::ChannelArguments;
 
 // The only way to start an RPC: owns the ClientContext and cancels it on
 // SIGINT for as long as the call lives, so no call can forget to be
