@@ -211,6 +211,8 @@ pkgs.testers.runNixOSTest {
       imports = [ (worker "worker1") ];
       testCerts.certs.worker1 = cert "worker-1" "DNS:worker1,DNS:lb,IP:${ip.worker1}";
       nix.settings.system-features = [ "vip" ];
+      # Rewritten under the running daemon by the max-jobs e2e test.
+      nix.extraOptions = "!include /run/nix-max-jobs.conf";
       services.nix-grpc-daemon.workerName = "node-a";
       # With worker2, two builders for a system other than the default.
       services.nix-grpc-daemon.extraSystems = [ "riscv64-linux" ];

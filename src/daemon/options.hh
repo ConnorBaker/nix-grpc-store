@@ -53,7 +53,7 @@ struct Options
     // Systems the local nix-daemon builds without them being in extra-platforms,
     // e.g. through external-builders.
     std::vector<std::string> extraSystems;
-    unsigned maxJobs = 0; // 0 = take nix's max-jobs
+    unsigned maxJobs = 0; // 0 = nix's max-jobs, read at start and on SIGHUP (Coordinator::reloadNixConfig)
     unsigned lookupThreads = 0; // scheduler: concurrent cache lookups for Wants, 0 = default
     uint64_t minFree = 0;
     std::string storeDir;
