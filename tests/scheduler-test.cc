@@ -329,6 +329,51 @@ void testPlaceabilityFlips()
 
 // A given-back drv goes to another worker, or back to the same one if
 // nobody else can run it.
+// A worker gives a drv back, then the next one it went to gives it back
+// too: a third worker that was never tried gets it, not the first again,
+// though that one has more slots free.
+// Two workers, w0 with two slots and w1 with one, each giving the drv
+// back as soon as it gets it, five times: once both have, the one that
+// gave it back last is passed over, so they take turns rather than w0
+// getting it every time.
+void testRepeatGiveBacksTakeTurns()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 2);
+    auto const w1 = hello(shard, "w1", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    std::vector<WorkerId> placed;
+    for (int round = 0; round < 5; round++) {
+        assert(out.size() == placed.size() + 1);
+        placed.push_back(out.back().worker);
+        shard.giveBack(placed.back(), "a.drv");
+        shard.dispatch(out);
+    }
+    placed.push_back(out.back().worker);
+    assert((placed == std::vector<WorkerId>{w0, w1, w0, w1, w0, w1}));
+}
+
+void testGiveBackPassesOverEveryWorkerThatGaveItBack()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 2);
+    auto const w1 = hello(shard, "w1", 1);
+    auto const w2 = hello(shard, "w2", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+    shard.giveBack(w0, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 2 && (out[1].worker == w1 || out[1].worker == w2));
+    auto const second = out[1].worker;
+    shard.giveBack(second, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker != w0 && out[2].worker != second);
+}
+
 void testGiveBack()
 {
     Core shard;
@@ -450,6 +495,8 @@ try {
     testUnofferedSystems();
     testHelloAdoptsQueued();
     testGiveBack();
+    testGiveBackPassesOverEveryWorkerThatGaveItBack();
+    testRepeatGiveBacksTakeTurns();
     testCrossSystemPriority();
     testPlaceabilityFlips();
     testStaleDoneAndUnknown();

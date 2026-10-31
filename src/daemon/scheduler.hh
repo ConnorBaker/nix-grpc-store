@@ -295,7 +295,8 @@ struct Entry
     double enqMs = 0;
     double cpHint = 0;
     bool unplaceable = false; // as last told to the followers
-    WorkerId avoid = noWorker; // gave it back; used only if no other worker can run it
+    // Gave it back: each used only if no other worker can run it.
+    std::vector<WorkerId> avoid;
 };
 
 struct Worker
@@ -583,7 +584,9 @@ public:
             return;
         }
         slot->worker = noWorker;
-        slot->avoid = wid;
+        // Latest last: a worker that gives it back again is the one passed over.
+        std::erase(slot->avoid, wid);
+        slot->avoid.push_back(wid);
         if (slot->followers.empty()) {
             retire(*found);
         } else {
@@ -938,32 +941,50 @@ private:
         return best;
     }
 
-    // The worker it was given back by, if nobody else can run it.
-    [[nodiscard]] auto avoiding(const Entry & ent) const -> std::optional<WorkerId>
+    [[nodiscard]] static auto avoided(const Entry & ent, WorkerId wid) -> bool
     {
-        std::optional<WorkerId> best;
-        bool others = false;
-        for (WorkerId wid = 0; wid < workers.size(); wid++) {
-            const auto & wkr = workers.at(wid);
-            if (wid == ent.avoid || !wkr.up || wkr.draining || !offers(wkr, ent)) {
-                continue;
+        return std::ranges::find(ent.avoid, wid) != ent.avoid.end();
+    }
+
+    // The emptiest worker it was not given back by. If each one that can run
+    // it gave it back, the emptiest but the last of them; `fallback` (one it
+    // was given back by) if nobody else can run it. None while those it may
+    // go to have no slot.
+    [[nodiscard]] auto avoiding(const Entry & ent, WorkerId fallback) const -> std::optional<WorkerId>
+    {
+        auto const among = [&](auto passed) -> std::optional<std::optional<WorkerId>> {
+            std::optional<WorkerId> best;
+            bool others = false;
+            for (WorkerId wid = 0; wid < workers.size(); wid++) {
+                const auto & wkr = workers.at(wid);
+                if (passed(wid) || !wkr.up || wkr.draining || !offers(wkr, ent)) {
+                    continue;
+                }
+                others = true;
+                if (freeOf(wid) > 0 && (!best || freeOf(wid) > freeOf(*best))) {
+                    best = wid;
+                }
             }
-            others = true;
-            if (freeOf(wid) > 0 && (!best || freeOf(wid) > freeOf(*best))) {
-                best = wid;
+            if (!others) {
+                return std::nullopt;
             }
-        }
-        if (best || others) {
             return best;
+        };
+        if (auto const placed = among([&](WorkerId wid) -> bool { return avoided(ent, wid); })) {
+            return *placed;
         }
-        return ent.avoid;
+        auto const last = [&](WorkerId wid) -> bool { return !ent.avoid.empty() && wid == ent.avoid.back(); };
+        if (auto const placed = among(last)) {
+            return *placed;
+        }
+        return fallback;
     }
 
     [[nodiscard]] auto pick(const Entry & ent) const -> std::optional<WorkerId>
     {
         auto best = emptiestFor(ent);
-        if (best && *best == ent.avoid) {
-            best = avoiding(ent);
+        if (best && avoided(ent, *best)) {
+            best = avoiding(ent, *best);
         }
         if (!best) {
             return std::nullopt;
@@ -979,7 +1000,7 @@ private:
                 continue;
             }
             auto [wid, size] = iter->second;
-            if (wid >= workers.size() || wid == ent.avoid || !workers.at(wid).up || freeOf(wid) <= 0
+            if (wid >= workers.size() || avoided(ent, wid) || !workers.at(wid).up || freeOf(wid) <= 0
                 || !offers(workers.at(wid), ent)) {
                 continue;
             }
