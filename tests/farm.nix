@@ -1,6 +1,8 @@
 # Multi-node end to end: niks3 + S3, two builder nodes (both may
 # schedule, niks3 picks one) behind envoy, a CI client using the build hook and an OIDC
-# developer.
+# developer. `part` picks the tests (`parts` below), so that each check fits
+# in one build client: every part boots this farm afresh and runs some of
+# tests/e2e/farm's modules.
 {
   pkgs,
   nixPkgs,
@@ -8,6 +10,7 @@
   niks3,
   mockOidc,
   e2eTests,
+  part,
 }:
 
 let
@@ -198,10 +201,40 @@ let
       args = [ "-c" "/bin/sh -c 'read -t 90 x < /dev/zero'; echo ''${tag} > $out" ];
     }
   '';
+
+  # Subtests per part, each an e2e module run with that many test threads.
+  parts = {
+    scheduling = [
+      {
+        title = "independent builds";
+        module = "independent";
+        threads = 3;
+      }
+      {
+        title = "scheduling, placement and the cache";
+        module = "scheduling";
+        threads = 1;
+      }
+    ];
+    restarts = [
+      {
+        title = "schedulers and builders restarting, draining and dying";
+        module = "restarts";
+        threads = 1;
+      }
+    ];
+    cutoffs = [
+      {
+        title = "calls, streams and uploads cut off";
+        module = "cutoffs";
+        threads = 1;
+      }
+    ];
+  };
 in
 pkgs.testers.runNixOSTest {
-  name = "nix-grpc-farm";
-  globalTimeout = 900;
+  name = "nix-grpc-farm-${part}";
+  globalTimeout = 540;
 
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
@@ -329,10 +362,9 @@ pkgs.testers.runNixOSTest {
     }
     nodes = {"client": client, "lb": lb, "worker1": worker1, "worker2": worker2}
 
-    with subtest("independent builds"):
-        run_e2e(nodes, env, "farm::independent::", "--test-threads=3")
-
-    with subtest("scheduler and lifecycle"):
-        run_e2e(nodes, env, "farm::serial::", "--test-threads=1")
+    ${lib.concatMapStringsSep "\n" (s: ''
+      with subtest("${s.title}"):
+          run_e2e(nodes, env, "farm::${s.module}::", "--test-threads=${toString s.threads}")
+    '') parts.${part}}
   '';
 }

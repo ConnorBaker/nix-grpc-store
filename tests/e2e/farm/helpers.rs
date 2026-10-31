@@ -2,6 +2,8 @@ use std::sync::Once;
 
 use crate::harness::*;
 
+pub const UNIT: &str = "nix-grpc-daemon";
+
 pub const CLIENT: Node = Node("client");
 pub const LB: Node = Node("lb");
 pub const WORKER1: Node = Node("worker1");
