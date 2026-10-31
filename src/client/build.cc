@@ -324,15 +324,15 @@ struct GrpcStore::Run {
           throw Interrupted("interrupted");
         }
         res = store.buildAssigned(*work->job, work->where, evalStore);
+        if (auto * missing = std::get_if<MissingInput>(&res)) {
+          res = recover(*work, missing->path);
+        }
       } catch (Interrupted &) {
         res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, "interrupted");
       } catch (std::exception & err) {
         // nix reports only the top-level result, so a failed leaf would just read "dependency failed".
         printError("%s: %s", work->job->drvPath.to_string(), err.what());
         res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, err.what());
-      }
-      if (auto * missing = std::get_if<MissingInput>(&res)) {
-        res = recover(*work, missing->path);
       }
       std::scoped_lock const lock(mutex);
       if (auto * result = std::get_if<BuildResult>(&res)) {
