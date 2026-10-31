@@ -73,7 +73,7 @@ void testFreeIndex()
     assert(fi.get(4) == 100 && *fi.emptiest() == 4);
 }
 
-auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector<std::string_view> & running = {}, std::vector<std::string> features = {}, std::vector<Core::Superseded> * superseded = nullptr, bool faulty = false) -> WorkerId
+auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector<std::string_view> & running = {}, std::vector<std::string> features = {}, std::vector<Core::Superseded> * superseded = nullptr, bool faulty = false, bool namesPlacements = true) -> WorkerId
 {
     std::vector<std::pair<std::string_view, uint64_t>> runs;
     runs.reserve(running.size());
@@ -81,7 +81,7 @@ auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector
         runs.emplace_back(drv, 7);
     }
     std::vector<Core::Superseded> ignored;
-    return shard.hello({.addr = addr, .systems = {"x"}, .features = std::move(features), .maxJobs = jobs, .running = std::move(runs), .faulty = faulty}, superseded != nullptr ? *superseded : ignored);
+    return shard.hello({.addr = addr, .systems = {"x"}, .features = std::move(features), .maxJobs = jobs, .running = std::move(runs), .faulty = faulty, .namesPlacements = namesPlacements}, superseded != nullptr ? *superseded : ignored);
 }
 
 void testAssignAndDedup()
@@ -355,6 +355,30 @@ void testFaulty()
     assert(shard.cancel(1, "e.drv") == w1);
     shard.giveBack(w1, "e.drv");
     assert(!shard.findDrv("e.drv"));
+}
+
+// A Done that names an earlier placement of its drv ends nothing, but a
+// BUILT one's outputs are on that worker all the same: a build that needs
+// one of them is placed there, not on a worker with more free slots.
+void testOtherPlacementsDoneTellsWhereOutputsAre()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 4);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+    auto const first = out[0].assignId;
+    // w0's next session's Hello leaves a.drv out: placed there again.
+    hello(shard, "w0", 4);
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == w0 && out[1].assignId != first);
+    auto const w1 = hello(shard, "w1", 4); // more free slots than w0 now
+    assert(!shard.done(w0, "a.drv", {{"/nix/store/a-out", 1'000'000'000}}, first));
+    assert(shard.entry(out[1].drv)->worker == w0 && shard.entry(out[1].drv)->assignId == out[1].assignId);
+    shard.want(2, {.drvPath = "b.drv", .inputs = {"/nix/store/a-out"}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker == w0 && out[2].worker != w1);
 }
 
 void testDraining()
@@ -666,6 +690,7 @@ try {
     testBouncedOffTwiceTriesAThirdWorker();
     testRepeatBouncesTakeTurns();
     testFaulty();
+    testOtherPlacementsDoneTellsWhereOutputsAre();
     testDraining();
     testSetMaxJobs();
     testFeatures();

@@ -235,6 +235,12 @@ message Hello {
   repeated RunningBuild running = 5;
   // See Load.
   bool publish_failing = 6;
+  // This builder names in each Done the placement it ends, and gives a build
+  // it already runs the id of a new placement of it there (Expect). Without
+  // it, a Done ends whatever placement of the drv the scheduler holds there.
+  // (Builds of the integration branch sent a session generation here, which
+  // reads as true; they named placements too.)
+  bool names_placements = 7;
 }
 
 message Done {

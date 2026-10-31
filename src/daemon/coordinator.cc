@@ -92,7 +92,11 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     auto lck = state.lock();
     auto & ent = lck->expected[exp.drv_path()];
     if (ent.claimed) {
-        return; // re-announced across a scheduler restart, keep the live one
+        // Placed here again while it runs: keep the live build, but report it
+        // as the placement the scheduler holds now, whose end its Done must
+        // name (Core::done).
+        ent.assignId = exp.assign_id();
+        return;
     }
     ent.assignId = exp.assign_id();
     ent.since = Clock::now();
@@ -231,6 +235,7 @@ auto Builder::hello() const -> WorkerMsg
     }
     hel->set_max_jobs(maxJobs_.load());
     hel->set_publish_failing(publishFailing);
+    hel->set_names_placements(true);
     auto lck = state.lock();
     for (const auto & [drv, ent] : lck->expected) {
         auto * run = hel->add_running();

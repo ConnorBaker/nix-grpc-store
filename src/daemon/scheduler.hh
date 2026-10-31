@@ -311,6 +311,7 @@ struct Worker
     // Its last publish to the cache failed: it gets builds only while no
     // other worker has a slot, until it reports that publishing works again.
     bool faulty = false;
+    bool namesPlacements = false; // see Hello.names_placements
     std::vector<DrvId> running;
 };
 
@@ -510,6 +511,7 @@ public:
         uint32_t maxJobs = 0;
         std::vector<std::pair<std::string_view, uint64_t>> running; // running + expecting, with assignId
         bool faulty = false;
+        bool namesPlacements = false; // Hello.names_placements
     };
 
     // A reported drv that followers wait for: the caller sends them a fresh
@@ -535,6 +537,7 @@ public:
         workersUp_++;
         wkr.draining = false;
         setFaulty(wid, info.faulty);
+        wkr.namesPlacements = info.namesPlacements;
         wkr.systems = info.systems;
         for (const auto & name : wkr.systems) {
             sys(name).free.push(wid);
@@ -566,8 +569,15 @@ public:
         return wid;
     }
 
-    void
-    done(WorkerId wid, std::string_view drvPath, const std::vector<std::pair<std::string_view, uint64_t>> & outputs)
+    // `assignId`: the placement the Done ends. One that names an earlier
+    // placement of the drv on this worker ends nothing, that placement's own
+    // Done follows; 0 (not known) ends the current one. False if it ended
+    // nothing for that. The outputs are on the worker either way.
+    auto done(
+        WorkerId wid,
+        std::string_view drvPath,
+        const std::vector<std::pair<std::string_view, uint64_t>> & outputs,
+        uint64_t assignId = 0) -> bool
     {
         auto & wkr = workers.at(wid);
         for (auto [path, size] : outputs) {
@@ -575,7 +585,10 @@ public:
         }
         auto found = findDrv(drvPath);
         if (!found) {
-            return;
+            return true;
+        }
+        if (namesAnother(wid, *found, assignId)) {
+            return false;
         }
         std::erase(wkr.running, *found);
         refreshFree(wid);
@@ -583,14 +596,22 @@ public:
         if (slot && slot->worker == wid) {
             retire(*found);
         }
+        return true;
     }
 
-    // The worker can't run it after all: place it elsewhere.
-    void giveBack(WorkerId wid, std::string_view drvPath)
+    // The worker can't run it after all: place it elsewhere. `assignId` as
+    // for done().
+    auto giveBack(WorkerId wid, std::string_view drvPath, uint64_t assignId = 0) -> bool
     {
-        if (auto found = findDrv(drvPath)) {
-            giveBack(wid, *found);
+        auto found = findDrv(drvPath);
+        if (!found) {
+            return true;
         }
+        if (namesAnother(wid, *found, assignId)) {
+            return false;
+        }
+        giveBack(wid, *found);
+        return true;
     }
 
     void giveBack(WorkerId wid, DrvId drv)
@@ -850,6 +871,17 @@ private:
     PathMap<std::pair<WorkerId, uint64_t>> lastBuilder;
     uint64_t lastAssignId = 0;
     size_t faultyCount = 0; // workers with `faulty` set
+
+    // A Done names an earlier placement of `drv` on `wid` than the current
+    // one: the worker's Hello left the drv out after the Done was made, and the
+    // scheduler placed it there again.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): a worker and a drv, named where it is called
+    [[nodiscard]] auto namesAnother(WorkerId wid, DrvId drv, uint64_t assignId) const -> bool
+    {
+        auto const & slot = entries.at(drv);
+        return slot && slot->worker == wid && workers.at(wid).namesPlacements && assignId != 0
+               && slot->assignId != assignId;
+    }
 
     // Entry is finished or abandoned: free the slot and its id for reuse.
     void retire(DrvId drv)
