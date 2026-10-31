@@ -40,6 +40,35 @@ What happens on a build:
   up. A build nobody announced is turned away and the client asks the
   scheduler again. A second client for a build that is already running
   attaches to it.
+* A builder that cannot get an input tries once more without the
+  narinfos its nix-daemon cached, one of which may name a NAR the cache
+  lost. If it still cannot, and the binary cache lost the input (niks3
+  lists it as a closure root, but the bucket has no narinfo for it or
+  its NAR answers 404, which the builder checks at `--niks3-cache-url`),
+  the builder names it. The client then builds that input too, without
+  the scheduler's cache lookup; the builder that makes it publishes it
+  with niks3 checking the bucket (`--verify-s3-integrity`), which takes
+  the lost objects again and, for a rebuild with other bytes, puts up a
+  narinfo naming the new NAR, so every builder can get it again. The
+  build waits for it and is placed anew. A build that misses the same
+  input again goes to the scheduler again, and so does any other failure
+  to get an input, up to the client's
+  `reschedule-retries`: a cache that did not answer, or an input niks3
+  does not list, which only another substituter offers or which niks3
+  holds only inside another root's closure (niks3 lists closure roots
+  only). Any client that may build can ask for that check (header
+  `x-nix-cache-lost`); it costs an S3 lookup per object of the outputs'
+  closure.
+
+  Known limitation: nix keeps a narinfo it looked up for
+  `narinfo-cache-positive-ttl` (30 days by default), even once the NAR
+  it names answers 404. Builders get past that as above. Any other
+  machine that substitutes from the cache, and looked an input up before
+  it was built again with other bytes, fails to fetch it until that
+  narinfo expires: a client of the farm that reads the cache directly
+  (`nix copy --from` the cache), for example. Clients that read through
+  the farm are not affected. The fix belongs in nix: drop a cached
+  narinfo whose NAR answers 404, and look the path up again.
 * The balancer (envoy) sends scheduler traffic to the active scheduler,
   sends each build to the builder the scheduler named, and spreads
   everything else (uploads, queries, downloads) over the builders of
@@ -316,6 +345,11 @@ scheduler, and returns once the claimed ones have published. After
 another worker. A second SIGTERM cancels right away. `nixos-rebuild
 switch` only signals the worker and the next connection starts the new
 generation.
+
+**Upgrade the module or the chart.** Both pass the daemon
+`--niks3-cache-url` (from `niks3.cacheUrl`, the chart's `niks3.cacheURL`). A
+`nix-grpc-daemon` older than that flag exits on it, so deploy the
+package with the module or chart it came with, not behind it.
 
 **Restart the scheduler.** Safe at any time, see [How it works](#how-it-works).
 New builds wait until it is back, or until another scheduler node has

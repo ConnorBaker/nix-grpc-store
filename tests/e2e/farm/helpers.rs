@@ -274,3 +274,133 @@ pub fn assert_unit_success(unit: &str) {
 pub fn wait_building() {
     retry(60, "a slow build is running", || !building().is_empty());
 }
+
+/// DEP's `input` for `tag`, needing vip, with other bytes on every build if
+/// `nondet`: built on the client (which offers vip for that build only),
+/// uploaded to worker1 alone, which publishes it to niks3, then deleted from
+/// the client and worker1. Worker1 never asked a substituter for it. Returns
+/// its store path.
+pub fn input_only_in_the_cache(tag: &str, nondet: bool) -> String {
+    let dep = expr("DEP");
+    let inp = succeed(
+        CLIENT,
+        &[
+            "nix-build",
+            "--no-out-link",
+            "--option",
+            "extra-system-features",
+            "vip",
+            &dep,
+            "-A",
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+            "--arg",
+            "features",
+            r#"["vip"]"#,
+            "--arg",
+            "nondet",
+            if nondet { "true" } else { "false" },
+        ],
+    )
+    .trim()
+    .to_string();
+    succeed(
+        CLIENT,
+        &[
+            "nix",
+            "copy",
+            "--no-check-sigs",
+            "--to",
+            &direct(WORKER1),
+            &inp,
+        ],
+    );
+    succeed(CLIENT, &["nix-store", "--delete", &inp]);
+    succeed(WORKER1, &["nix-store", "--delete", &inp]);
+    assert!(holders(&inp).is_empty(), "{:?} hold {inp}", holders(&inp));
+    inp
+}
+
+/// The NAR object the cache's narinfo for `path` names.
+pub fn nar_of(path: &str) -> String {
+    let hash = &path["/nix/store/".len()..][..32];
+    let narinfo = succeed(
+        LB,
+        &["curl", "-sf", &format!("{}/{hash}.narinfo", env("NGS_NIKS3_URL"))],
+    );
+    narinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("URL: "))
+        .unwrap_or_else(|| panic!("no URL in the narinfo of {path}: {narinfo}"))
+        .to_string()
+}
+
+/// The HTTP status the cache answers for `key`.
+pub fn cache_status(key: &str) -> String {
+    succeed(
+        LB,
+        &[
+            "curl",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("{}/{key}", env("NGS_NIKS3_URL")),
+        ],
+    )
+}
+
+/// Deletes `key` from the cache's bucket behind niks3's back, which keeps
+/// listing it.
+pub fn lose(key: &str) {
+    succeed(
+        LB,
+        &[
+            "sh",
+            "-c",
+            r#"curl -sf -X DELETE --aws-sigv4 aws:amz:us-east-1:s3 --user "$(cat /etc/niks3-test/s3-credentials)" "http://lb:9000/farm/$1""#,
+            "sh",
+            key,
+        ],
+    );
+    assert_eq!(cache_status(key), "404", "{key} is still in the cache");
+}
+
+/// `nix build` of DEP's `job` for `tag` through `store`, its input needing
+/// vip (and `nondet` as in input_only_in_the_cache) and the job
+/// `job_features`.
+pub fn build_dep_job(store: &str, tag: &str, job_features: &str, nondet: bool, secs: u64) -> Out {
+    run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "-L",
+            "--no-link",
+            "--print-out-paths",
+            "--store",
+            store,
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("DEP"),
+            "job",
+            "--argstr",
+            "tag",
+            tag,
+            "--arg",
+            "features",
+            r#"["vip"]"#,
+            "--arg",
+            "jobFeatures",
+            job_features,
+            "--arg",
+            "nondet",
+            if nondet { "true" } else { "false" },
+        ],
+        secs,
+    )
+}

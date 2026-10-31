@@ -4,10 +4,14 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <curl/curl.h>
 
 #include <nlohmann/json.hpp>
 
@@ -32,12 +36,17 @@ class Cache
         PushProcess push;
         // For publish(verify); its child starts on first use (ensureChild).
         PushProcess verifyingPush;
+        std::string cacheUrl;
 
         explicit Remote(const Niks3Config & cfg)
             : client(cfg)
             , push(cfg.pushArgv)
             , verifyingPush(withVerify(cfg.pushArgv))
+            , cacheUrl(cfg.cacheUrl)
         {
+            while (cacheUrl.ends_with('/')) {
+                cacheUrl.pop_back();
+            }
         }
 
         static auto withVerify(PushProcess::Argv argv) -> PushProcess::Argv
@@ -113,6 +122,43 @@ public:
         for (const auto & [path, sigs] : publish(paths, cancelled, verify)) {
             nixcompat::addSignatures(store, store.parseStorePath(path), sigs);
         }
+    }
+
+    // Whether the cache lost the path whose hash part is `hashPart`: niks3
+    // lists it as a closure root, and the bucket has no narinfo for it, or
+    // the narinfo's NAR answers 404. False for a path niks3 does not list,
+    // such as one only another substituter offers, when the cache did not
+    // answer either way, and without --niks3-cache-url. Throws on transport
+    // errors.
+    [[nodiscard]] auto lost(std::string_view hashPart) -> bool
+    {
+        constexpr long notFound = 404;
+        if (!remote || remote->cacheUrl.empty()) {
+            return false;
+        }
+        auto const cacheUrl = remote->cacheUrl;
+        auto const key = std::string(hashPart) + ".narinfo";
+        if (!present({key}).contains(key)) {
+            return false;
+        }
+        http::Call narinfo(cacheUrl + "/" + key, "", std::nullopt);
+        auto const status = narinfo.perform();
+        if (status == notFound) {
+            return true;
+        }
+        if (!http::ok(status)) {
+            return false;
+        }
+        constexpr std::string_view urlField = "URL: ";
+        for (const auto & line : std::views::split(std::string_view(narinfo.body()), '\n')) {
+            auto const field = std::string_view(line.begin(), line.end());
+            if (field.starts_with(urlField)) {
+                http::Call nar(cacheUrl + "/" + std::string(field.substr(urlField.size())), "", std::nullopt);
+                nar.opt(CURLOPT_NOBODY, 1L);
+                return nar.perform() == notFound;
+            }
+        }
+        return false;
     }
 
     // Path valid locally afterwards, or throws.

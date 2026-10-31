@@ -370,7 +370,7 @@ which also requires `trustClients` (see above).
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
   * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
-  * `--niks3 URL [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both
+  * `--niks3 URL [--niks3-cache-url URL] [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both. `--niks3-cache-url` is the cache as nodes substitute from it: with it, a builder that cannot get an input which the cache lost (niks3 lists it as a closure root, but the bucket has no narinfo for it or its NAR answers 404) names it, so the client builds it
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring

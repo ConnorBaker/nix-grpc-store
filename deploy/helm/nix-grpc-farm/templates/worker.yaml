@@ -202,6 +202,9 @@ spec:
             - --worker-name=$(NODE_NAME)/$(POD_NAME)
             - --log-level={{ $root.Values.logLevel }}
             - --niks3={{ $root.Values.niks3.serverURL }}
+            {{- with $root.Values.niks3.cacheURL }}
+            - --niks3-cache-url={{ . }}
+            {{- end }}
             - --niks3-token-file=/secrets/niks3/token
             {{- with $root.Values.niks3.pushFlags }}
             - --niks3-push=niks3 push {{ join " " . }}

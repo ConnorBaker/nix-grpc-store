@@ -640,7 +640,28 @@ public:
         return targets;
     }
 
-    // Inputs may have been uploaded to, or built on, another worker.
+    // nix found no substitute for `path` (its error `err` says so), and the
+    // cache lost it (Cache::lost). nix's error reads the same whether no
+    // substituter had the path, its NAR was gone or the NAR download failed,
+    // so the cache is asked. An error from a cache that did not answer, or
+    // from our nix-daemon, is not this, nor is a path niks3 does not list.
+    [[nodiscard]] auto cacheLost(const nix::StorePath & path, const nix::Error & err) -> bool
+    {
+        auto const what = std::string_view(err.what());
+        if (!what.contains("there is no substituter that can build it")
+            && !what.contains("does not exist and cannot be created")) {
+            return false;
+        }
+        try {
+            return coord.cache.lost(path.hashPart());
+        } catch (std::exception & lookup) {
+            nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "cache_lookup_failed"}, {"error", lookup.what()}});
+            return false;
+        }
+    }
+
+    // Inputs may have been uploaded to, or built on, another worker. On
+    // failure, `missing` names the input if the cache lost it.
     auto gatherInputs(
         nix::Store & localStore,
         const nix::BasicDerivation & drv,
@@ -648,6 +669,7 @@ public:
         nixgrpc::Metrics::Inputs & counted,
         std::string & missing) -> grpc::Status
     {
+        std::optional<nix::StorePath> fetching;
         try {
             const auto & inputs = nixcompat::drvInputs(drv);
             counted.wanted = inputs.size();
@@ -659,7 +681,7 @@ public:
                 if (local.contains(input)) {
                     continue;
                 }
-                missing = localStore.printStorePath(input);
+                fetching = input;
                 try {
                     nixcompat::ensurePath(localStore, input);
                 } catch (nix::Error &) {
@@ -668,14 +690,21 @@ public:
                     // new narinfo, for an input built again with other bytes.
                     backends.ensureUncached(localStore, input);
                 }
-                missing.clear();
+                fetching.reset();
                 counted.bytes += localStore.queryPathInfo(input)->narSize;
             }
             counted.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count();
             metrics.inputs(counted);
         } catch (nix::Error & err) {
-            // Another worker may still hold it locally. UNAVAILABLE makes the client retry elsewhere.
             metrics.event("input_not_substitutable");
+            // No worker can get an input the cache lost: named, the client
+            // builds it. Past a cache or nix-daemon that failed, another
+            // worker may: unnamed, the client asks the scheduler for one, up
+            // to its reschedule-retries.
+            if (fetching && cacheLost(*fetching, err)) {
+                metrics.event("input_lost");
+                missing = localStore.printStorePath(*fetching);
+            }
             return {grpc::StatusCode::FAILED_PRECONDITION, workerName + ": input not substitutable: " + err.what()};
         }
         return grpc::Status::OK;
