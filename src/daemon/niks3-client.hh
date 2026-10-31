@@ -17,6 +17,9 @@ namespace nixgrpc {
 struct Niks3Config
 {
     std::string url;
+    // The binary cache as nodes substitute from it (cacheUrl), optional.
+    // Lets a builder tell an input the cache lost from a fetch that failed.
+    std::string cacheUrl;
     std::string tokenFile;  // bearer, optional
     std::string clientCert; // mTLS, optional
     std::string clientKey;
