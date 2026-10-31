@@ -215,6 +215,13 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.sandboxWrite.emplace_back(next());
         } else if (arg == "--min-free") {
             options.minFree = parseSize(next());
+        } else if (arg == "--take-over") {
+            // NOLINTNEXTLINE(misc-include-cleaner): pid_t comes from <unistd.h>.
+            auto pid = parseInt<pid_t>(next());
+            if (!pid || *pid <= 1) {
+                throw nix::Error("--take-over expects the PID of the unit's main process");
+            }
+            options.takeOverFrom = pid;
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
@@ -244,6 +251,9 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         throw nix::Error("--idle-timeout with --scheduler: the builder must stay connected");
     }
     options.advertise = bracketHost(options.advertise);
+    if (options.takeOverFrom && !options.handsOver()) {
+        throw nix::Error("--take-over is for a node that is its own scheduler's only builder (--role builder,scheduler without --scheduler)");
+    }
     if (options.advertise.empty()) {
         options.advertise = options.listen;
     }

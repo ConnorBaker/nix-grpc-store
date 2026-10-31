@@ -41,7 +41,6 @@
 
 #include "acl.hh"
 #include "auth.hh"
-#include "backend.hh"
 #include "cache.hh"
 #include "client/channel.hh"
 #include "keepalive.hh"
@@ -80,10 +79,9 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     if (exp.drv_path().empty()) {
         return;
     }
-    if (draining_) {
-        giveBack({{exp.drv_path(), exp.assign_id()}}, nix::remote::Done::DRAINING);
-        return;
-    }
+    // While draining, an Expect is given back by tick(), not here: on the
+    // in-process path this runs under the dispatcher's lock, which a Done
+    // sent from here would take again.
     auto lck = state.lock();
     auto & ent = lck->expected[exp.drv_path()];
     if (ent.claimed) {
@@ -279,7 +277,7 @@ auto Builder::send(const WorkerMsg & msg) const -> bool
 void Builder::tick()
 {
     const auto now = Clock::now();
-    // While draining, also what an Expect racing setDraining() left behind.
+    // While draining, also the Expects that came meanwhile (onExpect).
     bool const draining = draining_;
     giveBack(
         takeUnclaimed([&](const Expected & ent) -> bool { return draining || now - ent.since > expectTimeout; }),
@@ -545,7 +543,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
     }
 }
 
-void Coordinator::tick()
+void Coordinator::tick(bool stopping)
 {
     if (!builder) {
         return;
@@ -558,7 +556,7 @@ void Coordinator::tick()
     const bool healthy = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize >= options.minFree;
     if (lastHealthy.exchange(healthy) != healthy) {
         logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", "min_free"}});
-        if (stopSignal == 0) {
+        if (!stopping) {
             builder->setDraining(!healthy);
         }
     }

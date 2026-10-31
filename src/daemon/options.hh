@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include <sys/types.h>
+
 #include <grpcpp/security/server_credentials.h>
 
 #include "acl.hh"
@@ -46,9 +48,18 @@ struct Options
     unsigned maxJobs = 0; // 0 = take nix's max-jobs
     uint64_t minFree = 0;
     std::string storeDir;
+    // --take-over: start as the successor of this main process, see takeover.hh.
+    std::optional<pid_t> takeOverFrom;
     bool sandbox = false;
     // Extra subtrees the sandbox lets the daemon write.
     std::vector<std::string> sandboxWrite;
+
+    // Its own scheduler's only builder: nobody else takes new builds while
+    // it drains, so a successor takes over instead (takeover.hh).
+    [[nodiscard]] auto handsOver() const -> bool
+    {
+        return builder && scheduler && schedulerAddr.empty();
+    }
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options;

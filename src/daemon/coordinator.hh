@@ -204,8 +204,9 @@ public:
     // NOLINTEND(*-non-private-member-variables-in-classes)
 
     void start(grpc::Server & server);
-    // From the serve loop, ~1 Hz.
-    void tick();
+    // From the serve loop, ~1 Hz. `stopping`: after a SIGTERM or a takeover,
+    // when the builder drains for good and --min-free no longer moves it.
+    void tick(bool stopping);
     // Before Shutdown(): peers of the scheduler are told to reconnect rather
     // than left to find a dead stream.
     void restarting();

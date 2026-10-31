@@ -65,6 +65,7 @@ stdenv.mkDerivation {
         ../../tests/xfcc-test.cc
         ../../tests/sbpl-test.cc
         ../../tests/sandbox-test.cc
+        ../../tests/takeover-test.cc
         ../../tests/log-spill-test.cc
         ../../tests/plugin-loader-test.cc
         ../../tests/upload-claims-test.cc
@@ -75,6 +76,7 @@ stdenv.mkDerivation {
         ../../tests/nar-fetcher-test.cc
         ../../tests/executor-test.cc
         ../../tests/retry-test.cc
+        ../../tests/builder-test.cc
         ../../tests/scheduler-test.cc
         ../../tests/dispatcher-bench.cc
         ../../tests/scheduler-grpc-bench.cc

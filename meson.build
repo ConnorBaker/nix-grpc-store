@@ -192,8 +192,8 @@ if build_server
     dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
   )
 
-  daemon_sources = [
-    'src/daemon/main.cc',
+  # All but main.cc, which builder-test links too.
+  daemon_core_sources = [
     'src/client/channel.cc',
     'src/daemon/elector.cc',
     'src/daemon/auth.cc',
@@ -201,8 +201,10 @@ if build_server
     'src/daemon/coordinator.cc',
     'src/daemon/eds.cc',
     'src/daemon/options.cc',
+    'src/daemon/takeover.cc',
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
+  daemon_sources = ['src/daemon/main.cc'] + daemon_core_sources
 
   executable('nix-grpc-daemon',
     sources : daemon_sources + [gen, eds_gen],
@@ -254,6 +256,15 @@ if build_server
   )
   test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
 
+  # The builder's side of the scheduler protocol, with an in-memory session:
+  # the daemon's sources but main.cc.
+  test('builder', executable('builder-test',
+    sources : ['tests/builder-test.cc'] + daemon_core_sources + [gen, eds_gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    cpp_args : nix_compat_args + ['-UNDEBUG', '-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
+    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
+  ))
+
   test('scheduler', executable('scheduler-test',
     sources : ['tests/scheduler-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
@@ -275,6 +286,13 @@ if build_server
       dependencies : [nix_util_dep],
       cpp_args : ['-UNDEBUG'],
     ))
+
+    test('takeover', executable('takeover-test',
+      sources : ['tests/takeover-test.cc', 'src/daemon/takeover.cc'],
+      include_directories : [src_inc, include_directories('src/daemon')],
+      dependencies : [nix_util_dep, threads_dep],
+      cpp_args : ['-UNDEBUG'],
+    ), timeout : 60)
   endif
 
   test('acl', executable('acl-test',
