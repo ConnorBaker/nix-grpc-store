@@ -415,6 +415,7 @@ which also requires `trustClients` (see above).
   * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--extra-system SYSTEM`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
   * `--lookup-threads N` — how many cache lookups a scheduler runs at once for incoming Wants, default 32. Raise it when Wants wait on a slow cache while the scheduler is idle
   * `--niks3 URL [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both
+  * `--max-linger SECS` — the longest a client's `grpc-linger` keeps a build once its clients left, default 600; `0` turns lingering off
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring
@@ -452,7 +453,7 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | `nix_grpc_nar_bytes_total` | direction, cn | uncompressed NAR bytes imported/exported |
 | `nix_grpc_build_info` | version, worker, system, features | constant 1, for joins and version skew |
 | `nix_grpc_sched` | kind = queued, workers, rested, clients, leader | scheduler state; `rested` counts workers that get no builds because they kept giving builds back |
-| `nix_grpc_sched_system` | system, features, kind = queued, unplaceable, running, slots, free | queue (by required features) and capacity (by offered features), for autoscaling |
+| `nix_grpc_sched_system` | system, features, kind = queued, unplaceable, running, slots, free, lingering | queue (by required features) and capacity (by offered features), for autoscaling; `lingering`: builds kept for a departed client's lease, or for 10 s after its stream broke (running ones are in `running` too) |
 | `nix_grpc_unavailable` | reason = stopping, low_disk, local_daemon | 1 while a worker takes no new builds for that reason |
 | `nix_grpc_events_total` | kind | assigned, cached, attached, give_back, given_back_<reason>, expect_late, unexpected_build, scheduler_take_over, scheduler_yield, … |
 | `nix_grpc_lookup_seconds` | stage = queued, cache | scheduler: time a batch of build requests waits for a lookup thread, then for the cache's answer. Not part of the queue wait |

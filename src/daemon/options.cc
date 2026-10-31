@@ -246,6 +246,12 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.sandboxWrite.emplace_back(next());
         } else if (arg == "--min-free") {
             options.minFree = parseSize(next());
+        } else if (arg == "--max-linger") {
+            auto secs = parseInt<unsigned>(next());
+            if (!secs) {
+                throw nix::Error("--max-linger expects a non-negative integer");
+            }
+            options.maxLinger = std::chrono::seconds(*secs);
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
