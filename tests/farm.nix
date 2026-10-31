@@ -127,6 +127,8 @@ let
         };
       };
       nix.settings.extra-substituters = [ "${offerUrl}?want-mass-query=true" ];
+      # A test resets one NAR download of worker1's nix-daemon (root).
+      environment.systemPackages = [ pkgs.iptables ];
       programs.nix-grpc-store.enable = true;
       networking.firewall.allowedTCPPorts = [ 50051 ];
       testCerts.neededBy = [ "nix-grpc-daemon.service" ];
@@ -149,14 +151,15 @@ let
     mk' top "farm-top" [ a b ]
   '';
   depExpr = pkgs.writeText "dep.nix" ''
-    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features }:
+    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features, nondet ? false }:
     rec {
       input = if inputPath != null then builtins.storePath inputPath else derivation {
         name = "local-input-''${tag}";
         system = builtins.currentSystem;
         requiredSystemFeatures = features;
         builder = "/bin/sh";
-        args = [ "-c" "echo ''${tag} > $out" ];
+        # nondet: other bytes on every build, as many real builds have.
+        args = [ "-c" (if nondet then "read u < /proc/sys/kernel/random/uuid; echo ''${tag} $u > $out" else "echo ''${tag} > $out") ];
       };
       referrer = derivation {
         name = "refers-to-input-''${tag}";
@@ -169,7 +172,8 @@ let
         system = builtins.currentSystem;
         requiredSystemFeatures = jobFeatures;
         builder = "/bin/sh";
-        args = [ "-c" "read x < ''${input}; echo $x > $out" ];
+        # Other bytes than the input's, so its NAR is another object.
+        args = [ "-c" "read x < ''${input}; echo used-$x > $out" ];
       };
     }
   '';
