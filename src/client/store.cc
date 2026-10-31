@@ -36,7 +36,6 @@
 #include <nix/util/util.hh>
 
 #include "channel.hh"
-#include "keepalive.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "pump.hh"
@@ -77,16 +76,10 @@ auto GrpcStore::sslOptions() -> grpc::SslCredentialsOptions {
 
 auto GrpcStore::makeChannel(bool ownConnection) -> std::shared_ptr<grpc::Channel>
 {
-  grpc::ChannelArguments args;
+  grpc::ChannelArguments args = nixgrpc::daemonChannelArgs();
   // The worker protocol streams NARs; do not cap message size.
   args.SetMaxReceiveMessageSize(-1);
-  // A replaced balancer pod blackholes the first SYN; do not sit out gRPC's 20s.
-  args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
   args.SetMaxSendMessageSize(-1);
-  // RPCs have no deadline, so notice a peer that vanished without a FIN.
-  args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, nixgrpc::kKeepaliveTimeMs);
-  args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, nixgrpc::kKeepaliveTimeoutMs);
-  args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
   if (ownConnection) {
     // Private subchannel pool = own TCP connection.
     args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
