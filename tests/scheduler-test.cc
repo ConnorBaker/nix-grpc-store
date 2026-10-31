@@ -672,6 +672,28 @@ void testStaleDoneAndUnknown()
     assert(threw);
 }
 
+// A restarted scheduler knows a running build from its worker's Hello alone:
+// nobody follows it, yet it holds its slot until its Done. The stats count it
+// as running, under its worker's system. A build whose last client cancelled
+// it, revoked and not yet Done, holds its slot the same way.
+void testReannouncedBuildRuns()
+{
+    Core shard;
+    auto const w0 = hello(shard, "w0", 1, {"orphan.drv"});
+    auto sts = shard.stats();
+    assert(sts[{.system = "x", .features = ""}].slots == 1 && sts[{.system = "x", .features = ""}].free == 0);
+    assert(sts[{.system = "x", .features = ""}].running == 1 && sts[{.system = "x", .features = ""}].queued == 0);
+    shard.done(w0, "orphan.drv", {});
+    sts = shard.stats();
+    assert(sts[{.system = "x", .features = ""}].free == 1 && sts[{.system = "x", .features = ""}].running == 0);
+    std::vector<Assign> out;
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && shard.cancel(1, "a.drv") == w0);
+    sts = shard.stats();
+    assert(sts[{.system = "x", .features = ""}].free == 0 && sts[{.system = "x", .features = ""}].running == 1);
+}
+
 } // namespace
 // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length)
 
@@ -691,6 +713,7 @@ try {
     testRepeatBouncesTakeTurns();
     testFaulty();
     testOtherPlacementsDoneTellsWhereOutputsAre();
+    testReannouncedBuildRuns();
     testDraining();
     testSetMaxJobs();
     testFeatures();
