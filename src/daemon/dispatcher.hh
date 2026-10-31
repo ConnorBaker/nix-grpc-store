@@ -56,6 +56,8 @@ public:
         // Unset: the steady clock, and the dispatcher calls tick() itself
         // every second. Set: the caller owns time and calls tick().
         std::function<double()> nowMs;
+        // The longest a client may have a build kept once it leaves (Want.linger_s).
+        double maxLingerMs = 0;
     };
 
     Dispatcher(Config config, Metrics & metrics);
@@ -212,6 +214,8 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void tickLocked();
+    // Revoke or forget the builds kept for a client whose linger or hold is over.
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void expireLingersLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void placeabilityChangedLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void sendToFollowers(sched::DrvId drv, const nix::remote::SchedMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto assignedMsg(sched::DrvId drv) const -> nix::remote::SchedMsg;
@@ -223,6 +227,8 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, bool cached);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);
+    // Ends a lease (Release) and answers Released.
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onRelease(Client & client, const nix::remote::Release & release);
 };
 
 } // namespace nixgrpc
