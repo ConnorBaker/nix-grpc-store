@@ -125,6 +125,16 @@ public:
         return draining_;
     }
 
+    // Builds taken at once: --max-jobs, else nix's max-jobs as last read.
+    [[nodiscard]] auto maxJobs() const -> unsigned
+    {
+        return maxJobs_;
+    }
+
+    // SIGHUP: without --max-jobs, read nix's max-jobs anew and hand the
+    // scheduler the new capacity. Called from the serve loop.
+    void reloadNixConfig();
+
     // Give back unclaimed Expects nobody came for. Called from the serve loop.
     void tick();
 
@@ -144,8 +154,11 @@ private:
     mutable nix::Sync<State> state;
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<bool> draining_{false};
+    std::atomic<unsigned> maxJobs_;
     static constexpr std::chrono::seconds expectTimeout{60};
 
+    // Draining and capacity, after Hello. False if the session is gone.
+    auto sendLoad() const -> bool;
     void sendDone(
         const std::string & drvPath,
         uint64_t assignId,

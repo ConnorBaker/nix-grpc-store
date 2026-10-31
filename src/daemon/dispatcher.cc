@@ -675,7 +675,11 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
     } else if (msg.has_done()) {
         onDone(*worker.id, msg.done());
     } else if (msg.has_load()) {
-        core.setDraining(*worker.id, msg.load().draining());
+        const auto & load = msg.load();
+        core.setDraining(*worker.id, load.draining());
+        if (load.has_max_jobs()) {
+            core.setMaxJobs(*worker.id, load.max_jobs());
+        }
         membershipChangedLocked();
         placeabilityChangedLocked();
     }

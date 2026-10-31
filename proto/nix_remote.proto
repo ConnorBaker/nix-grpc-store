@@ -258,6 +258,9 @@ message Done {
 
 message Load {
   bool draining = 1;
+  // The worker's capacity, as Hello.max_jobs, which says 0 while draining.
+  // Absent from workers that predate it.
+  optional uint32 max_jobs = 3;
 }
 
 message WorkerMsg {

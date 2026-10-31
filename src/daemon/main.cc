@@ -118,6 +118,9 @@ auto stopping() -> bool
 {
     return stopSignal != 0 || handedOver;
 }
+// SIGHUP count: each one asks the builder to read nix's max-jobs anew.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
+volatile std::sig_atomic_t reloadSignal = 0;
 
 static_assert(static_cast<int>(nixgrpc::SpillKind::line) == static_cast<int>(nixgrpc::BuildEvent::Kind::line));
 static_assert(static_cast<int>(nixgrpc::SpillKind::phase) == static_cast<int>(nixgrpc::BuildEvent::Kind::phase));
@@ -1351,6 +1354,14 @@ void waitTick(
     }
 }
 
+// SIGHUP: a builder reads nix's max-jobs anew.
+void reloadNixConfig(nixgrpc::Coordinator & coord)
+{
+    if (coord.builder) {
+        coord.builder->reloadNixConfig();
+    }
+}
+
 // The first SIGTERM, or a successor taking over: no new builds, out of the
 // balancer.
 void startDrain(grpc::Server & server, nixgrpc::Coordinator & coord)
@@ -1380,11 +1391,16 @@ void serve(
         watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
                               : std::chrono::seconds(1));
     bool draining = false;
+    std::sig_atomic_t reloaded = 0;
     for (;;) {
         bool const predecessor = gen.predecessorAlive();
         if (!stopping()) {
             if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout && !predecessor && !gen.paused()) {
                 return;
+            }
+            if (reloadSignal != reloaded) {
+                reloaded = reloadSignal;
+                reloadNixConfig(coord);
             }
             if (!gen.paused()) {
                 coord.tick(false);
@@ -1469,6 +1485,9 @@ try {
     for (int const sig : {SIGTERM, SIGINT}) {
         sigaction(sig, &act, nullptr);
     }
+    // Picked up by the main loop too. Unhandled, SIGHUP would kill us mid-build.
+    act.sa_handler = [](int) -> void { reloadSignal = reloadSignal + 1; };
+    sigaction(SIGHUP, &act, nullptr);
     // NOLINTEND(misc-include-cleaner)
 
     // Required before nix::openStore() in the native RPC handlers.
@@ -1517,7 +1536,7 @@ try {
          {"scheduler_addr", options.schedulerAddr},
          {"advertise", options.advertise},
          {"niks3", options.niks3.url},
-         {"max_jobs", std::to_string(options.maxJobs)}});
+         {"max_jobs", std::to_string(coord.builder ? coord.builder->maxJobs() : 0)}});
     NixRemoteService service(
         options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord);
 

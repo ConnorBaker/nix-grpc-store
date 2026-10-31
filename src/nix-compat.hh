@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <variant>
 
 // Must be a macro: it is evaluated in #if directives below and in the sources.
@@ -465,16 +466,27 @@ public:
 #endif
 
 
-// 2.36 moved max-jobs and friends into a WorkerSettings base.
-inline auto maxBuildJobs() -> unsigned {
-  constexpr auto has = []<typename S>(S &settings) -> unsigned {
+// max-jobs as Nix's configuration says now, not as nix::settings read it at
+// startup: fresh settings filled by Nix's own loader (nix.conf and its
+// includes, the user files, NIX_CONFIG). 2.36 moved max-jobs and friends into
+// a WorkerSettings base; there only that base is instantiated, so no other
+// setting's parser runs (or warns).
+inline auto configuredMaxBuildJobs() -> unsigned {
+  constexpr auto load = []<typename S>(S &settings) -> unsigned {
     if constexpr (requires { settings.getWorkerSettings(); }) {
-      return settings.getWorkerSettings().maxBuildJobs;
+      using Worker = std::remove_cvref_t<decltype(settings.getWorkerSettings())>;
+      // WorkerSettings' constructor is protected. Its bases are Nix's.
+      struct Fresh : Worker {}; // NOLINT(misc-multiple-inheritance)
+      Fresh fresh;
+      nix::loadConfFile(fresh);
+      return fresh.maxBuildJobs;
     } else {
-      return settings.maxBuildJobs;
+      S fresh;
+      nix::loadConfFile(fresh);
+      return fresh.maxBuildJobs;
     }
   };
-  return has(nix::settings);
+  return load(nix::settings);
 }
 
 // The worker's own `cores`. 2.36 moved it into LocalSettings.

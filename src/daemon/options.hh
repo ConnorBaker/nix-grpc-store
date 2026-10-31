@@ -45,7 +45,7 @@ struct Options
     std::string schedulerTokenFile; // bearer towards a remote scheduler, optional
     // How the balancer reaches this worker. Goes into Assigned.worker_addr.
     std::string advertise;
-    unsigned maxJobs = 0; // 0 = take nix's max-jobs
+    unsigned maxJobs = 0; // 0 = nix's max-jobs, read at start and on SIGHUP (Builder::reloadNixConfig)
     uint64_t minFree = 0;
     std::string storeDir;
     // --take-over: start as the successor of this main process, see takeover.hh.
