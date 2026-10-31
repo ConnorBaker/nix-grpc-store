@@ -71,11 +71,20 @@ has_add_temp_roots = cxx.compiles('''
 void f(nix::Store & s) { s.addTempRoots({}); }
 ''', dependencies : [nix_store_dep, nix_util_dep], name : 'Store::addTempRoots')
 
+# Store::queryMissing with an evaluation store (NixOS/nix#16433) is only in
+# the Nix forks that carry that PR; released Nix and master have the
+# one-argument virtual alone.
+has_query_missing_eval_store = cxx.compiles('''
+#include <nix/store/store-api.hh>
+void f(nix::Store & s) { static_cast<void>(s.queryMissing({}, &s)); }
+''', dependencies : [nix_store_dep, nix_util_dep], name : 'Store::queryMissing with an evaluation store')
+
 # Version macros for src/nix-compat.hh.
 nix_compat_args = [
   '-DNIX_COMPAT_VERSION_MAJOR=' + nix_ver[0],
   '-DNIX_COMPAT_VERSION_MINOR=' + nix_ver_minor,
   '-DNIX_COMPAT_HAS_ADD_TEMP_ROOTS=' + (has_add_temp_roots ? '1' : '0'),
+  '-DNIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE=' + (has_query_missing_eval_store ? '1' : '0'),
 ]
 
 # --- protobuf / gRPC codegen -----------------------------------------------

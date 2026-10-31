@@ -286,8 +286,12 @@ public:
 
     // RemoteStore would tunnel this. One RPC, with a fallback to the
     // client-side walk for servers without QueryMissing.
-    auto queryMissing(const std::vector<DerivedPath> & targets)
+#if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE
+    auto queryMissing(const std::vector<DerivedPath> & targets, Store * evalStore = nullptr)
         -> MissingPaths override;
+#else
+    auto queryMissing(const std::vector<DerivedPath> & targets) -> MissingPaths override;
+#endif
 
     // RemoteStore would tunnel this, which only trusted callers may. Nothing
     // reads more than membership from it, so QueryMissing answers it.
