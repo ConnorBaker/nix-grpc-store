@@ -174,6 +174,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.oidcConfig = next();
         } else if (arg == "--niks3") {
             options.niks3.url = next();
+        } else if (arg == "--niks3-cache-url") {
+            options.niks3.cacheUrl = next();
         } else if (arg == "--niks3-token-file") {
             options.niks3.tokenFile = next();
         } else if (arg == "--niks3-client-cert") {
