@@ -87,6 +87,7 @@ class Metrics
     prometheus::Gauge * schedQueuedGauge = &sched->Add({{"kind", "queued"}});
     prometheus::Gauge * schedWorkersGauge = &sched->Add({{"kind", "workers"}});
     prometheus::Gauge * schedLeaderGauge = &sched->Add({{"kind", "leader"}});
+    prometheus::Gauge * buildSlotsGauge = nullptr;
 
     // NOLINTNEXTLINE(*-magic-numbers)
     prometheus::Histogram::BucketBoundaries buckets{0.05, 0.25, 1, 2, 5, 10, 30, 60, 120, 300, 900, 3600};
@@ -185,14 +186,17 @@ public:
             .Set(1);
     }
 
+    // Builders only: registered on first use, then set again on SIGHUP.
     void buildSlots(unsigned count)
     {
-        prometheus::BuildGauge()
-            .Name("nix_grpc_build_slots")
-            .Help("Configured concurrent builds (--max-jobs)")
-            .Register(*registry)
-            .Add({})
-            .Set(count);
+        if (buildSlotsGauge == nullptr) {
+            buildSlotsGauge = &prometheus::BuildGauge()
+                                   .Name("nix_grpc_build_slots")
+                                   .Help("Concurrent builds taken: --max-jobs, else nix's max-jobs as last read")
+                                   .Register(*registry)
+                                   .Add({});
+        }
+        buildSlotsGauge->Set(count);
     }
 
     void schedQueued(size_t count) const

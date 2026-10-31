@@ -1,9 +1,7 @@
 // Command line of nix-grpc-daemon.
 
 #include "options.hh"
-#include "nix-compat.hh"
 
-#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -240,8 +238,6 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     }
     if (!options.builder) {
         options.maxJobs = 0;
-    } else if (options.maxJobs == 0) {
-        options.maxJobs = std::clamp(nixcompat::maxBuildJobs(), 1U, static_cast<unsigned>(sched::FreeIndex::maxSlots));
     }
     if (options.schedulerAddr.empty() && !options.scheduler) {
         throw nix::Error("--role builder without --scheduler has nobody to take work from");

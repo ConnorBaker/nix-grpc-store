@@ -211,6 +211,8 @@ pkgs.testers.runNixOSTest {
     worker1 = {
       imports = [ (worker "worker1") ];
       nix.settings.system-features = [ "vip" ];
+      # Rewritten under the running daemon by the max-jobs e2e test.
+      nix.extraOptions = "!include /run/nix-max-jobs.conf";
       services.nix-grpc-daemon.workerName = "node-a";
     };
     worker2 = {

@@ -281,6 +281,24 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('dispatcher', executable('dispatcher-test',
+    sources : ['tests/dispatcher-test.cc'],
+    dependencies : [dispatcher_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  max_jobs_conf = meson.current_build_dir() / 'max-jobs-test-conf'
+  test('max-jobs', executable('max-jobs-test',
+    sources : ['tests/max-jobs-test.cc'],
+    include_directories : [src_inc],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+    dependencies : [nix_store_dep, nix_util_dep],
+  ), env : {
+    'NIX_CONF_DIR' : max_jobs_conf,
+    'NIX_USER_CONF_FILES' : max_jobs_conf / 'no-user.conf',
+    'NIX_CONFIG' : '',
+  })
+
   test('sbpl', executable('sbpl-test',
     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],

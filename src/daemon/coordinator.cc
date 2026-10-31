@@ -37,6 +37,7 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/globals.hh>
+#include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 
 #include "acl.hh"
@@ -46,10 +47,12 @@
 #include "keepalive.hh"
 #include "logfmt.hh"
 #include "metrics.hh"
+#include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "options.hh"
 #include "sched-reactor.hh"
+#include "scheduler.hh"
 
 namespace nixgrpc {
 
@@ -64,6 +67,12 @@ namespace {
 constexpr int minReconnectBackoffMs = 2'000;
 constexpr std::chrono::milliseconds minBackoff{200};
 constexpr std::chrono::milliseconds maxBackoff{5000};
+
+// 0 (nix: no local builds) still takes one.
+auto nixMaxJobs() -> unsigned
+{
+    return std::clamp(nixcompat::configuredMaxBuildJobs(), 1U, static_cast<unsigned>(sched::FreeIndex::maxSlots));
+}
 } // namespace
 
 // ---------------------------------------------------------------- Builder
@@ -71,6 +80,7 @@ constexpr std::chrono::milliseconds maxBackoff{5000};
 Builder::Builder(const Options & options, Metrics & metrics)
     : options(options)
     , metrics(metrics)
+    , maxJobs_(options.maxJobs != 0 ? options.maxJobs : nixMaxJobs())
 {
 }
 
@@ -211,7 +221,7 @@ auto Builder::hello() const -> WorkerMsg
     for (const auto & feat : nix::settings.systemFeatures.get()) {
         hel->add_features(feat);
     }
-    hel->set_max_jobs(options.maxJobs);
+    hel->set_max_jobs(maxJobs_.load());
     auto lck = state.lock();
     for (const auto & [drv, ent] : lck->expected) {
         auto * run = hel->add_running();
@@ -226,12 +236,7 @@ auto Builder::greet() const -> bool
     if (!send(hello())) {
         return false;
     }
-    if (draining_) {
-        WorkerMsg msg;
-        msg.mutable_load()->set_draining(true);
-        return send(msg);
-    }
-    return true;
+    return !draining_ || sendLoad();
 }
 
 void Builder::setDraining(bool draining)
@@ -239,12 +244,18 @@ void Builder::setDraining(bool draining)
     if (draining_.exchange(draining) == draining) {
         return;
     }
-    WorkerMsg msg;
-    msg.mutable_load()->set_draining(draining);
-    send(msg);
+    sendLoad();
     if (draining) {
         giveBack(takeUnclaimed([](const Expected &) -> bool { return true; }), nix::remote::Done::DRAINING);
     }
+}
+
+auto Builder::sendLoad() const -> bool
+{
+    WorkerMsg msg;
+    msg.mutable_load()->set_draining(draining_);
+    msg.mutable_load()->set_max_jobs(maxJobs_);
+    return send(msg);
 }
 
 auto Builder::takeUnclaimed(const std::function<bool(const Expected &)> & pred)
@@ -261,6 +272,28 @@ auto Builder::takeUnclaimed(const std::function<bool(const Expected &)> & pred)
         }
     }
     return taken;
+}
+
+// Whoever rewrites nix's configuration signals us; a Tribuchet hub rewrites
+// max-jobs, in a file nix.conf includes, whenever a worker joins or leaves.
+void Builder::reloadNixConfig()
+{
+    if (options.maxJobs != 0) {
+        return;
+    }
+    unsigned jobs = 0;
+    try {
+        jobs = nixMaxJobs();
+    } catch (nix::Error & err) {
+        logLine(LogLevel::info, {{"event", "max_jobs_unreadable"}, {"error", err.msg()}});
+        return;
+    }
+    auto const was = maxJobs_.exchange(jobs);
+    logLine(LogLevel::info, {{"event", "max_jobs"}, {"from", std::to_string(was)}, {"to", std::to_string(jobs)}});
+    if (was != jobs) {
+        metrics.buildSlots(jobs);
+        sendLoad();
+    }
 }
 
 void Builder::setSend(SendFn send)
@@ -395,7 +428,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
 {
     if (options.builder) {
         builder.emplace(options, metrics);
-        metrics.buildSlots(options.maxJobs);
+        metrics.buildSlots(builder->maxJobs());
     }
     if (options.scheduler) {
         Dispatcher::PresentFn present;

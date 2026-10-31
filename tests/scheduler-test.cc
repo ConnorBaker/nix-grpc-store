@@ -230,6 +230,36 @@ void testDraining()
     assert(out.size() == 1);
 }
 
+// Load.max_jobs: the worker's capacity changed while it stayed connected.
+void testSetMaxJobs()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1);
+    for (auto const * drv : {"a.drv", "b.drv", "c.drv"}) {
+        shard.want(1, {.drvPath = drv, .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    }
+    shard.dispatch(out);
+    assert(out.size() == 1);
+    shard.setMaxJobs(w0, 3);
+    shard.dispatch(out);
+    assert(out.size() == 3 && shard.queued() == 0);
+    // Shrunk below what runs: nothing new until the excess finishes.
+    shard.setMaxJobs(w0, 1);
+    shard.want(1, {.drvPath = "d.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.done(w0, "a.drv", {});
+    shard.done(w0, "b.drv", {});
+    shard.dispatch(out);
+    assert(out.size() == 3);
+    shard.done(w0, "c.drv", {});
+    shard.dispatch(out);
+    assert(out.size() == 4 && out[3].worker == w0);
+    // Clamped as Hello's is.
+    shard.setMaxJobs(w0, 1000);
+    auto sts = shard.stats();
+    assert((sts[{.system = "x", .features = ""}].slots == FreeIndex::maxSlots));
+}
+
 void testFeatures()
 {
     Core shard;
@@ -490,6 +520,7 @@ try {
     testHelloSupersedes();
     testCancelAndClientGone();
     testDraining();
+    testSetMaxJobs();
     testFeatures();
     testSystems();
     testUnofferedSystems();

@@ -1391,3 +1391,47 @@ fn an_input_a_substituter_offers_unsigned_is_built() {
         );
     }
 }
+
+#[test]
+fn sighup_rereads_nix_max_jobs_and_the_scheduler_counts_it() {
+    farm_ready();
+    let pid = || query(WORKER1, &["systemctl", "show", "-p", "MainPID", "--value", UNIT]);
+    let own = || gauge(WORKER1, "nix_grpc_build_slots");
+    let total = || gauge_sum(leader(), r#"kind="slots""#);
+    let hup = || {
+        succeed(
+            WORKER1,
+            &["systemctl", "kill", "--kill-whom=main", "--signal=SIGHUP", UNIT],
+        )
+    };
+    let reads = || journal_count(WORKER1, UNIT, "event=max_jobs ");
+    let (pid0, own0, total0) = (pid(), own(), total());
+    // worker1's nix.conf includes this file, as a Tribuchet hub's does the
+    // fragment it rewrites (farm.nix).
+    let conf = "/run/nix-max-jobs.conf";
+    succeed(
+        WORKER1,
+        &[
+            "sh",
+            "-c",
+            r#"printf 'max-jobs = %s\n' "$1" > "$2.tmp" && mv "$2.tmp" "$2""#,
+            "sh",
+            &(own0 + 3).to_string(),
+            conf,
+        ],
+    );
+    // Nothing is re-read without the signal.
+    let reads0 = reads();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(own(), own0);
+    hup();
+    wait_journal_above(WORKER1, UNIT, "event=max_jobs ", reads0, 30);
+    retry(30, "worker1 took nix's new max-jobs", || own() == own0 + 3);
+    retry(30, "the scheduler counts the new slots", || total() == total0 + 3);
+    succeed(WORKER1, &["rm", conf]);
+    hup();
+    retry(30, "back to nix.conf's own max-jobs", || {
+        own() == own0 && total() == total0
+    });
+    assert_eq!(pid(), pid0, "nix-grpc-daemon restarted");
+}

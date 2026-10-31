@@ -600,6 +600,14 @@ public:
         refreshFree(wid);
     }
 
+    // Capacity changed while connected. Below what runs, free goes negative
+    // and nothing new is placed until enough finish.
+    void setMaxJobs(WorkerId wid, uint32_t maxJobs)
+    {
+        workers.at(wid).maxJobs = static_cast<int32_t>(std::min<uint32_t>(maxJobs, FreeIndex::maxSlots));
+        refreshFree(wid);
+    }
+
     // Requeues what still has followers; a reconnecting worker's Hello
     // reconciles.
     void workerGone(WorkerId wid)

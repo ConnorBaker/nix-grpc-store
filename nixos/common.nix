@@ -284,7 +284,7 @@ in
     maxJobs = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 1 63);
       default = null;
-      description = "Concurrent builds. Defaults to `nix.settings.max-jobs`.";
+      description = "Concurrent builds. Defaults to `nix.settings.max-jobs`, read again on SIGHUP.";
     };
     minFree = lib.mkOption {
       type = lib.types.str;
