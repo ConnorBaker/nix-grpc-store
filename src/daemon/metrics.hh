@@ -19,6 +19,7 @@ namespace nixgrpc {
 class Metrics
 {
     std::shared_ptr<prometheus::Registry> registry = std::make_shared<prometheus::Registry>();
+    std::string listen;
     std::unique_ptr<prometheus::Exposer> exposer;
 
     prometheus::Family<prometheus::Counter> * rpcs =
@@ -254,9 +255,19 @@ public:
     }
 
     // `listen` empty: keep counting but do not serve /metrics.
-    explicit Metrics(const std::string & listen)
+    explicit Metrics(std::string listen)
+        : listen(std::move(listen))
     {
-        if (!listen.empty()) {
+        serve(true);
+    }
+
+    // Off frees the port for a successor taking over, on serves again if the
+    // takeover failed. From one thread.
+    void serve(bool serving)
+    {
+        if (!serving) {
+            exposer.reset();
+        } else if (!exposer && !listen.empty()) {
             exposer = std::make_unique<prometheus::Exposer>(listen);
             exposer->RegisterCollectable(registry);
         }
