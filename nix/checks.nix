@@ -5,6 +5,7 @@
   nixToolsWithPlugin,
   nixosModule,
   niks3,
+  tribuchet,
 }:
 let
   inherit (pkgs) lib;
@@ -35,6 +36,26 @@ in
 # Every per-version plugin package doubles as a compile check.
 lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
 // {
+  # contrib/build-client.sh against a fake nix and clock.
+  build-client =
+    pkgs.runCommand "build-client-self-test"
+      {
+        nativeBuildInputs = with pkgs; [
+          bash
+          coreutils
+          gnused
+          gnugrep
+          python3
+          zstd
+        ];
+      }
+      ''
+        bash ${../contrib/build-client.sh} --self-test > self-test.txt || {
+          cat self-test.txt
+          exit 1
+        }
+        cp self-test.txt $out
+      '';
   # A grpc:// URL is only understood when the plugin registered the scheme.
   nix-with-plugin = pkgs.runCommand "nix-with-plugin-check" { } ''
     HOME=$TMPDIR ${packages.nix-with-plugin}/bin/nix --extra-experimental-features nix-command \
@@ -167,4 +188,25 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   farm-restarts = farm "restarts";
   farm-cutoffs = farm "cutoffs";
 }
-// lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") { inherit k3s; }
+// lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") (
+  let
+    # contrib/build-client.sh's chains through this scheduler to a Tribuchet
+    # hub, in Tribuchet's package set, against this tree.
+    lease =
+      scenario:
+      tribuchet.inputs.nixpkgs.legacyPackages.x86_64-linux.testers.runNixOSTest (
+        import ../tests/lease-test.nix {
+          tribuchet = tribuchet.packages.x86_64-linux.default;
+          nixosModule = tribuchet.nixosModules.default;
+          slowBuild = "${tribuchet}/nix/tests/cancel.nix";
+          nixGrpcStore = ../.;
+          inherit scenario;
+        }
+      );
+  in
+  {
+    inherit k3s;
+    lease = lease "chain";
+    lease-queue = lease "queue";
+  }
+)

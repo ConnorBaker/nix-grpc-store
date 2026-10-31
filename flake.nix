@@ -8,6 +8,9 @@
     # (ConnorBaker/niks3 verify-integrity-fixes).
     niks3.url = "github:ConnorBaker/niks3/a3f6a6040848f73c9f5a3a99e804f341f3bd942f";
     niks3.inputs.nixpkgs.follows = "nixpkgs";
+    # The lease checks' hub and worker. Only those checks use it, in its own
+    # package set: the Nix its hub patches.
+    tribuchet.url = "github:ConnorBaker/tribuchet/f9c35e3bc5d0d339192bc76fd977acc2f0887b18";
   };
 
   outputs =
@@ -15,6 +18,7 @@
       self,
       nixpkgs,
       niks3,
+      tribuchet,
     }:
     let
       lib = nixpkgs.lib;
@@ -164,7 +168,7 @@
           nixPackages = nixPackagesFor nixpkgs.legacyPackages.${system};
           nixosModule = self.nixosModules.default;
           nixToolsWithPlugin = self.lib.nixToolsWithPlugin;
-          inherit niks3;
+          inherit niks3 tribuchet;
         }
       );
 
