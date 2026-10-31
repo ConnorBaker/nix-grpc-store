@@ -92,6 +92,18 @@
 
 using GrpcStream = grpc::ClientReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 
+namespace nixgrpc {
+// The `grpc-linger` setting (store.cc): seconds every Want asks the scheduler
+// to keep its build once this client leaves (Want.linger_s).
+auto lingerSeconds() -> unsigned;
+// The `grpc-lease` setting (store.cc): whose promise that is (Want.lease_id).
+auto leaseId() -> std::string;
+// How much of a lease id a notice shows: whoever knows the id can end that
+// lease, and a notice ends up in logs others read (the scheduler's journal
+// shows as much, dispatcher.cc's leaseIdLogged).
+constexpr size_t leaseIdShown = 8;
+} // namespace nixgrpc
+
 namespace nix {
 
 // Follows Nix's own StoreConfig pattern (e.g. DummyStoreConfig).
@@ -168,6 +180,11 @@ private:
         4,
         "nar-connections",
         "Number of parallel TCP connections used for NAR downloads."};
+
+    Setting<bool> releaseLease{this, false, "release-lease",
+        "End the lease the `grpc-lease` setting names on the scheduler when the store connects, as "
+        "`nix store info` does: builds kept only for it are let go. Fails unless `grpc-lease` is set "
+        "and the scheduler answers."};
 
 public:
     explicit GrpcStoreConfig(const Params & params)
@@ -330,7 +347,28 @@ public:
     // answers it and caches the trust flag, no tunnel needed. TCP-level
     // failures are retried for connect-timeout so a balancer or worker
     // restart does not fail the build; TLS rejections fail at once.
-    void connect() override { isTrustedClient(); }
+    // With release-lease, `nix store info` ends the grpc-lease setting's
+    // lease first: the id comes from the settings (NIX_CONFIG, say), not
+    // from the store URL on the command line, where any user can read it.
+    void connect() override {
+      if (config->releaseLease.get()) {
+        auto const lease = nixgrpc::leaseId();
+        if (lease.empty()) {
+          throw Error("release-lease: no lease to end, the grpc-lease setting is empty");
+        }
+        auto const builds = releaseLease(lease);
+        notice(
+            "released lease %s on %s: %d builds",
+            lease.substr(0, nixgrpc::leaseIdShown),
+            config->authority.to_string(),
+            builds);
+      }
+      isTrustedClient();
+    }
+
+    // Release (proto/nix_remote.proto) on a Schedule stream of its own: the
+    // number of builds the lease held, once the scheduler answers.
+    auto releaseLease(const std::string & lease) -> uint32_t;
 
     // The tunnel is for trusted callers only, `nix store info` is for all.
     auto getVersion() -> std::optional<std::string> override {

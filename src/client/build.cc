@@ -294,6 +294,8 @@ struct GrpcStore::Run {
     want->set_cp_hint_ms(job.cpHintMs);
     want->set_build_mode(static_cast<uint32_t>(job.mode));
     want->set_system(job.drv.platform);
+    want->set_linger_s(nixgrpc::lingerSeconds());
+    want->set_lease_id(nixgrpc::leaseId());
     debug("grpc: want %s", job.drvPath.to_string());
   }
 
@@ -645,6 +647,34 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
     logReconnect(config->authority.to_string(), status, handover);
     std::this_thread::sleep_for(backoff->next());
   }
+}
+
+auto GrpcStore::releaseLease(const std::string & lease) -> uint32_t {
+  // Long enough to connect, then for the answer. A scheduler that predates
+  // Release ignores it: this runs out.
+  constexpr auto answerWithin = std::chrono::seconds(10);
+  nixgrpc::Call call;
+  call.ctx().set_deadline(
+      std::chrono::system_clock::now() + std::chrono::seconds(config->connectTimeout.get()) + answerWithin);
+  call.ctx().set_wait_for_ready(true);
+  auto stream = sched->Schedule(&call.ctx());
+  remote::ClientMsgs msgs;
+  msgs.add_msgs()->mutable_release()->set_lease_id(lease);
+  if (stream->Write(msgs)) {
+    remote::SchedMsgs answer;
+    while (stream->Read(&answer)) {
+      for (const auto & msg : answer.msgs()) {
+        if (msg.has_released() && msg.released().lease_id() == lease) {
+          call.ctx().TryCancel();
+          static_cast<void>(stream->Finish());
+          return msg.released().builds();
+        }
+      }
+    }
+  }
+  auto const status = stream->Finish();
+  throw Error("scheduler at '%s' did not answer the release of lease '%s': %s", config->authority.to_string(),
+              lease.substr(0, nixgrpc::leaseIdShown), status.ok() ? "the stream ended" : status.error_message());
 }
 
 void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) {

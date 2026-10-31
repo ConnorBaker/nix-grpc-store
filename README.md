@@ -333,6 +333,49 @@ With access control enabled, remote builders need the `trusted` role.
 The builder protocol imports unsigned outputs built on the client,
 which also requires `trustClients` (see above).
 
+A client that gives up after a while and is followed by another for the
+same build, a chain of time-bounded `nix build`s, can ask the scheduler
+to keep its builds running in between, under a lease that names the
+chain (the same name for each of its `nix build`s):
+
+    NIX_CONFIG="grpc-lease = $chain" nix build --option grpc-linger 600 …
+
+Once a build's last client leaves, the scheduler keeps it while any lease
+on it is live, until 600 s after the last client of that lease left, in
+whatever state it is: running, even while other builds wait for its slot;
+assigned to a builder (and back in its place in the queue should the
+builder give it back or go); or queued, in its place, though not placed
+while no client is there to take it. The next client to ask for it
+follows it again instead of starting it anew. Each lease counts on its
+own, capped by the scheduler's `--max-linger`: a client without one (an
+interactive `nix build`, whose linger is 0) neither keeps a build nor ends
+another's lease. When the chain is over, end its lease:
+
+    NIX_CONFIG="grpc-lease = $chain" nix store info --store "grpc://host:port?release-lease=true"
+
+It reports `released lease …: N builds` once the scheduler has
+answered, N being the builds that carried the lease (0: none), and
+fails if the scheduler does not answer (one that predates leases). A
+build only that lease kept is let go; one a client of the lease still
+follows runs on for it, and is let go as it leaves. A later Want with
+the lease keeps nothing for as long as `--max-linger`: the scheduler
+remembers each released id that long, a Release that came before any
+Want of its lease too, at most 65,536 of them, so Releases of fresh ids
+flooding in can drop a real one early. A restarted scheduler has
+forgotten them, as it has its leases. A scheduler does not know who
+set a lease: any client allowed to schedule that knows the id can end
+it, so the id goes in the environment, not on the command line where
+every user's `ps` shows it, and the report above and the scheduler's
+log show only its first 8 characters. Without a linger (`0`, the
+default) a build is forgotten as its last client leaves, and one placed
+on a builder is revoked: at once on a Cancel, and 10 s later when the
+client's stream broke, so that a client that reconnects finds it still
+running. An interrupted `nix build` thus stops its builds within 10 s.
+`grpc-lease` and `grpc-linger` are global settings, not URI parameters,
+because `builders` is shared by every build on the machine; the daemon
+applies them only for a trusted user. A linger without a lease keeps a
+build for the longest such linger and cannot be released.
+
 ## URI parameters
 
   * `insecure` — plaintext, no TLS (testing only)
@@ -356,6 +399,9 @@ which also requires `trustClients` (see above).
     not count, nor does one after which the scheduler sends it back to the
     same assignment, where the build still runs.
   * `max-builds` (default 64) — concurrent `BuildDerivation` streams.
+  * `release-lease` (default false) — when the store connects (`nix store
+    info`), end the lease the `grpc-lease` setting names on the scheduler
+    first; see above.
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that
     system. Use one `nix.buildMachines` entry per system.
