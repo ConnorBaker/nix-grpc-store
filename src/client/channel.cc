@@ -1,6 +1,7 @@
 // Client credential lookup and gRPC runtime lifetime.
 
 #include "channel.hh"
+#include "keepalive.hh"
 
 #include <chrono>
 #include <memory>
@@ -12,6 +13,8 @@
 
 #include <grpc/event_engine/event_engine.h>
 #include <grpc/grpc.h>
+#include <grpc/impl/channel_arg_names.h>
+#include <grpcpp/support/channel_arguments.h>
 
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
@@ -24,6 +27,20 @@
 #include <nix/util/file-system.hh>
 
 namespace nixgrpc {
+
+auto daemonChannelArgs() -> grpc::ChannelArguments
+{
+  // A replaced balancer pod blackholes the first SYN; do not sit out gRPC's 20s.
+  constexpr int minReconnectBackoffMs = 2'000;
+  grpc::ChannelArguments args;
+  args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
+  // Calls have no deadline, and a stream may be silent for hours (builds):
+  // notice a peer that vanished without a FIN.
+  args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
+  args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
+  args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+  return args;
+}
 
 namespace {
 // First readable candidate, or empty.
