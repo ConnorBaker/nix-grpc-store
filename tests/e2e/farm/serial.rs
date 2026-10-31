@@ -1097,6 +1097,101 @@ fn lost_input(tag: &str, nondet: bool) -> (String, String) {
     (inp, nar)
 }
 
+/// The same through nix's build hook (`--builders`), which hands the plugin
+/// one derivation at a time: the job's lost input is found among its input
+/// derivations and built on the farm, not uploaded again to a worker that
+/// counts it as held.
+#[test]
+fn lost_input_is_built_for_a_build_hook_s_job() {
+    farm_ready();
+    let dep = expr("DEP");
+    let eval = |tag: &str, attr: &str| {
+        succeed(
+            CLIENT,
+            &[
+                "nix", "eval", "--raw", "-f", &dep, attr, "--argstr", "tag", tag, "--arg", "features",
+                r#"["vip"]"#, "--arg", "jobFeatures", "[]",
+            ],
+        )
+        .trim()
+        .to_string()
+    };
+    // A tag whose input's derivation sorts before the job's: the run then
+    // holds the job behind its producer, and the hook's job is still the
+    // one whose result the plugin returns.
+    let base = |path: &str| path.rsplit('/').next().unwrap_or_default().to_string();
+    let tag = (0..32)
+        .map(|i| format!("losthook{i}"))
+        .find(|tag| {
+            let job = eval(tag, "job.drvPath");
+            let refs = succeed(CLIENT, &["nix-store", "--query", "--references", &job]);
+            refs.lines()
+                .filter(|r| r.ends_with(&format!("-local-input-{tag}.drv")))
+                .any(|r| base(r) < base(&job))
+        })
+        .expect("no tag whose input's derivation sorts first");
+    let tag = tag.as_str();
+    let (inp, nar) = lost_input(tag, false);
+    // The client has it, built again here: the hook does not upload it,
+    // since the farm counts it as held.
+    let again = succeed(
+        CLIENT,
+        &[
+            "nix-build",
+            "--no-out-link",
+            "--option",
+            "extra-system-features",
+            "vip",
+            &dep,
+            "-A",
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+            "--arg",
+            "features",
+            r#"["vip"]"#,
+        ],
+    );
+    assert_eq!(again.trim(), inp);
+    let hook = hook();
+    let mut cmd = vec![
+        "sh",
+        "-c",
+        r#"NIX_REMOTE=daemon exec "$@""#,
+        "sh",
+        "nix",
+        "build",
+        "-L",
+    ];
+    cmd.extend(hook.iter().map(String::as_str));
+    cmd.extend([
+        "--print-out-paths",
+        "--no-link",
+        "-f",
+        &dep,
+        "job",
+        "--argstr",
+        "tag",
+        tag,
+        "--arg",
+        "features",
+        r#"["vip"]"#,
+        "--arg",
+        "jobFeatures",
+        "[]",
+    ]);
+    let built = run_t(CLIENT, &cmd, 240);
+    assert_eq!(built.code, 0, "the build failed: {}", built.combined());
+    assert_eq!(built.stdout.trim(), eval(tag, "job.outPath"), "{}", built.combined());
+    assert!(
+        built.combined().contains(&format!("farm lacks '{inp}'")),
+        "{inp} was not built anew: {}",
+        built.combined()
+    );
+    assert_eq!(cache_status(&nar), "200");
+}
+
 #[test]
 fn lost_input_is_built_for_its_user_on_the_same_worker() {
     farm_ready();

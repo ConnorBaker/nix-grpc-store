@@ -346,6 +346,24 @@ struct GrpcStore::Run {
     }
   }
 
+  // The input derivation of `job` that outputs `path`, if any: from the
+  // planner (farmInputs), or, for a job it did not plan (a build hook's,
+  // buildOne), from the job's derivation.
+  [[nodiscard]] auto producerOf(const Job & job, const StorePath & path) const -> std::optional<StorePath> {
+    if (auto const found = job.farmInputs.find(path); found != job.farmInputs.end()) {
+      return found->second;
+    }
+    std::optional<StorePath> producer;
+    nixcompat::forInputDrvs(evalStore.readDerivation(job.drvPath), [&](const StorePath & input) -> void {
+      auto const outputs = evalStore.queryStaticPartialDerivationOutputMap(input);
+      if (std::ranges::any_of(outputs | std::views::values,
+                              [&](const std::optional<StorePath> & out) -> bool { return out == path; })) {
+        producer = input;
+      }
+    });
+    return producer;
+  }
+
   // A drv output becomes a job in this run, a source or .drv is uploaded again.
   auto recover(const Work & work, const StorePath & path) -> Attempt {
     auto const pathS = store.printStorePath(path);
@@ -360,15 +378,14 @@ struct GrpcStore::Run {
         return Bounced{};
       }
     }
-    auto const producer = work.job->farmInputs.find(path);
-    if (producer == work.job->farmInputs.end()) {
+    auto const producer = producerOf(*work.job, path);
+    if (!producer) {
       warn("%s: worker lacks '%s', uploading it again", work.job->drvPath.to_string(), pathS);
       store.uploadDrvClosure(evalStore, {work.job->drvPath}, store.routingFor(work.job->drv, work.where.addr, work.where.system));
       return Bounced{};
     }
-    warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS,
-         producer->second.to_string());
-    auto const drvPath = producer->second;
+    warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS, producer->to_string());
+    auto const & drvPath = *producer;
     auto const full = evalStore.readDerivation(drvPath);
     std::scoped_lock const lock(mutex);
     auto const name = std::string(drvPath.to_string());
@@ -711,7 +728,8 @@ auto GrpcStore::buildOne(const StorePath & drvPath, const BasicDerivation & drv,
   std::map<StorePath, Job> jobs;
   jobs.emplace(drvPath, Job{.drvPath = drvPath, .drv = drv, .mode = buildMode});
   runJobs(jobs, *evalStore);
-  auto & job = jobs.begin()->second;
+  // recover() may have added the producer of a lost input to `jobs`.
+  auto & job = jobs.at(drvPath);
   if (!job.result) {
     throw Error("'%s' was not built", printStorePath(drvPath));
   }
