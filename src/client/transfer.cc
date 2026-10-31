@@ -39,6 +39,21 @@
 
 namespace nix {
 
+namespace {
+
+// Store's own queryMissing, which walks the graph with this store's path
+// queries, given the evaluation store where this Nix takes one.
+auto walkMissing(Store & store, const std::vector<DerivedPath> & targets,
+                 [[maybe_unused]] Store * evalStore) -> MissingPaths {
+#if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE
+  return store.Store::queryMissing(targets, evalStore);
+#else
+  return store.Store::queryMissing(targets);
+#endif
+}
+
+} // namespace
+
 auto GrpcStore::queryValidPathsRouted(const StorePathSet & paths, SubstituteFlag maybeSubstitute,
                            const Metadata & headers) -> StorePathSet {
   remote::QueryValidPathsRequest request;
@@ -60,8 +75,19 @@ auto GrpcStore::queryValidPathsRouted(const StorePathSet & paths, SubstituteFlag
   return res;
 }
 
-auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets)
+#if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE
+auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets, Store * evalStore)
     -> MissingPaths {
+#else
+auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets) -> MissingPaths {
+  Store * const evalStore = nullptr; // this Nix passes none (NixOS/nix#16433)
+#endif
+  if (evalStore != nullptr && evalStore != this) {
+    // The remote daemon cannot read the caller's evaluation store. Walk the
+    // graph client-side, using native RPCs for build-store path queries.
+    return walkMissing(*this, targets, evalStore);
+  }
+
   remote::QueryMissingRequest request;
   for (const auto & target : targets) {
     request.add_targets(target.to_string(*this));
@@ -78,8 +104,7 @@ auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets)
   if (unimplemented) {
     // Deliberate: RemoteStore::queryMissing would tunnel, the generic
     // Store walk works with native path queries.
-    // NOLINTNEXTLINE(bugprone-parent-virtual-call)
-    return Store::queryMissing(targets);
+    return walkMissing(*this, targets, evalStore);
   }
   MissingPaths res;
   for (const auto & path : reply.will_build()) {
