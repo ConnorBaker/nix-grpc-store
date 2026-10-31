@@ -64,11 +64,20 @@ inline auto workerLeft(const grpc::Status & status) -> bool
     }
 }
 
-// The connection died under an open stream. Only callers that know what the
-// stream already delivered can retry this safely.
+// The connection died under an open stream. gRPC reports a reset under it, a
+// balancer's included, as "Stream removed", or ends the call UNKNOWN or
+// INTERNAL with "RST_STREAM" or "Socket closed". Only callers that know what
+// the stream already delivered can retry this safely.
 inline auto streamBroken(const grpc::Status & status) -> bool
 {
-    return status.error_message().contains("Stream removed");
+    auto const & msg = status.error_message();
+    switch (status.error_code()) {
+    case grpc::StatusCode::UNKNOWN:
+    case grpc::StatusCode::INTERNAL:
+        return msg.contains("Stream removed") || msg.contains("RST_STREAM") || msg.contains("Socket closed");
+    default:
+        return msg.contains("Stream removed");
+    }
 }
 
 // The call broke or its server left, as opposed to the server answering with

@@ -398,12 +398,13 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  # Also stops a real server under a stuck call.
   test('retry', executable('retry-test',
-    sources : ['tests/retry-test.cc'],
-    include_directories : [src_inc, include_directories('src/client')],
+    sources : ['tests/retry-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/client')],
     cpp_args : ['-UNDEBUG'],
-    dependencies : [grpc_dep],
-  ))
+    dependencies : common_deps,
+  ), timeout : 30)
 
   test('call', executable('call-test',
     sources : ['tests/call-test.cc', gen],
