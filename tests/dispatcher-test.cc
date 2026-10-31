@@ -238,10 +238,38 @@ void aSystemWithoutBuildersGetsEveryBuilder()
     assert(Dispatcher::membersFor({}, "riscv").empty());
 }
 
+// Load.max_jobs changes a builder's slots without a reconnect, as after
+// SIGHUP (Coordinator::reloadNixConfig); a Load without it, as older builders
+// send, leaves them. The builder starts with none: older builders say Hello
+// with max_jobs 0 while they drain.
+void loadRestoresSlotsAfterDrainingHello()
+{
+    Farm farm;
+    Session worker;
+    farm.hello(worker.conn, "w:1", 0);
+    farm.want("a.drv");
+
+    nix::remote::WorkerMsgs older;
+    older.add_msgs()->mutable_load()->set_draining(false);
+    farm.disp.workerMsgs(worker.conn, older);
+    assert(farm.sentTo.empty());
+    assert(farm.disp.membership()->at("x").front().draining);
+
+    nix::remote::WorkerMsgs load;
+    auto * recovered = load.add_msgs()->mutable_load();
+    recovered->set_draining(false);
+    recovered->set_max_jobs(2);
+    farm.disp.workerMsgs(worker.conn, load);
+    assert(farm.sentTo == std::vector<std::string>{"w:1"});
+    assert(!farm.disp.membership()->at("x").front().draining);
+    farm.disp.workerGone(worker.conn);
+}
+
 } // namespace
 
 auto main() -> int
 try {
+    loadRestoresSlotsAfterDrainingHello();
     aSystemWithoutBuildersGetsEveryBuilder();
     aClientThatCannotReachItsWorkerIsSentElsewhere();
     aWorkerThatRestedGetsItsDerivationBack();
