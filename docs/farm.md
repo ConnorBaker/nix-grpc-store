@@ -343,8 +343,36 @@ arriving, hands assignments no client has claimed yet back to the
 scheduler, and returns once the claimed ones have published. After
 `TimeoutStopSec` (1h) the rest is killed and the clients are sent to
 another worker. A second SIGTERM cancels right away. `nixos-rebuild
-switch` only signals the worker and the next connection starts the new
-generation.
+switch` reloads the unit, which drains the same way but returns at once.
+The new generation starts once the old process has exited: systemd
+starts no second process of the unit, and the old one holds the port.
+Until then the balancer sends new builds to the other builders.
+
+**Upgrade a single node.** A node that is its own scheduler's only
+builder (both roles, no `scheduler`, socket-activated) has no other
+builder to take new builds while it drains. There a reload, and so
+`nixos-rebuild switch`, starts the new generation at once instead: it
+takes over the socket and the scheduler, becomes the unit's main
+process, and the old process finishes the builds it runs beside it and
+then exits (`event=handed_over` and `event=predecessor_exited` in the
+journal). New builds go to the new generation from the moment the
+reload returns. The new one does not stop or idle out before the old
+one has exited, so its builds keep their process, and a stop drains
+both. Until then the node runs the builds of both, up to twice
+`max-jobs`; a reload while an older one still drains adds another
+generation. If the new generation crashes, systemd stops the unit and
+the old one's builds go with it: their clients build them again. If it
+cannot start, the reload fails and the old one serves on. If it hangs
+once it has the sockets, systemd's reload timeout does not end it: the
+old one serves on after 120 s, and if the hung one had started
+accepting, it keeps taking a share of new connections until it is
+killed. A reload can also report failure although the takeover went
+through, when systemd's timeout falls after the new generation last
+checked the reload and before systemd read MAINPID=; `event=handed_over`
+says which process serves. By hand, upgrade with `systemctl reload`:
+`stop` and `restart` still drain first and take no builds meanwhile. A
+daemon too old to hand over fails the reload and keeps running
+unchanged.
 
 **Upgrade the module or the chart.** Both pass the daemon
 `--niks3-cache-url` (from `niks3.cacheUrl`, the chart's `niks3.cacheURL`). A
