@@ -56,6 +56,13 @@ public:
         // Unset: the steady clock, and the dispatcher calls tick() itself
         // every second. Set: the caller owns time and calls tick().
         std::function<double()> nowMs;
+        // The longest a client may have a build kept once it leaves (Want.linger_s).
+        double maxLingerMs = 0;
+        // A client whose stream broke reconnects within its backoff and Wants
+        // its assigned drvs again: until then, without a lease, their builds
+        // keep running (sched::Config::departedGraceMs).
+        static constexpr double defaultDepartedGraceMs = 10'000;
+        double departedGraceMs = defaultDepartedGraceMs;
     };
 
     Dispatcher(Config config, Metrics & metrics);
@@ -157,14 +164,6 @@ private:
     // The live session of each worker. A stale one, replaced by a re-Hello, is not here.
     std::unordered_map<sched::WorkerId, Worker *> workers ABSL_GUARDED_BY(mutex);
     bool lettingGo ABSL_GUARDED_BY(mutex) = false;
-    // Assigned drvs whose last follower left. Revoked unless one is back in time.
-    struct Orphan
-    {
-        sched::DrvId drv;
-        uint64_t assignId;
-        double dueMs;
-    };
-    std::vector<Orphan> orphans ABSL_GUARDED_BY(mutex);
     std::optional<double> statsAtMs ABSL_GUARDED_BY(mutex);
     std::map<sched::Core::StatsKey, std::vector<prometheus::Gauge *>> statGauges ABSL_GUARDED_BY(mutex);
     std::atomic<sched::ClientId> nextClient{1};
@@ -210,8 +209,9 @@ private:
     // Per-system gauges. O(entries), so at most once a second unless forced.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOrphans();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void tickLocked();
+    // Revoke or forget the builds kept for a client whose linger or grace is over.
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void expireLingersLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void placeabilityChangedLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void sendToFollowers(sched::DrvId drv, const nix::remote::SchedMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto assignedMsg(sched::DrvId drv) const -> nix::remote::SchedMsg;
@@ -223,6 +223,8 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, bool cached);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);
+    // Ends a lease (Release) and answers Released.
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onRelease(Client & client, const nix::remote::Release & release);
 };
 
 } // namespace nixgrpc
