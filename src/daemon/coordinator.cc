@@ -2,6 +2,7 @@
 #include "dispatcher.hh"
 #include "idle.hh"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -34,6 +35,7 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/globals.hh>
+#include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 
 #include "acl.hh"
@@ -46,10 +48,12 @@
 #include "keepalive.hh"
 #include "logfmt.hh"
 #include "metrics.hh"
+#include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "options.hh"
 #include "sched-reactor.hh"
+#include "scheduler.hh"
 
 namespace nixgrpc {
 
@@ -62,6 +66,12 @@ using nix::remote::WorkerMsgs;
 
 namespace {
 constexpr int minReconnectBackoffMs = 2'000;
+
+// 0 (nix: no local builds) still takes one.
+auto nixMaxJobs() -> unsigned
+{
+    return std::clamp(nixcompat::configuredMaxBuildJobs(), 1U, static_cast<unsigned>(sched::FreeIndex::maxSlots));
+}
 } // namespace
 
 // ---------------------------------------------------------- SchedulerService
@@ -175,12 +185,16 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
     , metrics(metrics)
 {
     if (options.builder) {
-        Builder::Config self{.advertise = options.advertise, .systems = {nix::settings.thisSystem.get()}, .features = {}, .maxJobs = options.maxJobs};
+        Builder::Config self{
+            .advertise = options.advertise,
+            .systems = {nix::settings.thisSystem.get()},
+            .features = {},
+            .maxJobs = options.maxJobs != 0 ? options.maxJobs : nixMaxJobs()};
         self.systems.append_range(nix::settings.extraPlatforms.get());
         self.systems.append_range(options.extraSystems);
         self.features.append_range(nix::settings.systemFeatures.get());
         builder.emplace(std::move(self), metrics);
-        metrics.buildSlots(options.maxJobs);
+        metrics.buildSlots(builder->maxJobs());
     }
     if (options.scheduler) {
         Dispatcher::PresentFn present;
@@ -380,6 +394,28 @@ void Coordinator::tick()
     if (lastHealthy.exchange(healthy) != healthy) {
         logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", std::string(Builder::name(Builder::Unavailable::lowDisk))}});
         builder->setUnavailable(Builder::Unavailable::lowDisk, !healthy);
+    }
+}
+
+// Whoever rewrites nix's configuration signals us; a Tribuchet hub rewrites
+// max-jobs, in a file nix.conf includes, whenever a worker joins or leaves.
+void Coordinator::reloadNixConfig()
+{
+    if (!builder || options.maxJobs != 0) {
+        return;
+    }
+    unsigned jobs = 0;
+    try {
+        jobs = nixMaxJobs();
+    } catch (nix::Error & err) {
+        logLine(LogLevel::info, {{"event", "max_jobs_unreadable"}, {"error", err.msg()}});
+        return;
+    }
+    auto const was = builder->maxJobs();
+    logLine(LogLevel::info, {{"event", "max_jobs"}, {"from", std::to_string(was)}, {"to", std::to_string(jobs)}});
+    if (was != jobs) {
+        metrics.buildSlots(jobs);
+        builder->setMaxJobs(jobs);
     }
 }
 
