@@ -130,6 +130,22 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     phase = "upload";
   };
 
+  handover-upgrade = import ../tests/handover.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+    part = "upgrade";
+  };
+
+  handover-failures = import ../tests/handover.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+    part = "failures";
+  };
+
   helm = import ../tests/helm.nix {
     inherit pkgs;
     chart = ../deploy/helm/nix-grpc-farm;

@@ -11,6 +11,12 @@ let
   # A socket unit is not restarted when its listen address changes, and an
   # idle node would never register with the scheduler.
   socketActivated = cfg.idleTimeout != null;
+  # Its own scheduler's only builder: while it drains nobody takes new builds,
+  # and systemd starts no new process from the socket until the old one has
+  # exited. So a reload hands the socket to a new process instead, see
+  # src/daemon/takeover.hh.
+  handOver = socketActivated && builder && lib.elem "scheduler" cfg.roles && cfg.scheduler == null;
+  daemonArgs = import ./daemon-args.nix { inherit cfg lib pkgs; };
 in
 {
   imports = [ ./common.nix ];
@@ -49,7 +55,8 @@ in
       wants = [ "nix-daemon.socket" ];
       # Reload = drain: leave the balancer, finish and publish running
       # builds, then exit. The socket or Restart=always starts the new
-      # generation.
+      # generation. On a node that is its own only builder the new generation
+      # takes over at once instead, and the old one drains beside it.
       reloadIfChanged = builder;
       # /tmp is a size-limited tmpfs.
       environment.TMPDIR = "/var/cache/nix-grpc-daemon";
@@ -63,7 +70,7 @@ in
         User = "nix-grpc-daemon";
         Group = "nix-grpc-daemon";
         Restart = if socketActivated then "on-failure" else "always";
-        ExecStart = lib.escapeShellArgs (import ./daemon-args.nix { inherit cfg lib pkgs; });
+        ExecStart = lib.escapeShellArgs daemonArgs;
         # Builds run in nix-daemon. This only bounds the proxy.
         MemoryMax = lib.mkDefault "2G";
       }
@@ -73,7 +80,12 @@ in
         CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
       }
       // lib.optionalAttrs builder {
-        ExecReload = "${pkgs.coreutils}/bin/kill -TERM $MAINPID";
+        # The new generation forks: this exits once it is the main process.
+        ExecReload =
+          if handOver then
+            "${lib.escapeShellArgs daemonArgs} --take-over $MAINPID"
+          else
+            "${pkgs.coreutils}/bin/kill -TERM $MAINPID";
         # stop drains too, and niks3 push must live on to publish.
         KillMode = "mixed";
         TimeoutStopSec = lib.mkDefault "1h";
