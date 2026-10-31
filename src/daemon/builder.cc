@@ -24,6 +24,7 @@ using nix::remote::WorkerMsg;
 Builder::Builder(Config config, Metrics & metrics)
     : config(std::move(config))
     , metrics(metrics)
+    , maxJobs_(this->config.maxJobs)
 {
     for (auto const why : {Unavailable::stopping, Unavailable::lowDisk, Unavailable::localDaemonDown}) {
         metrics.unavailable(name(why), false);
@@ -196,7 +197,7 @@ auto Builder::hello() -> WorkerMsg
     for (const auto & feat : config.features) {
         hel->add_features(feat);
     }
-    hel->set_max_jobs(config.maxJobs);
+    hel->set_max_jobs(maxJobs_);
     auto lck = state.lock();
     lck->newestExpect = 0; // a new session, maybe of a new scheduler, counts anew
     // A slot nobody claimed is dropped, not reported: the scheduler would
@@ -217,12 +218,24 @@ auto Builder::greet() -> bool
         return false;
     }
     greeted_ = true;
-    if (draining()) {
-        WorkerMsg msg;
-        msg.mutable_load()->set_draining(true);
-        return send(msg);
+    return !draining() || send(load());
+}
+
+auto Builder::load() const -> WorkerMsg
+{
+    WorkerMsg msg;
+    msg.mutable_load()->set_draining(draining());
+    msg.mutable_load()->set_max_jobs(maxJobs_);
+    return msg;
+}
+
+void Builder::setMaxJobs(uint32_t maxJobs)
+{
+    std::scoped_lock const lock(unavailableMutex);
+    if (maxJobs_.exchange(maxJobs) == maxJobs || !greeted_) {
+        return;
     }
-    return true;
+    send(load());
 }
 
 void Builder::onAvailability(std::function<void(bool)> changed)
@@ -252,9 +265,7 @@ void Builder::setUnavailable(Unavailable why, bool holds)
     if (was == draining || !greeted_) {
         return;
     }
-    WorkerMsg msg;
-    msg.mutable_load()->set_draining(draining);
-    send(msg);
+    send(load());
     if (draining) {
         giveBack(take([](const Expected & ent) -> bool { return !ent.claimed; }), nix::remote::Done::DRAINING);
     }

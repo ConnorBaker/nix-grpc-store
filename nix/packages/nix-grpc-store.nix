@@ -83,6 +83,7 @@ stdenv.mkDerivation {
         ../../tests/scheduler-test.cc
         ../../tests/dispatcher-test.cc
         ../../tests/http-test.cc
+        ../../tests/max-jobs-test.cc
         ../../tests/dispatcher-bench.cc
         ../../tests/scheduler-grpc-bench.cc
       ]
