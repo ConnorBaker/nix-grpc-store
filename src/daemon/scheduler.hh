@@ -778,6 +778,10 @@ public:
         // Keyed by what the derivation requires.
         size_t queued = 0;      // wanted, not placed
         size_t unplaceable = 0; // of those, no connected worker could ever run it
+        // Assigned to a worker, so holding its slot, whether a client follows
+        // it or not: also one a worker's Hello re-announced to a restarted
+        // scheduler, which knows it from that alone, one whose clients left
+        // and that is kept or revoked, until its Done.
         size_t running = 0;
         // Keyed by what the worker offers (native system).
         size_t slots = 0; // maxJobs of up, non-draining workers
@@ -813,10 +817,16 @@ public:
         // placeable() is O(workers). Entries sharing system+features share the answer.
         std::map<StatsKey, bool> memo;
         for (const auto & slot : entries) {
-            if (!slot || slot->followers.empty()) {
+            if (!slot || (slot->followers.empty() && slot->worker == noWorker)) {
                 continue;
             }
-            const StatsKey key{.system = slot->system, .features = featureKey(slot->features)};
+            // A build known from a Hello alone has no system of its own yet:
+            // it counts under its worker's.
+            std::string_view system = slot->system;
+            if (system.empty() && slot->worker != noWorker && !workers.at(slot->worker).systems.empty()) {
+                system = workers.at(slot->worker).systems.front();
+            }
+            const StatsKey key{.system = std::string(system), .features = featureKey(slot->features)};
             auto & sst = out[key];
             if (slot->worker != noWorker) {
                 sst.running++;
