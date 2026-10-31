@@ -45,6 +45,7 @@ stdenv.mkDerivation {
         ../../src/keepalive.hh
         ../../src/macro-compat.hh
         ../../src/nix-compat.hh
+        ../../src/parse-int.hh
         ../../src/path-info-wire.hh
         ../../src/pump.hh
         ../../src/top-down.hh
