@@ -136,7 +136,7 @@ void aNodeWithoutKeysIsMissing()
 
 // Each node has the keys "-out" and "-man". Uses maps a node to the nodes it
 // builds on, with the keys it needs of each; held lists keys.
-using Uses = std::map<std::string, std::map<std::string, std::vector<std::string>>>;
+using Uses = std::map<std::string, std::vector<std::pair<std::string, std::vector<std::string>>>>;
 
 auto runBuild(const Uses & uses, const std::map<std::string, std::vector<std::string>> & roots, const Names & held,
               bool rebuildRoots) -> Result

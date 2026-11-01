@@ -153,7 +153,7 @@ template <class Node, class Key, class Uses, class Query, class Fetch> class Bui
     std::size_t budget;
     std::set<Node> rebuilt;
     // Dependency graph below the roots, and the number of users of each node.
-    std::map<Node, std::map<Node, std::vector<Key>>> used;
+    std::map<Node, decltype(std::declval<Uses &>()(std::declval<const Node &>()))> used;
     std::map<Node, std::size_t> users;
     // needs: keys required by requests and by nodes that get built.
     // anyNeeds: keys any user might require; queried ahead in batches.
