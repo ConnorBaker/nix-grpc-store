@@ -751,12 +751,10 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
 auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore)
     -> StorePathSet {
   std::map<StorePath, Derivation> drvs;
-  std::map<StorePath, std::map<std::string, std::optional<StorePath>>> outputs;
   std::function<void(const StorePath &)> collect = [&](const StorePath & drvPath) -> void {
     if (drvs.contains(drvPath)) {
       return;
     }
-    outputs.emplace(drvPath, evalStore.queryStaticPartialDerivationOutputMap(drvPath));
     auto const & full = drvs.emplace(drvPath, evalStore.readDerivation(drvPath)).first->second;
     nixcompat::forInputDrvs(full, collect);
   };
@@ -770,14 +768,23 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMod
       collect(built->drvPath->getBaseStorePath());
     }
   }
+  std::map<StorePath, std::map<std::string, std::optional<StorePath>>> outputs;
+  auto const outputPath = [&](const StorePath & drvPath, const std::string & name) -> std::optional<StorePath> {
+    auto found = outputs.find(drvPath);
+    if (found == outputs.end()) {
+      found = outputs.emplace(drvPath, evalStore.queryStaticPartialDerivationOutputMap(drvPath)).first;
+    }
+    auto const path = found->second.find(name);
+    return path == found->second.end() ? std::nullopt : path->second;
+  };
   return nixgrpc::missingForBuild(
       tops, buildMode != bmNormal,
       [&](const StorePath & drvPath) -> std::map<StorePath, std::vector<StorePath>> {
         std::map<StorePath, std::vector<StorePath>> used;
         nixcompat::forInputOutputs(drvs.at(drvPath), [&](const StorePath & input, const std::string & name) -> void {
           auto & paths = used[input];
-          if (auto const path = outputs.at(input).find(name); path != outputs.at(input).end() && path->second) {
-            paths.push_back(*path->second);
+          if (auto path = outputPath(input, name)) {
+            paths.push_back(std::move(*path));
           }
         });
         return used;
