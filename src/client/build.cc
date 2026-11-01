@@ -353,8 +353,12 @@ struct GrpcStore::Run {
     {
       std::scoped_lock const lock(mutex);
       if (!recovered.emplace(work.jid, path).second) {
-        return nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
-                                 fmt("input '%s' is missing on the farm", pathS));
+        // Missed again although recovered once: the farm may still be
+        // getting it (a worker whose nix-daemon cached a stale narinfo).
+        // Placed again like after any bounce, within reschedule-retries.
+        printError("%s: input '%s' is still missing on the farm, asking the scheduler again",
+                   work.job->drvPath.to_string(), pathS);
+        return Bounced{};
       }
     }
     auto const producer = work.job->farmInputs.find(path);
