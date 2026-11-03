@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use crate::fixtures::*;
+use crate::harness::{MACHINE, journal_matches};
 
 #[test]
 fn add_path_and_read_it_back_locally() {
@@ -32,6 +33,83 @@ fn build_whose_log_is_not_utf8() {
     ]);
     let built = succeed(&["cat", p.trim()]);
     assert!(built.contains("rawlog-over-grpc"), "{built}");
+}
+
+/// `nix log --store grpc://…` reads the log the server's nix-daemon kept,
+/// by derivation and by output. It asks that store first, then the
+/// substituters (none configured in the VM), never the local store.
+#[test]
+fn build_log_is_read_from_the_server() {
+    write_file(
+        "/tmp/logged.nix",
+        &drv_expr("logged-grpc", "echo line-from-the-build >&2; echo logged > $out"),
+    );
+    let out = succeed(&[
+        "nix",
+        "build",
+        "--store",
+        STORE,
+        "--impure",
+        "-f",
+        "/tmp/logged.nix",
+        "--no-link",
+        "--print-out-paths",
+    ]);
+    let drv = succeed(&["nix-instantiate", "/tmp/logged.nix"]);
+    for installable in [drv.trim(), out.trim()] {
+        let log = succeed(&["nix", "log", "--store", STORE, installable]);
+        assert!(log.contains("line-from-the-build"), "{installable}: {log}");
+    }
+    let name = drv.trim().rsplit('/').next().unwrap();
+    assert_journal("nix-grpc-daemon", &format!("method=GetBuildLog .* drv={name}"));
+
+    write_file("/tmp/unbuilt.nix", &drv_expr("unbuilt-grpc", "echo never > $out"));
+    let unbuilt = succeed(&["nix-instantiate", "/tmp/unbuilt.nix"]);
+    let err = fail(&["nix", "log", "--store", STORE, unbuilt.trim()]);
+    assert!(err.contains("is not available"), "{err}");
+}
+
+/// A log that compresses to more than one message arrives whole.
+#[test]
+fn long_build_log_streams_in_chunks() {
+    let drv = succeed(&["nix-instantiate", "/etc/biglog.nix"]);
+    let drv = drv.trim();
+    succeed(&[
+        "nix",
+        "build",
+        "--store",
+        STORE,
+        "--impure",
+        "-f",
+        "/etc/biglog.nix",
+        "--no-link",
+    ]);
+    // The VM's store is the server's: both read the file its nix-daemon wrote.
+    succeed(&[
+        "sh",
+        "-c",
+        r#"nix log --store "$1" "$2" > /tmp/biglog.grpc && nix log "$2" > /tmp/biglog.local && cmp /tmp/biglog.grpc /tmp/biglog.local"#,
+        "sh",
+        STORE,
+        drv,
+    ]);
+    let size: u64 = succeed(&["stat", "-c", "%s", "/tmp/biglog.grpc"])
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(size > 4_000_000, "{size}");
+    let name = drv.rsplit('/').next().unwrap();
+    let lines = journal_matches(
+        MACHINE,
+        "nix-grpc-daemon",
+        &format!("method=GetBuildLog .* drv={name}"),
+    );
+    println!("[log] {lines:?}");
+    let chunks: Vec<u64> = lines
+        .iter()
+        .filter_map(|l| l.split(" chunks=").nth(1)?.split_whitespace().next()?.parse().ok())
+        .collect();
+    assert!(!chunks.is_empty() && chunks.iter().all(|&c| c > 1), "{lines:?}");
 }
 
 #[test]

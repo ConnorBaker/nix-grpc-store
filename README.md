@@ -207,7 +207,11 @@ is given.
         --allow '*=write' \
         --allow-anonymous read-only    # optional: cert-less clients
 
-  * `read-only` — path queries and NAR downloads (`nix copy --from`)
+  * `read-only` — path queries, NAR downloads (`nix copy --from`) and
+    build logs (`nix log --store`), failed builds' too: every caller
+    with at least this role, anonymous ones under `--allow-anonymous
+    read-only` included, can read every log the daemon's store keeps
+    (callers with no role are denied)
   * `write` — additionally imports (signature checking is enforced
     regardless of `--no-check-sigs`) and server-side builds
     (`nix build --store 'grpc://…'`)
@@ -243,6 +247,7 @@ Role needed per use case:
 | Use case                                         | Role        |
 | ------------------------------------------------ | ----------- |
 | Substituter, `nix copy --from`                   | `read-only` |
+| `nix log --store 'grpc://…'`                     | `read-only` |
 | `nix copy --to` (signed paths)                   | `write`     |
 | `nix build --store 'grpc://…' --eval-store auto` | `write`     |
 | Remote builder (`nix.buildMachines`)             | `trusted`   |
@@ -332,6 +337,13 @@ TLS uses the system CA bundle and the client key pair from
 With access control enabled, remote builders need the `trusted` role.
 The builder protocol imports unsigned outputs built on the client,
 which also requires `trustClients` (see above).
+
+The client's own `nix log` of a remote build holds what reached it: a
+client stopped before the relayed log arrived keeps less, and a later
+attempt whose outputs the builder already had replaces it with the
+builder's `building` line alone. The builder's nix-daemon keeps the whole
+log, which `nix log --store 'grpc://builder:50051' DRV` reads. In a farm,
+name the node that ran the build: another node has no log of it.
 
 A client that gives up after a while and is followed by another for the
 same build, a chain of time-bounded `nix build`s, can ask the scheduler

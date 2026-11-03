@@ -51,6 +51,7 @@
 #include <nix/store/derivations.hh>
 #include <nix/store/derived-path.hh>
 #include <nix/store/globals.hh>
+#include <nix/store/log-store.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
@@ -103,6 +104,7 @@ using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chu
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
 using NarFrameWriter = grpc::ServerWriter<nix::remote::NarFrame>;
 using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
+using BuildLogWriter = grpc::ServerWriter<nix::remote::GetBuildLogChunk>;
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
 volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
@@ -139,6 +141,9 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     std::mutex storeMutex;
     std::shared_ptr<nix::Store> store;
     nixgrpc::UploadClaims uploads;
+    // One GetBuildLog at a time: each holds its log decompressed, which
+    // can be most of the 2G the NixOS module allows the daemon.
+    std::mutex buildLogTurn;
     nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return openScopedStore(); }};
 
     // Without the path info cache a path deleted behind our back (gc) is
@@ -621,6 +626,66 @@ public:
             auto const rpc = begin(*context, "StoreInfo", nixgrpc::Role::readOnly);
             // build-remote sends BuildDerivation and unsigned inputs only to stores that trust it.
             reply->set_trusted(rpc.caller.role == nixgrpc::Role::trusted);
+            return grpc::Status::OK;
+        });
+    }
+
+    // The log of the derivation's build, kept by the nix-daemon that ran it
+    // here. A client's own copy can lack it: one that left before the relayed
+    // log reached it, or a later attempt answered as already valid. Nix
+    // hands the log over whole, so the call holds one decompressed copy of
+    // it; the stream holds at most a chunk of its compressed form. A call
+    // that finds another sending is refused, UNAVAILABLE, which the client
+    // retries: waiting would hold a server thread per caller.
+    auto GetBuildLog(
+        grpc::ServerContext * context,
+        const nix::remote::GetBuildLogRequest * request,
+        BuildLogWriter * writer) -> grpc::Status override
+    {
+        return guarded([&] -> grpc::Status {
+            auto const rpc = begin(*context, "GetBuildLog", nixgrpc::Role::readOnly);
+            nixgrpc::Metrics::Held const held(metrics, "GetBuildLog"); // the drain waits for it
+            auto const localStore = getStore();
+            nix::StorePath const drvPath(request->drv_path());
+            std::unique_lock const turn(buildLogTurn, std::try_to_lock);
+            if (!turn.owns_lock()) {
+                return {grpc::StatusCode::UNAVAILABLE, "another build log is being sent, retry"};
+            }
+            auto * const logs = dynamic_cast<nix::LogStore *>(&*localStore);
+            if (logs == nullptr) {
+                return {grpc::StatusCode::UNIMPLEMENTED, "the store behind this daemon keeps no build logs"};
+            }
+            std::optional<std::string> log;
+            try {
+                log = logs->getBuildLogExact(drvPath);
+            } catch (nix::Unsupported & err) {
+                // A LogStore that keeps none, e.g. --proxy-store ssh-ng://.
+                return {grpc::StatusCode::UNIMPLEMENTED, err.what()};
+            }
+            if (!log) {
+                return {grpc::StatusCode::NOT_FOUND, "no build log of " + std::string(drvPath.to_string())};
+            }
+
+            struct CountingWriter
+            {
+                BuildLogWriter * writer = nullptr;
+                uint64_t chunks = 0;
+
+                auto Write(const nix::remote::GetBuildLogChunk & chunk) -> bool
+                {
+                    ++chunks;
+                    return writer->Write(chunk);
+                }
+            };
+
+            CountingWriter counted{.writer = writer};
+            nixgrpc::ZstdWriterSink<CountingWriter, nix::remote::GetBuildLogChunk> sink(counted);
+            sink(*log);
+            sink.finish();
+            rpc.done(
+                {{"drv", std::string(drvPath.to_string())},
+                 {"log_bytes", std::to_string(log->size())},
+                 {"chunks", std::to_string(counted.chunks)}});
             return grpc::Status::OK;
         });
     }
@@ -1156,7 +1221,7 @@ auto drained(nixgrpc::Coordinator & coord, nixgrpc::Metrics & metrics) -> bool
 {
     return (!coord.builder || coord.builder->holding() == 0)
            && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars")
-                      + metrics.inflightNow("AddMultipleToStore")
+                      + metrics.inflightNow("AddMultipleToStore") + metrics.inflightNow("GetBuildLog")
                   == 0;
 }
 

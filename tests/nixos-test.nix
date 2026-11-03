@@ -126,6 +126,17 @@ pkgs.testers.runNixOSTest {
         }
       '';
 
+      # A build log that compresses to several GetBuildLog messages.
+      environment.etc."biglog.nix".text = ''
+        derivation {
+          name = "biglog-grpc";
+          system = builtins.currentSystem;
+          builder = "/bin/sh";
+          args = [ "-c" "head -c 3000000 /dev/urandom | base64 >&2; echo biglog > $out" ];
+          PATH = builtins.storePath "${pkgs.coreutils}" + "/bin";
+        }
+      '';
+
       # Bench corpora as input-addressed outputs: CA paths from `nix store
       # add` are re-hashed on import (RewritingSink), skewing the benchmark.
       environment.etc."blob.nix".text = ''
