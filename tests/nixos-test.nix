@@ -9,7 +9,7 @@
   module,
   mockOidc,
   e2eTests,
-  # "main" or "upload"
+  # "main", "upload" or "floating"
   phase ? "main",
 }:
 
@@ -260,5 +260,8 @@ pkgs.testers.runNixOSTest {
   '' + pkgs.lib.optionalString (phase == "upload") ''
     with subtest("concurrent uploads of one input"):
         run_e2e({"machine": machine}, env, "upload::", "--test-threads=1")
+  '' + pkgs.lib.optionalString (phase == "floating") ''
+    with subtest("floating content-addressed builds without a cache"):
+        run_e2e({"machine": machine}, env, "floating::", "--test-threads=1")
   '';
 }

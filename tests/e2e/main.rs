@@ -4,6 +4,7 @@ mod acme;
 mod bench;
 mod farm;
 mod fixtures;
+mod floating;
 mod handover;
 mod harness;
 mod latency;
