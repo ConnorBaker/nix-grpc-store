@@ -604,6 +604,17 @@ fn has_vip_build_info(line: &str) -> bool {
 #[test]
 fn required_system_features_are_placed_or_refused() {
     farm_ready();
+    // In nix's default configuration, without the experimental features
+    // that add to them, a builder offers and shows its `system-features`.
+    let mut offered = Vec::new();
+    for w in WORKERS {
+        let set = succeed(w, &["nix", "config", "show", "system-features"]);
+        let set = set.split_whitespace().collect::<Vec<_>>().join(",");
+        assert_eq!(features_label(&build_info(w)), Some(set.as_str()));
+        offered.extend(set.split(',').map(String::from));
+    }
+    offered.sort();
+    offered.dedup();
     let job = expr("JOB");
     let vip = format!(
         r#"map (tag: import {job} {{ inherit tag; features = ["vip"]; }}) ["f1" "f2" "f3"]"#
@@ -673,7 +684,8 @@ fn required_system_features_are_placed_or_refused() {
         unit_result(CLIENT, "gpu") == "exit-code"
     });
     let out = query(CLIENT, &["journalctl", "-u", "gpu", "-o", "cat"]);
-    assert!(out.contains("features {gpu}"), "{out}");
+    let why = format!("features {{gpu}}, the workers offer {{{}}}", offered.join(","));
+    assert!(out.contains(&why), "{out}");
     retry(30, "no unplaceable build", || {
         gauge(leader(), &unplaceable) == 0
     });
