@@ -87,6 +87,20 @@ pub fn worker_metrics(w: Node) -> Vec<String> {
     crate::harness::metrics(w, 9464)
 }
 
+/// `w`'s nix_grpc_build_info line.
+pub fn build_info(w: Node) -> String {
+    worker_metrics(w)
+        .into_iter()
+        .find(|l| l.starts_with("nix_grpc_build_info{"))
+        .unwrap_or_else(|| panic!("no nix_grpc_build_info on {}", w.0))
+}
+
+/// The `features` label of a metrics line.
+pub fn features_label(line: &str) -> Option<&str> {
+    let (_, rest) = line.split_once(r#"features=""#)?;
+    rest.split('"').next()
+}
+
 fn value(line: &str) -> i64 {
     line.split_whitespace()
         .last()

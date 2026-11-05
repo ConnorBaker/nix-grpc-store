@@ -174,3 +174,15 @@ fn a_second_client_attaches_to_a_floating_build() {
         );
     }
 }
+
+/// nix_grpc_build_info shows the features a builder offers, ca-derivations
+/// among them here.
+#[test]
+fn build_info_shows_the_features_a_builder_offers() {
+    farm_ready();
+    for w in WORKERS {
+        let info = build_info(w);
+        let ca = features_label(&info).is_some_and(|f| f.split(',').any(|f| f == "ca-derivations"));
+        assert!(ca, "{info}");
+    }
+}
