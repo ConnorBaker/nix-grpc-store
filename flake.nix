@@ -116,6 +116,8 @@
             docker-lb-multiarch
             docker-client-multiarch
             ;
+          # The daemon the images carry, against nixpkgs' Nix.
+          image-daemon = scope.imagePackage;
           # Benchmarks, intentionally not in `checks` so CI skips them.
           bench-closure = nixpkgs.legacyPackages.${system}.callPackage ./tests/bench-closure.nix { };
           bench-latency = import ./tests/latency-test.nix {
