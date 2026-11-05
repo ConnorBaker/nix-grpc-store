@@ -206,6 +206,16 @@ auto isSandboxed(const D & drv) -> bool
     }
 }
 
+template<typename D>
+auto isImpure(const D & drv) -> bool
+{
+    if constexpr (requires { drv.type(); }) {
+        return drv.type().isImpure();
+    } else {
+        return type(drv).isImpure();
+    }
+}
+
 // BuildResult: flat struct with `status` before 2.32, variant of
 // Success/Failure(BuildError) since.
 // Non-const because BuildResult::success() is non-const before Nix 2.32.
