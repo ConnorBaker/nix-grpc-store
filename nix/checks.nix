@@ -206,6 +206,9 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   in
   {
     inherit k3s;
+    # The daemon the images carry, built against nixpkgs' Nix, without
+    # building the images or booting k3s.
+    image-daemon = packages.image-daemon;
     lease = lease "chain";
     lease-queue = lease "queue";
   }
