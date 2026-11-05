@@ -210,6 +210,11 @@ pub fn run_t(node: Node, argv: &[&str], secs: u64) -> Out {
     run(node, argv, secs, false)
 }
 
+/// An argv of `String`s as one of `&str`s.
+pub fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
 fn expect_ok(node: Node, argv: &[&str], repeatable: bool) -> String {
     let cmd = shell_join(argv);
     let o = run(node, argv, 300, repeatable);
