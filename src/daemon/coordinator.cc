@@ -36,6 +36,7 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/globals.hh>
+#include <nix/store/store-api.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 
@@ -230,7 +231,9 @@ auto Builder::hello() const -> WorkerMsg
     for (const auto & extra : nix::settings.extraPlatforms.get()) {
         hel->add_systems(extra);
     }
-    for (const auto & feat : nix::settings.systemFeatures.get()) {
+    // As nix-daemon builds: system-features plus those its experimental
+    // features imply, such as ca-derivations.
+    for (const auto & feat : nix::StoreConfig::getDefaultSystemFeatures()) {
         hel->add_features(feat);
     }
     hel->set_max_jobs(maxJobs_.load());

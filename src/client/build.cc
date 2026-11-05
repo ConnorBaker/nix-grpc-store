@@ -292,6 +292,12 @@ struct GrpcStore::Run {
     for (const auto & feat : nixcompat::requiredSystemFeatures(store, job.drv)) {
       want->add_required_features(feat);
     }
+    // nix asks ca-derivations of an impure derivation too, which builders
+    // offer for floating content-addressed ones but turn impure ones down.
+    // Asking for a feature none offers keeps it unplaceable.
+    if (nixcompat::isImpure(job.drv)) {
+      want->add_required_features("impure-derivations");
+    }
     want->set_cp_hint_ms(job.cpHintMs);
     want->set_build_mode(static_cast<uint32_t>(job.mode));
     want->set_system(job.drv.platform);

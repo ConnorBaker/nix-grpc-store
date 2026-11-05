@@ -179,7 +179,18 @@ services.nix-grpc-daemon = {
 Repeat for every node. Builders for different systems use the same
 config. `nix.settings.system-features` decides which
 `requiredSystemFeatures` a builder accepts: a derivation that needs
-`kvm` only goes to builders that list it. A builder with
+`kvm` only goes to builders that list it. As for nix-daemon, its
+enabled experimental features add to them: `ca-derivations` adds
+`ca-derivations`, `recursive-nix` adds `recursive-nix`, and
+`dynamic-derivations` adds `builder-rpc-v0` (with Nix master; 2.35
+and earlier add only the first two), so a build that requires
+one of these goes to builders that enable it. Impure derivations
+require `ca-derivations` too, but builders turn them down, so they
+stay unplaceable: keep `impure-derivations` out of `system-features`,
+or the scheduler hands them to a builder that turns them down.
+nix-grpc-daemon goes by the Nix it is built with, so
+run nix-daemon from the same Nix: an older one may not know
+`builder-rpc-v0`. A builder with
 `nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
 too. Add each of them to the balancer's `systems`. A
 scheduler-only node is the same with `roles = [ "scheduler" ]` and no
@@ -403,11 +414,19 @@ connected.
 **Autoscale builders.** `nix_grpc_sched_system` has one series per
 system and feature set. `queued`, `unplaceable` and `running` are
 labelled with what the derivations require (`features=""` for none,
-otherwise sorted and comma-joined like `features="big-parallel,kvm"`).
+otherwise sorted and comma-joined like `features="big-parallel,kvm"`),
+where an impure derivation counts as requiring `impure-derivations`
+too, which no builder offers (Step 1).
 `slots` and `free` are labelled with what the builders offer, under
 their native system. So a plain x86_64 group scales on
 `{system="x86_64-linux",features=""}` and a kvm group on
-`{system="x86_64-linux",features="kvm"}` independently. `unplaceable`
+`{system="x86_64-linux",features="kvm"}` independently. What a builder
+offers includes the features its experimental features add (Step 1),
+in these labels and in `nix_grpc_build_info`'s `features`: a kvm group
+with `ca-derivations` enabled is `{features="ca-derivations,kvm"}`.
+Builders that enabled one of these experimental features before
+nix-grpc-store offered them change their label when they update, and
+queries that name the old one no longer match. `unplaceable`
 counts queued builds that no connected builder could take at all, so a
 group does not grow for builds it cannot run. The number to scale a
 group on is therefore `queued - unplaceable` for its label set.
