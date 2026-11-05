@@ -176,5 +176,6 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   farm-scheduling = farm "scheduling";
   farm-restarts = farm "restarts";
   farm-cutoffs = farm "cutoffs";
+  farm-ca = farm "ca";
 }
 // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") { inherit k3s; }
