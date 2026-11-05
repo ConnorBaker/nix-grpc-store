@@ -34,6 +34,7 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/globals.hh>
+#include <nix/store/store-api.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 
@@ -188,7 +189,9 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
             .maxJobs = options.maxJobs != 0 ? options.maxJobs : nixMaxJobs()};
         self.systems.append_range(nix::settings.extraPlatforms.get());
         self.systems.append_range(options.extraSystems);
-        self.features.append_range(nix::settings.systemFeatures.get());
+        // As nix-daemon builds: system-features plus those its experimental
+        // features imply, such as ca-derivations.
+        self.features.append_range(nix::StoreConfig::getDefaultSystemFeatures());
         builder.emplace(std::move(self), metrics);
         metrics.buildSlots(builder->maxJobs());
     }
