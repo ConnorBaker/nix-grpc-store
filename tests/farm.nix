@@ -77,7 +77,15 @@ let
     virtualisation.memorySize = 1536;
     security.pki.certificateFiles = [ "${certs}/public-ca.pem" ];
     nix.package = nixPkgs.nix-everything;
-    nix.settings.experimental-features = [ "nix-command" ];
+    # The other parts keep nix's default configuration, so their builders
+    # offer their system-features alone.
+    nix.settings.experimental-features = [
+      "nix-command"
+    ]
+    ++ lib.optionals (part == "ca") [
+      "ca-derivations"
+      "dynamic-derivations"
+    ];
   };
 
   worker =
@@ -201,6 +209,44 @@ let
       args = [ "-c" "/bin/sh -c 'read -t 90 x < /dev/zero'; echo ''${tag} > $out" ];
     }
   '';
+  # Floating content-addressed derivations: `a`, `b` on `a`, and `slow` (as
+  # in slow.nix), and `dynamic`, which reads the output of `inner`, the
+  # derivation that the text-hashed `producer` outputs, byte for byte.
+  caExpr = pkgs.writeText "ca.nix" ''
+    { tag }:
+    let
+      ca = name: script: derivation {
+        inherit name;
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" script ];
+        __contentAddressed = true;
+        outputHashMode = "recursive";
+        outputHashAlgo = "sha256";
+      };
+    in
+    rec {
+      a = ca "ca-a-''${tag}" "echo a-''${tag} > $out";
+      b = ca "ca-b-''${tag}" "read x < ''${a}; echo b-$x > $out";
+      slow = ca "ca-slow-''${tag}" "/bin/sh -c 'read -t 90 x < /dev/zero'; echo slow-''${tag} > $out";
+      inner = ca "ca-inner-''${tag}" "echo inner-''${tag} > $out";
+      producer = derivation {
+        name = "ca-inner-''${tag}.drv";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "read -r d < ''${builtins.unsafeDiscardOutputDependency inner.drvPath}; printf %s \"$d\" > $out" ];
+        __contentAddressed = true;
+        outputHashMode = "text";
+        outputHashAlgo = "sha256";
+      };
+      dynamic = derivation {
+        name = "ca-dynamic-''${tag}";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "read x < ''${builtins.outputOf producer.outPath "out"}; echo dynamic-$x > $out" ];
+      };
+    }
+  '';
 
   # Subtests per part, each an e2e module run with that many test threads.
   parts = {
@@ -227,6 +273,13 @@ let
       {
         title = "calls, streams and uploads cut off";
         module = "cutoffs";
+        threads = 1;
+      }
+    ];
+    ca = [
+      {
+        title = "floating content-addressed and dynamic derivations";
+        module = "ca";
         threads = 1;
       }
     ];
@@ -359,6 +412,7 @@ pkgs.testers.runNixOSTest {
         "NGS_DEP_EXPR": "${depExpr}",
         "NGS_FAIL_EXPR": "${failExpr}",
         "NGS_SLOW_EXPR": "${slowExpr}",
+        "NGS_CA_EXPR": "${caExpr}",
     }
     nodes = {"client": client, "lb": lb, "worker1": worker1, "worker2": worker2}
 
