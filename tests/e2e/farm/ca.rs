@@ -7,10 +7,11 @@ use crate::harness::*;
 
 /// `nix build` of CA's `attr` for `tag` through the build hook, as argv
 /// after `prefix`. The builder offers `ca-derivations`, which nix requires
-/// of a floating content-addressed derivation.
+/// of a floating content-addressed derivation; an unplaceable build fails
+/// at once.
 fn ca_build(prefix: &[&str], tag: &str, attr: &str) -> Vec<String> {
     let sys = system();
-    let builders = format!("{}&system={sys} {sys} - 4 1 ca-derivations", envoy());
+    let builders = format!("{}&system={sys}&restart-grace=5 {sys} - 4 1 ca-derivations", envoy());
     let ca = expr("CA");
     let build = [
         "nix", "build", "-L", "--print-out-paths", "--no-link", "--max-jobs", "0", "--builders", &builders, "-f",
@@ -185,4 +186,26 @@ fn build_info_shows_the_features_a_builder_offers() {
         let ca = features_label(&info).is_some_and(|f| f.split(',').any(|f| f == "ca-derivations"));
         assert!(ca, "{info}");
     }
+}
+
+/// nix requires ca-derivations of an impure derivation too, which these
+/// builders offer for floating ones. They turn impure ones down, so it
+/// finds no builder.
+#[test]
+fn an_impure_derivation_finds_no_builder() {
+    farm_ready();
+    let o = run_t(CLIENT, &strs(&ca_build(&["env", "NIX_REMOTE=daemon"], "impure", "impure")), 300);
+    let out = o.combined();
+    assert_ne!(o.code, 0, "{out}");
+    assert!(out.contains("offers features {ca-derivations,impure-derivations}"), "{out}");
+}
+
+/// A build that requires recursive-nix, which these builders offer for
+/// their recursive-nix experimental feature, is placed on one and built.
+/// Placement only: the job does not call nix.
+#[test]
+fn a_build_that_requires_recursive_nix_is_placed() {
+    farm_ready();
+    let top = build(&envoy(), "recursive", &["--arg", "features", r#"["recursive-nix"]"#]);
+    assert!(!holders(&top).is_empty(), "{top}");
 }

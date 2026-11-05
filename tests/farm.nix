@@ -85,6 +85,8 @@ let
     ++ lib.optionals (part == "ca") [
       "ca-derivations"
       "dynamic-derivations"
+      "impure-derivations"
+      "recursive-nix"
     ];
   };
 
@@ -244,6 +246,13 @@ let
         system = builtins.currentSystem;
         builder = "/bin/sh";
         args = [ "-c" "read x < ''${builtins.outputOf producer.outPath "out"}; echo dynamic-$x > $out" ];
+      };
+      impure = derivation {
+        name = "ca-impure-''${tag}";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "echo impure-''${tag} > $out" ];
+        __impure = true;
       };
     }
   '';
