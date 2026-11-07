@@ -264,6 +264,9 @@ auto Builder::hello() const -> WorkerMsg
     for (const auto & extra : nix::settings.extraPlatforms.get()) {
         hel->add_systems(extra);
     }
+    for (const auto & extra : options.extraSystems) {
+        hel->add_systems(extra);
+    }
     // As nix-daemon builds: system-features plus those its experimental
     // features imply, such as ca-derivations.
     for (const auto & feat : nix::StoreConfig::getDefaultSystemFeatures()) {

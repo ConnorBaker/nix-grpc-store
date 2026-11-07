@@ -190,7 +190,9 @@ nix-grpc-daemon goes by the Nix it is built with, so
 run nix-daemon from the same Nix: an older one may not know
 `builder-rpc-v0`. A builder with
 `nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
-too. Add each of them to the balancer's `systems`. A
+too, and so do the systems in `extraSystems` (e.g. ones the
+nix-daemon hands to `external-builders`). Add each of them to the
+balancer's `systems`. A
 scheduler-only node is the same with `roles = [ "scheduler" ]` and no
 `scheduler` or `maxJobs`.
 

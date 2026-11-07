@@ -60,6 +60,10 @@
   "--role"
   (lib.concatStringsSep "," cfg.roles)
 ]
+++ lib.concatMap (s: [
+  "--extra-system"
+  s
+]) cfg.extraSystems
 ++ lib.optionals (cfg.maxJobs != null) [
   "--max-jobs"
   (toString cfg.maxJobs)

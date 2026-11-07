@@ -314,6 +314,7 @@ pkgs.testers.runNixOSTest {
       imports = [ (worker "worker2") ];
       # Pins a build to worker2, like vip does for worker1.
       nix.settings.system-features = [ "w2" ];
+      services.nix-grpc-daemon.extraSystems = [ "riscv64-linux" ];
       services.nix-grpc-daemon.schedulerTokenFile = "/run/scheduler-token";
       systemd.services.scheduler-token = {
         requiredBy = [ "nix-grpc-daemon.service" ];
@@ -423,6 +424,15 @@ pkgs.testers.runNixOSTest {
         "NGS_CA_EXPR": "${caExpr}",
     }
     nodes = {"client": client, "lb": lb, "worker1": worker1, "worker2": worker2}
+
+    with subtest("extraSystems are advertised"):
+        # Either worker may hold the scheduler role.
+        def advertised(last_try: bool) -> bool:
+            return any(
+                w.execute("journalctl -u nix-grpc-daemon -o cat | grep worker_hello | grep '${ip.worker2}' | grep -q riscv64-linux")[0] == 0
+                for w in [worker1, worker2]
+            )
+        retry(advertised, timeout_seconds=60)
 
     ${lib.concatMapStringsSep "\n" (s: ''
       with subtest("${s.title}"):

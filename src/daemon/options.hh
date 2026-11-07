@@ -44,6 +44,9 @@ struct Options
     std::string schedulerTokenFile; // bearer towards a remote scheduler, optional
     // How the balancer reaches this worker. Goes into Assigned.worker_addr.
     std::string advertise;
+    // Systems the local nix-daemon builds without them being in extra-platforms,
+    // e.g. through external-builders.
+    std::vector<std::string> extraSystems;
     unsigned maxJobs = 0; // 0 = nix's max-jobs, read at start and on SIGHUP (Builder::reloadNixConfig)
     // The longest a departed client's lease may keep a build, and its slot,
     // for it (Want.linger_s). 600 s because most revoked builds that were
