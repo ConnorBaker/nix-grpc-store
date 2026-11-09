@@ -1188,3 +1188,156 @@ fn a_drv_whose_log_its_worker_cannot_create_is_built_by_the_other() {
     let unit = Worker2Full::new("nolog", NoLogDir::new).build(&drv);
     assert_built_by_worker1(&unit, &drv);
 }
+
+/// Worker2's store takes no new files: they fail with ENOSPC while it has
+/// bytes to spare.
+struct NoInodes {
+    inodes: String,
+}
+
+impl NoInodes {
+    fn new() -> Self {
+        let df = succeed(WORKER2, &["df", "--output=itotal,iused", "/nix/.rw-store"]);
+        let mut cols = df.lines().last().unwrap().split_whitespace().map(String::from);
+        let (inodes, used) = (cols.next().unwrap(), cols.next().unwrap());
+        let opts = format!("remount,nr_inodes={used}");
+        succeed(WORKER2, &["mount", "-o", &opts, "/nix/.rw-store"]);
+        fail(WORKER2, &["touch", "/nix/.rw-store/probe"]);
+        NoInodes { inodes }
+    }
+}
+
+impl Drop for NoInodes {
+    fn drop(&mut self) {
+        let opts = format!("remount,nr_inodes={}", self.inodes);
+        succeed(WORKER2, &["mount", "-o", &opts, "/nix/.rw-store"]);
+    }
+}
+
+/// A client-local file, in the client's store.
+fn random_source(name: &str) -> String {
+    let cmd = format!("head -c 65536 /dev/urandom | base64 > /tmp/{name} && nix store add-file /tmp/{name}");
+    succeed(CLIENT, &["sh", "-c", &cmd]).trim().to_string()
+}
+
+/// The client's upload of a drv's closure lands on whichever worker the
+/// balancer picks, and the drv on worker2, which has no disk to fetch it.
+#[test]
+fn a_drv_whose_closure_its_worker_has_no_disk_for_is_built_by_the_other() {
+    farm_ready();
+    let src = random_source("noroom");
+    let drv = instantiate("job", "noroom", &["--argstr", "inputPath", &src]);
+    let unit = Worker2Full::new("noroom", NoInodes::new).build(&drv);
+    assert_built_by_worker1(&unit, &drv);
+}
+
+/// An input in the cache that worker2 has no disk to fetch does not count as
+/// lost: the drv moves to worker1 and nothing is rebuilt.
+#[test]
+fn an_input_its_worker_has_no_disk_for_is_not_rebuilt() {
+    farm_ready();
+    // vip builds the input on worker1, the job may run anywhere.
+    let vip = ["--arg", "features", r#"["vip"]"#, "--arg", "jobFeatures", "[]"];
+    let input = instantiate("input", "noroomin", &vip);
+    spawn("noroomin-input", &[format!("{input}^*").as_str()]);
+    wait_unit_done("noroomin-input", 120);
+    assert_unit_success("noroomin-input");
+    let drv = instantiate("job", "noroomin", &vip);
+    succeed(CLIENT, &["nix", "copy", "--to", &direct(WORKER2), &drv]);
+    let unit = Worker2Full::new("noroomin", NoInodes::new).build(&drv);
+    assert_built_by_worker1(&unit, &drv);
+    let log = journal(CLIENT, &unit);
+    assert!(!log.contains("farm lacks"), "{log}");
+}
+
+/// `w` with `left` bytes free, until dropped.
+struct LowDisk(Node);
+
+impl LowDisk {
+    fn leaving(w: Node, left: u64) -> Self {
+        let avail = succeed(w, &["df", "--output=avail", "-B1", "/nix/store"]);
+        let avail: u64 = avail.lines().last().unwrap().trim().parse().unwrap();
+        let size = (avail - left).to_string();
+        succeed(w, &["fallocate", "-l", &size, "/nix/.rw-store/fill"]);
+        LowDisk(w)
+    }
+}
+
+impl Drop for LowDisk {
+    fn drop(&mut self) {
+        succeed(self.0, &["rm", "/nix/.rw-store/fill"]);
+        wait_members(&system(), &WORKERS);
+    }
+}
+
+/// A full worker answers an upload or a fetch that needs a path only the
+/// cache has as unavailable, which the client retries, not as an error.
+#[test]
+fn uploads_and_fetches_a_worker_has_no_disk_for_are_retried() {
+    farm_ready();
+    let src = random_source("noroomref");
+    succeed(CLIENT, &["nix", "copy", "--to", &direct(WORKER1), &src]);
+    let drv = instantiate("job", "noroomref", &["--argstr", "inputPath", &src]);
+    let store = format!("{}&restart-grace=1", direct(WORKER2));
+    let _full = NoInodes::new();
+    let upload = run_t(CLIENT, &["nix", "copy", "--to", &store, &drv], 60);
+    let fetch = run_t(
+        CLIENT,
+        &["sh", "-c", r#"nix store dump-path --store "$1" "$2" > /dev/null"#, "sh", &store, &src],
+        60,
+    );
+    for o in [upload, fetch] {
+        assert!(o.code != 0 && o.combined().contains("retrying"), "{}", o.combined());
+    }
+}
+
+/// A fetch from the cache bigger than what worker2 has left fails without
+/// ENOSPC in Nix's error: still unavailable, which the client retries.
+#[test]
+fn a_fetch_bigger_than_what_its_worker_has_left_is_retried() {
+    farm_ready();
+    let cmd = "head -c 64M /dev/urandom > /tmp/big && nix store add-file /tmp/big";
+    let src = succeed(CLIENT, &["sh", "-c", cmd]).trim().to_string();
+    succeed(CLIENT, &["nix", "copy", "--to", &direct(WORKER1), &src]);
+    let _low = LowDisk::leaving(WORKER2, 32 << 20);
+    let store = format!("{}&restart-grace=1", direct(WORKER2));
+    let fetch = run_t(
+        CLIENT,
+        &["sh", "-c", r#"nix store dump-path --store "$1" "$2" > /dev/null"#, "sh", &store, &src],
+        60,
+    );
+    assert!(fetch.code != 0 && fetch.combined().contains("retrying"), "{}", fetch.combined());
+}
+
+/// Worker2 is low on disk but not out of it, and a client pinned to it asks
+/// for a path nobody has: absent at once, as with disk to spare.
+#[test]
+fn a_path_nobody_has_is_absent_on_a_worker_low_on_disk() {
+    farm_ready();
+    let _low = LowDisk::leaving(WORKER2, 100 << 20);
+    let store = format!("{}&restart-grace=1", direct(WORKER2));
+    let absent = "/nix/store/00000000000000000000000000000000-absent";
+    let o = run_t(CLIENT, &["nix", "path-info", "--store", &store, absent], 120);
+    assert!(o.code != 0 && o.combined().contains("is not valid"), "{}", o.combined());
+}
+
+/// A drv whose NAR the cache lost still fails at once as missing on workers
+/// with disk to spare, and its lease ends.
+#[test]
+fn a_drv_the_cache_lost_fails_as_missing() {
+    farm_ready();
+    let drv = instantiate("input", "lostdrv", &[]);
+    succeed(CLIENT, &["nix", "copy", "--to", &direct(WORKER1), &drv]);
+    succeed(WORKER1, &["nix-store", "--delete", &drv]);
+    lose_nar(&drv);
+    let done = || WORKERS.into_iter().map(|w| events(w, "done_CANCELLED")).sum::<i64>();
+    let before = done();
+    let o = run_t(
+        CLIENT,
+        &["nix", "build", "--store", &envoy(), "--eval-store", "auto", &format!("{drv}^*")],
+        120,
+    );
+    let out = o.combined();
+    assert!(o.code != 0 && out.contains("missing: ") && !out.contains("gave up"), "{out}");
+    retry(30, "the lease ended", || done() > before);
+}

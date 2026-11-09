@@ -194,8 +194,36 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         std::string_view const what = err.what();
         // NOLINTBEGIN(misc-include-cleaner): EDQUOT is POSIX, <cerrno> has it.
         return what.contains(std::system_category().message(ENOSPC))
-               || what.contains(std::system_category().message(EDQUOT)) || coord.outOfSpace();
+               || what.contains(std::system_category().message(EDQUOT)) || coord.outOfSpace(0);
         // NOLINTEND(misc-include-cleaner)
+    }
+
+    // A fetch of `path` failed. Nix drops the reason, so the disk is also to
+    // blame where the farm's cache has the path and its NAR is bigger than
+    // what is left.
+    [[nodiscard]] auto outOfSpace(nix::Store & store, const nix::StorePath & path, const std::exception & err) const
+        -> bool
+    {
+        bool const full = outOfSpace(err);
+        if (full || !coord.cache.hasRemote()) {
+            return full;
+        }
+        nix::SubstitutablePathInfos infos;
+        try {
+            store.querySubstitutablePathInfos({{path, std::nullopt}}, infos);
+        } catch (nix::Error &) {
+            return false;
+        }
+        auto const found = infos.find(path);
+        return found != infos.end() && coord.outOfSpace(found->second.narSize);
+    }
+
+    // The answer for this node's full disk. Like a failed publish it is an
+    // answer, not a call cut off (cutOff, retry.hh), so a client's retries
+    // end when they stop getting anywhere.
+    static auto noSpace(std::string_view what) -> grpc::Status
+    {
+        return {grpc::StatusCode::UNAVAILABLE, "out of space: " + std::string(what)};
     }
 
     auto localDaemonGone(const std::exception & err) -> bool
@@ -279,6 +307,9 @@ private:
             }
             nixgrpc::logLine(
                 nixgrpc::LogLevel::info, {{"event", "handler_error"}, {"error", std::string(err.what())}});
+            if (outOfSpace(err)) {
+                return noSpace(err.what());
+            }
             return {grpc::StatusCode::INTERNAL, err.what()};
         }
     }
@@ -595,6 +626,9 @@ public:
                     if (backendGone(err)) {
                         throw;
                     }
+                    if (outOfSpace(*localStore, path, err)) {
+                        return noSpace(err.what());
+                    }
                     // invalid here and not substitutable: omitted from the reply
                     logDebug({{"event", "path_info_miss"}, {"path", name}, {"error", err.what()}});
                     continue;
@@ -809,12 +843,19 @@ public:
             counted.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count();
             metrics.inputs(counted);
         } catch (nix::Error & err) {
+            // No worker can get an input the cache lost, however full this
+            // node is.
+            bool const lost = fetching && cacheLost(*fetching, err);
+            // This node's disk failed, not the input: another worker may have room.
+            if (!lost && (fetching ? outOfSpace(localStore, *fetching, err) : outOfSpace(err))) {
+                return noSpace(workerName + ": " + err.what());
+            }
             metrics.event("input_not_substitutable");
             // No worker can get an input the cache lost: named, the client
             // builds it. Past a cache or nix-daemon that failed, another
             // worker may: unnamed, the client asks the scheduler for one, up
             // to its reschedule-retries.
-            if (fetching && cacheLost(*fetching, err)) {
+            if (lost) {
                 metrics.event("input_lost");
                 missing = localStore.printStorePath(*fetching);
             }
@@ -966,6 +1007,34 @@ public:
         std::jthread thread_;
     };
 
+    // The drv here, fetched if need be. NOT_FOUND makes the client upload it.
+    // A drv this node has no disk for is given back where it was expected:
+    // another worker may have room.
+    auto ensureDrv(
+        nix::Store & localStore,
+        const nix::StorePath & drvPath,
+        nixgrpc::Builder & builder,
+        const nixgrpc::Builder::Call & call) const -> grpc::Status
+    {
+        if (localStore.isValidPath(drvPath)) {
+            return grpc::Status::OK;
+        }
+        try {
+            nixcompat::ensurePath(localStore, drvPath);
+        } catch (nix::Error & err) {
+            if (!outOfSpace(localStore, drvPath, err)) {
+                return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
+            }
+            if (call.expected()) {
+                builder.finished(
+                    std::string(drvPath.to_string()), nix::remote::Done::GIVEN_BACK, {}, {},
+                    nix::remote::Done::TRANSIENT_FAILURE);
+            }
+            return noSpace(err.what());
+        }
+        return grpc::Status::OK;
+    }
+
     // gRPC errors mean "ask the scheduler again", build outcomes travel as BuildResult.
     auto build(
         const Rpc & rpc,
@@ -1000,12 +1069,8 @@ public:
         // The client is here: the lease holds through its upload. NOT_FOUND
         // makes it upload the closure and retry, so admit comes after.
         nixgrpc::Builder::Call const call(builder, drvName);
-        if (!localStore.isValidPath(drvPath)) {
-            try {
-                nixcompat::ensurePath(localStore, drvPath);
-            } catch (nix::Error &) {
-                return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
-            }
+        if (auto status = ensureDrv(localStore, drvPath, builder, call); !status.ok()) {
+            return status;
         }
         auto adm = builder.admit(drvName);
         if (!adm) {

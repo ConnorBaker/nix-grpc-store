@@ -29,8 +29,9 @@ inline auto transportError(std::string_view msg) -> bool
     return std::ranges::any_of(needles, [&](std::string_view needle) -> bool { return msg.contains(needle); });
 }
 
-// A worker or the balancer restarting under us, or not reachable right now.
-// The daemon sends UNAVAILABLE only for that; TLS setup failures are config errors.
+// A worker or the balancer restarting under us, not reachable right now, or a
+// worker out of disk. The daemon sends UNAVAILABLE only for those; TLS setup
+// failures are config errors.
 inline auto goneAway(const grpc::Status & status) -> bool
 {
     auto const & msg = status.error_message();
@@ -81,11 +82,14 @@ inline auto streamBroken(const grpc::Status & status) -> bool
 }
 
 // The call broke or its server left, as opposed to the server answering with
-// an error. A failed publish is an answer: worth a retry elsewhere, but not
-// progress, so the retries end when they stop getting anywhere.
+// an error. A failed publish, or a worker out of space, is an answer: worth a
+// retry elsewhere, but not progress, so the retries end when they stop
+// getting anywhere.
 inline auto cutOff(const grpc::Status & status) -> bool
 {
-    return !status.error_message().contains("publish failed") && (streamBroken(status) || goneAway(status));
+    auto const & msg = status.error_message();
+    return !msg.contains("publish failed") && !msg.contains("out of space: ")
+           && (streamBroken(status) || goneAway(status));
 }
 
 // Doubling pause under a deadline.

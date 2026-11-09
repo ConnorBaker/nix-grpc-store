@@ -104,8 +104,9 @@ public:
     };
 
     // A call for the drv: any BuildDerivation, also one answered NOT_FOUND,
-    // and an upload of its inputs (x-nix-drv).
-    void claim(const std::string & drvPath);
+    // and an upload of its inputs (x-nix-drv). False if the drv was not
+    // expected here.
+    auto claim(const std::string & drvPath) -> bool;
     auto admit(const std::string & drvPath) -> std::optional<Admission>;
     void finished(
         const std::string & drvPath,
@@ -151,13 +152,20 @@ public:
     {
         Builder & builder;
         std::string drvPath;
+        bool expected_;
 
     public:
         Call(Builder & builder, std::string drvPath)
             : builder(builder)
             , drvPath(std::move(drvPath))
+            , expected_(builder.claim(this->drvPath))
         {
-            builder.claim(this->drvPath);
+        }
+
+        // The drv was expected here when the call began.
+        [[nodiscard]] auto expected() const -> bool
+        {
+            return expected_;
         }
 
         Call(const Call &) = delete;
@@ -254,8 +262,8 @@ public:
     // From the serve loop, ~1 Hz. `stopping`: after a SIGTERM or a takeover,
     // when the builder drains for good and --min-free no longer moves it.
     void tick(bool stopping);
-    // The store takes no new block or file.
-    [[nodiscard]] auto outOfSpace() const -> bool;
+    // The store takes no new file, or not `need` more bytes (none for 0).
+    [[nodiscard]] auto outOfSpace(uint64_t need) const -> bool;
     // Before Shutdown(): peers of the scheduler are told to reconnect rather
     // than left to find a dead stream.
     void restarting();

@@ -54,6 +54,10 @@ void classifiesWhatAWorkerAnswersApartFromCutOffs()
     // Still an answer when the publish error's own text quotes a broken
     // stream: main.cc puts the cache client's message after "publish failed: ".
     assert(!nixgrpc::cutOff(unavailable("node-a: publish failed: niks3 push: Stream removed")));
+    // As main.cc answers for a worker's full disk (noSpace).
+    auto const noSpace = unavailable("out of space: cannot add path: No space left on device");
+    assert(nixgrpc::goneAway(noSpace));
+    assert(!nixgrpc::cutOff(noSpace));
     assert(nixgrpc::streamBroken({grpc::StatusCode::INTERNAL, "Received RST_STREAM with error code 2"}));
     assert(nixgrpc::streamBroken({grpc::StatusCode::UNKNOWN, "Socket closed"}));
     assert(nixgrpc::cutOff({grpc::StatusCode::UNKNOWN, "Stream removed (Socket closed)"}));

@@ -104,14 +104,17 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     metrics.event("expect");
 }
 
-void Builder::claim(const std::string & drvPath)
+auto Builder::claim(const std::string & drvPath) -> bool
 {
     auto lck = state.lock();
-    if (auto const found = lck->expected.find(drvPath); found != lck->expected.end()) {
-        found->second.claimed = true;
-        found->second.calls++;
-        found->second.since = Clock::now();
+    auto const found = lck->expected.find(drvPath);
+    if (found == lck->expected.end()) {
+        return false;
     }
+    found->second.claimed = true;
+    found->second.calls++;
+    found->second.since = Clock::now();
+    return true;
 }
 
 void Builder::callEnded(const std::string & drvPath)
@@ -616,13 +619,14 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 
 // As an unprivileged user sees it, which runs out before root's reserve. A
 // filesystem that reports no blocks or inodes at all (ramfs) has no limit.
-auto Coordinator::outOfSpace() const -> bool
+auto Coordinator::outOfSpace(uint64_t need) const -> bool
 {
     struct statvfs vfs{};
     if (statvfs(options.storeDir.c_str(), &vfs) != 0) {
         return false;
     }
-    return (vfs.f_blocks > 0 && vfs.f_bavail == 0) || (vfs.f_files > 0 && vfs.f_favail == 0);
+    auto const avail = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+    return (vfs.f_blocks > 0 && need >= avail) || (vfs.f_files > 0 && vfs.f_favail == 0);
 }
 
 void Coordinator::tick(bool stopping)
