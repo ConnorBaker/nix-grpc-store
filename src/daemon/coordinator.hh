@@ -83,6 +83,8 @@ public:
     // SIGHUP: without --max-jobs, read nix's max-jobs anew and hand the
     // scheduler the builder's new capacity. From the serve loop.
     void reloadNixConfig();
+    // The store takes no new block or file.
+    [[nodiscard]] auto outOfSpace() const -> bool;
     // Before Shutdown(): peers of the scheduler are told to reconnect rather
     // than left to find a dead stream.
     void restarting();
