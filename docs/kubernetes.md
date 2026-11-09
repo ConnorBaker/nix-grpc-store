@@ -156,16 +156,14 @@ equal on every container of the pod.
 
 A worker's `/nix` is an `emptyDir` on the node's disk. When free space
 there drops below `gc.ensureFree`, the harmonia-gc sidecar deletes
-unused store paths. If it still drops below `minFree`, the worker stops
-taking builds. Both thresholds are measured against the node's disk,
-not per pod, so keep `ensureFree` well above `minFree`.
+unused store paths. The threshold is measured against the node's disk,
+not per pod.
 `store.sizeLimit` is not a quota: going over it evicts the pod.
 
 For nodes with a 500 GB disk and two workers each:
 
 ```yaml
 workerDefaults:
-  minFree: 30G           # stop accepting builds
   store:
     sizeLimit: 200Gi     # evict a runaway pod before the node fills
   buildDir:

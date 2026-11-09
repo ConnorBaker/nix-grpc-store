@@ -98,7 +98,6 @@ private:
     bool daemonAnswered = true;
     std::optional<Elector> elector;
     grpc::HealthCheckServiceInterface * health = nullptr;
-    std::atomic<bool> lastHealthy{true};
     void setSchedulerActive(bool active);
     void runRemoteSession(Builder & bld, const std::stop_token & stop);
     void askLocalDaemon(Builder & bld);
