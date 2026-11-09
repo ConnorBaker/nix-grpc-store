@@ -691,33 +691,6 @@ fn required_system_features_are_placed_or_refused() {
     });
 }
 
-#[test]
-fn low_disk_drains_a_worker_and_builds_go_to_the_other() {
-    farm_ready();
-    let count = |p: &str| journal_count(WORKER1, UNIT, p);
-    let (down, up) = (
-        "event=unhealthy reason=min_free",
-        "event=healthy reason=min_free",
-    );
-    let (down0, up0) = (count(down), count(up));
-    let avail = succeed(WORKER1, &["df", "--output=avail", "-B1", "/nix/store"]);
-    let avail: u64 = avail.lines().last().unwrap().trim().parse().unwrap();
-    succeed(
-        WORKER1,
-        &[
-            "fallocate",
-            "-l",
-            &(avail - 100 * 1024 * 1024).to_string(),
-            "/nix/.rw-store/fill",
-        ],
-    );
-    wait_journal_above(WORKER1, UNIT, down, down0, 30);
-    let top = build(&envoy(), "drain", &[]);
-    assert_eq!(holders(&top), [WORKER2]);
-    succeed(WORKER1, &["rm", "/nix/.rw-store/fill"]);
-    wait_journal_above(WORKER1, UNIT, up, up0, 30);
-}
-
 fn farm_gives(path: &str) {
     let got = run_t(CLIENT, &["nix", "path-info", "--store", &envoy(), path], 120);
     assert_eq!(
@@ -1340,4 +1313,23 @@ fn a_drv_the_cache_lost_fails_as_missing() {
     let out = o.combined();
     assert!(o.code != 0 && out.contains("missing: ") && !out.contains("gave up"), "{out}");
     retry(30, "the lease ended", || done() > before);
+}
+
+/// Both workers low on disk but not out of it, and the cache lost the drv:
+/// "missing" at once, as with disk to spare.
+#[test]
+fn a_drv_the_cache_lost_fails_as_missing_on_workers_low_on_disk() {
+    farm_ready();
+    let drv = instantiate("input", "lostdrvlow", &[]);
+    succeed(CLIENT, &["nix", "copy", "--to", &direct(WORKER1), &drv]);
+    succeed(WORKER1, &["nix-store", "--delete", &drv]);
+    lose_nar(&drv);
+    let _low = [LowDisk::leaving(WORKER1, 100 << 20), LowDisk::leaving(WORKER2, 100 << 20)];
+    let o = run_t(
+        CLIENT,
+        &["nix", "build", "--store", &envoy(), "--eval-store", "auto", &format!("{drv}^*")],
+        300,
+    );
+    let out = o.combined();
+    assert!(o.code != 0 && out.contains("missing: ") && !out.contains("gave up"), "{out}");
 }

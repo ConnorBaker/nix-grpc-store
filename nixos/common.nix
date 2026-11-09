@@ -11,6 +11,14 @@ let
   builder = lib.elem "builder" cfg.roles;
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "services" "nix-grpc-daemon" "minFree" ] ''
+      The daemon no longer stops taking builds on low disk. A worker out of space hands
+      each build back to the scheduler; space comes back through Nix's own GC
+      (nix.settings.min-free/max-free), or gc.ensureFree in the helm chart.
+    '')
+  ];
+
   options.services.nix-grpc-daemon = {
     enable = lib.mkEnableOption "the nix-grpc-daemon proxy";
 
@@ -294,13 +302,6 @@ in
         Seconds a scheduler keeps a build at most once its clients left, when
         a client asked for that with its `grpc-linger` setting. `0` turns
         lingering off. Defaults to the daemon's 600.
-      '';
-    };
-    minFree = lib.mkOption {
-      type = lib.types.str;
-      default = "10G";
-      description = ''
-        Take no new builds below this much free space under /nix. `0` disables.
       '';
     };
 

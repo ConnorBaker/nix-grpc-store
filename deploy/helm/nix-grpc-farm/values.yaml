@@ -101,8 +101,6 @@ workerDefaults:
   # nix counts without regard to the pod's CPU limit.
   maxJobs: auto
   cores: 0
-  # Below this the worker tells the scheduler to stop assigning to it.
-  minFree: 20G
   store:
     sizeLimit: null # emptyDir sizeLimit for /nix
   spool:
@@ -148,7 +146,6 @@ scheduler:
   extraArgs: []
 
 gc:
-  # Keep this above every group's minFree so workers do not flap unhealthy.
   ensureFree: 40G
   interval: 300
   keepRecent: null # e.g. 1d

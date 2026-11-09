@@ -197,7 +197,6 @@ let
       inherit system;
       replicas = 2;
       maxJobs = 2;
-      minFree = "500M";
     };
     gc = {
       ensureFree = "2G";
@@ -432,7 +431,7 @@ pkgs.testers.runNixOSTest {
         def sh(container: str, cmd: str) -> str:
             return kubectl(f"exec {pod} -c {container} -- sh -c {shlex.quote(cmd)}")
         # emptyDir sizeLimit is not a filesystem, so gc sees the node's disk.
-        # Garbage for gc to find, then leave ~1G free: below ensureFree (2G), above minFree (500M).
+        # Garbage for gc to find, then leave ~1G free: below ensureFree (2G).
         avail = int(sh("gc", "df -B1 /nix/store | awk 'NR==2 {print $4}'"))
         sh("nix-daemon", "for i in 1 2 3; do echo $i > /tmp/g$i; nix-store --add /tmp/g$i; done")
         sh("gc", f"fallocate -l {avail - 1024**3} /nix/fill")

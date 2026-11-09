@@ -5,7 +5,7 @@
     "type": "prometheus",
     "uid": "${DS}"
    },
-   "description": "Envoy active health check per cluster. <100% means a worker is down or drained (low disk).",
+   "description": "Envoy active health check per cluster. <100% means a worker is down or draining.",
    "fieldConfig": {
     "defaults": {
      "color": {

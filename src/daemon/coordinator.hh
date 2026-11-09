@@ -259,9 +259,8 @@ public:
     // NOLINTEND(*-non-private-member-variables-in-classes)
 
     void start(grpc::Server & server);
-    // From the serve loop, ~1 Hz. `stopping`: after a SIGTERM or a takeover,
-    // when the builder drains for good and --min-free no longer moves it.
-    void tick(bool stopping);
+    // From the serve loop, ~1 Hz.
+    void tick();
     // The store takes no new file, or not `need` more bytes (none for 0).
     [[nodiscard]] auto outOfSpace(uint64_t need) const -> bool;
     // Before Shutdown(): peers of the scheduler are told to reconnect rather
@@ -273,7 +272,6 @@ private:
     std::jthread sessionThread; // remote WorkerSession client
     std::optional<Elector> elector;
     grpc::HealthCheckServiceInterface * health = nullptr;
-    std::atomic<bool> lastHealthy{true};
     void setSchedulerActive(bool active);
     void runRemoteSession(Builder & bld, const std::stop_token & stop);
 };

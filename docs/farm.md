@@ -141,7 +141,6 @@ services.nix-grpc-daemon = {
   roles = [ "builder" ];              # [ "builder" "scheduler" ] on the scheduler node
   scheduler = "10.0.0.4:50052";       # leave out on the scheduler node itself
   idleTimeout = null;
-  minFree = "20G";
   tls = {
     certFile = "/run/keys/worker.crt";
     keyFile = "/run/keys/worker.key";
@@ -169,7 +168,6 @@ services.nix-grpc-daemon = {
 | `scheduler` | Where a builder finds the scheduler: that node's address, or the balancer's when several nodes have the role (see [failover](#managing-the-farm)). Unset on a node that is the only scheduler. |
 | `advertise` | The address the balancer reaches this node at. A builder's must be `IP:port`, since the scheduler passes it to envoy as an endpoint. It routes requests and grants no access: only peers with the `trusted` role can open a session. A scheduler node's must match its entry in the balancer's `scheduler`. |
 | `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`, read again on SIGHUP. |
-| `minFree` | Below this much free disk the node takes no new builds until space returns. |
 | `trustedProxies` | Peers with a matching client cert are balancers. The node takes the real client identity from the `x-forwarded-client-cert` header they set. Other peers can't set it. |
 | `accessRules` | Maps CNs to roles. CI needs `trusted`, and so do the other nodes for their connection to the scheduler. |
 | `schedulerTokenFile` | Bearer token for the connection to the scheduler, instead of or next to the client certificate. The scheduler node maps it to `trusted` through its `oidc` rules. |
@@ -194,7 +192,7 @@ run nix-daemon from the same Nix: an older one may not know
 `nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
 too. Add each of them to the balancer's `systems`. A
 scheduler-only node is the same with `roles = [ "scheduler" ]` and no
-`scheduler`, `maxJobs` or `minFree`.
+`scheduler` or `maxJobs`.
 
 A node has two outbound connections, to the scheduler and to niks3, and
 on each it can present its certificate, a bearer token, or both. With

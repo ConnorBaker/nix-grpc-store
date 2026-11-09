@@ -130,7 +130,6 @@ in
           idleTimeout = null;
           trustClients = true;
           workerName = "hub";
-          minFree = "0";
           maxJobs = lib.mkIf (scenario == "queue") 1;
         };
       };

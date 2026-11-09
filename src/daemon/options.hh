@@ -2,7 +2,6 @@
 // Command line of nix-grpc-daemon.
 
 #include <chrono>
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -46,7 +45,6 @@ struct Options
     // How the balancer reaches this worker. Goes into Assigned.worker_addr.
     std::string advertise;
     unsigned maxJobs = 0; // 0 = nix's max-jobs, read at start and on SIGHUP (Builder::reloadNixConfig)
-    uint64_t minFree = 0;
     // The longest a departed client's lease may keep a build, and its slot,
     // for it (Want.linger_s). 600 s because most revoked builds that were
     // asked for again were asked for within it: 892 of 1,093 on one farm's

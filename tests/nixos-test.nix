@@ -86,8 +86,6 @@ pkgs.testers.runNixOSTest {
         listen = "127.0.0.1:50051";
         logLevel = "debug";
         idleTimeout = 3;
-        # Test VM disk is ~1 GiB.
-        minFree = "0";
         # Reuse the client bundle so the test doesn't compile the project twice.
         package = config.programs.nix-grpc-store.package;
       };

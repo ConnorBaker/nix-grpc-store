@@ -629,23 +629,12 @@ auto Coordinator::outOfSpace(uint64_t need) const -> bool
     return (vfs.f_blocks > 0 && need >= avail) || (vfs.f_files > 0 && vfs.f_favail == 0);
 }
 
-void Coordinator::tick(bool stopping)
+void Coordinator::tick()
 {
     if (!builder) {
         return;
     }
     builder->tick();
-    struct statvfs vfs{};
-    if (options.minFree == 0 || statvfs(options.storeDir.c_str(), &vfs) != 0) {
-        return;
-    }
-    const bool healthy = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize >= options.minFree;
-    if (lastHealthy.exchange(healthy) != healthy) {
-        logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", "min_free"}});
-        if (!stopping) {
-            builder->setDraining(!healthy);
-        }
-    }
 }
 
 } // namespace nixgrpc

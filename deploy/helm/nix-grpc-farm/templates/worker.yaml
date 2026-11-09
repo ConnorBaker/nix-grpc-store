@@ -209,7 +209,6 @@ spec:
             {{- with $root.Values.niks3.pushFlags }}
             - --niks3-push=niks3 push {{ join " " . }}
             {{- end }}
-            - --min-free={{ $w.minFree }}
             {{- if (include "farm.tlsSecret" (list $root "worker")) }}
             - --tls-cert=/secrets/tls/tls.crt
             - --tls-key=/secrets/tls/tls.key

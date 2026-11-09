@@ -1682,14 +1682,14 @@ void serve(
                 reloadNixConfig(coord);
             }
             if (!gen.paused()) {
-                coord.tick(false);
+                coord.tick();
             }
             service.tick();
         } else {
             if (!std::exchange(draining, true)) {
                 startDrain(server, coord);
             }
-            coord.tick(true); // gives back unclaimed leases
+            coord.tick(); // gives back unclaimed leases
             if (stopSignal >= nixgrpc::kCancelBuilds || (drained(coord, metrics) && !predecessor)) {
                 return;
             }
