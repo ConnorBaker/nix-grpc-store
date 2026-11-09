@@ -59,8 +59,6 @@
 ++ [
   "--role"
   (lib.concatStringsSep "," cfg.roles)
-  "--min-free"
-  cfg.minFree
 ]
 ++ lib.concatMap (s: [
   "--extra-system"
