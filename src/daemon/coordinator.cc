@@ -393,15 +393,6 @@ void Coordinator::tick()
         return;
     }
     builder->tick();
-    struct statvfs vfs{};
-    if (options.minFree == 0 || statvfs(options.storeDir.c_str(), &vfs) != 0) {
-        return;
-    }
-    const bool healthy = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize >= options.minFree;
-    if (lastHealthy.exchange(healthy) != healthy) {
-        logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", std::string(Builder::name(Builder::Unavailable::lowDisk))}});
-        builder->setUnavailable(Builder::Unavailable::lowDisk, !healthy);
-    }
 }
 
 // Whoever rewrites nix's configuration signals us; a Tribuchet hub rewrites

@@ -125,7 +125,6 @@ let
           }
         ];
         oidc = oidcConfig;
-        minFree = "200M";
         niks3 = {
           package = niks3Pkgs.niks3;
           url = niks3Url;
