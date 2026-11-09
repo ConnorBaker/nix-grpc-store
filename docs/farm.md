@@ -147,7 +147,6 @@ services.nix-grpc-daemon = {
   roles = [ "builder" ];              # [ "builder" "scheduler" ] on the scheduler node
   scheduler = "10.0.0.4:50052";       # leave out on the scheduler node itself
   idleTimeout = null;
-  minFree = "20G";
   tls = {
     certFile = "/run/keys/worker.crt";
     keyFile = "/run/keys/worker.key";
@@ -176,7 +175,6 @@ services.nix-grpc-daemon = {
 | `advertise` | The address the balancer reaches this node at. A builder's must be `IP:port`, since the scheduler passes it to envoy as an endpoint. It routes requests and grants no access: only peers with the `trusted` role can open a session. A scheduler node's must match its entry in the balancer's `scheduler`. |
 | `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`, read again on SIGHUP. |
 | `lookupThreads` | Cache lookups a scheduler runs at once for incoming build requests, 32 by default. Raise it when requests wait on a slow cache while the scheduler is idle. |
-| `minFree` | Below this much free disk the node takes no new builds until space returns. |
 | `buildLogRetention` | How long a builder keeps Nix's build logs, `"30d"` by default. `null` keeps them forever, as Nix does. |
 | `trustedProxies` | Peers with a matching client cert are balancers. The node takes the real client identity from the `x-forwarded-client-cert` header they set. Other peers can't set it. |
 | `accessRules` | Maps CNs to roles. CI needs `trusted`, and so do the other nodes for their connection to the scheduler. |
@@ -193,7 +191,7 @@ too, and so do the systems in `extraSystems` (e.g. ones the
 nix-daemon hands to `external-builders`). Add each of them to the
 balancer's `systems`. A
 scheduler-only node is the same with `roles = [ "scheduler" ]` and no
-`scheduler`, `maxJobs` or `minFree`.
+`scheduler` or `maxJobs`.
 
 A node has two outbound connections, to the scheduler and to niks3, and
 on each it can present its certificate, a bearer token, or both. With
