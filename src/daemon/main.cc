@@ -152,6 +152,17 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     nixgrpc::UploadClaims uploads;
     nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return local.scoped(); }};
 
+    // This node's disk, not the caller, failed. Nix's error says so where it
+    // survives; where Nix drops the reason (a failed fetch) the disk does.
+    [[nodiscard]] auto outOfSpace(const std::exception & err) const -> bool
+    {
+        std::string_view const what = err.what();
+        // NOLINTBEGIN(misc-include-cleaner): EDQUOT is POSIX, <cerrno> has it.
+        return what.contains(std::system_category().message(ENOSPC))
+               || what.contains(std::system_category().message(EDQUOT)) || coord.outOfSpace();
+        // NOLINTEND(misc-include-cleaner)
+    }
+
     // Retryable on another worker or later: guarded() maps it to UNAVAILABLE.
     struct Unavailable : nix::Error
     {
@@ -1112,6 +1123,14 @@ public:
                 metrics.event("revoked");
                 return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
             }
+            throw;
+        } catch (std::exception & err) {
+            // This node's disk failed, not the build: another worker may have room.
+            if (outcome != nix::remote::Done::BUILT && outOfSpace(err)) {
+                outcome = nix::remote::Done::GIVEN_BACK;
+                reason = nix::remote::Done::TRANSIENT_FAILURE;
+            }
+            report();
             throw;
         } catch (...) {
             report();
