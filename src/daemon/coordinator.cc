@@ -614,6 +614,17 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
     }
 }
 
+// As an unprivileged user sees it, which runs out before root's reserve. A
+// filesystem that reports no blocks or inodes at all (ramfs) has no limit.
+auto Coordinator::outOfSpace() const -> bool
+{
+    struct statvfs vfs{};
+    if (statvfs(options.storeDir.c_str(), &vfs) != 0) {
+        return false;
+    }
+    return (vfs.f_blocks > 0 && vfs.f_bavail == 0) || (vfs.f_files > 0 && vfs.f_favail == 0);
+}
+
 void Coordinator::tick(bool stopping)
 {
     if (!builder) {

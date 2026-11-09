@@ -254,6 +254,8 @@ public:
     // From the serve loop, ~1 Hz. `stopping`: after a SIGTERM or a takeover,
     // when the builder drains for good and --min-free no longer moves it.
     void tick(bool stopping);
+    // The store takes no new block or file.
+    [[nodiscard]] auto outOfSpace() const -> bool;
     // Before Shutdown(): peers of the scheduler are told to reconnect rather
     // than left to find a dead stream.
     void restarting();
