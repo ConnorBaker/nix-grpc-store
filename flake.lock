@@ -146,17 +146,17 @@
         "treefmt-nix": "treefmt-nix_2"
       },
       "locked": {
-        "lastModified": 1793729466,
-        "narHash": "sha256-XS0Zs9YywVJ2gkB2OcjehsC4OOAEjA+8CCYQsIsHbT4=",
+        "lastModified": 1794534245,
+        "narHash": "sha256-sfUnNKTm0sWeDwd9KkzXxE7bG3bfTZQKEAEjaty/zaA=",
         "owner": "ConnorBaker",
         "repo": "tribuchet",
-        "rev": "823dc2edd7b738feb4e9a69148c8842553c31769",
+        "rev": "05a14690064881247f5ae1f821e03c0f45a103e1",
         "type": "github"
       },
       "original": {
         "owner": "ConnorBaker",
         "repo": "tribuchet",
-        "rev": "823dc2edd7b738feb4e9a69148c8842553c31769",
+        "rev": "05a14690064881247f5ae1f821e03c0f45a103e1",
         "type": "github"
       }
     }
