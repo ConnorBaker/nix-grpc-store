@@ -148,8 +148,6 @@ in
           enable = true;
           package = tribuchet;
           agents = 1;
-          # the VM has less than the default 8 GiB to keep back
-          agentMemoryReserve = 512 * 1024 * 1024;
           keyFile = "/etc/tribuchet/tls/worker.key";
           settings = {
             hub = "https://hub:7437";
