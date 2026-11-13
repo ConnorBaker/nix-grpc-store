@@ -8,7 +8,7 @@
     niks3.inputs.nixpkgs.follows = "nixpkgs";
     # The lease checks' hub and worker. Only those checks use it, in its own
     # package set: the Nix its hub patches.
-    tribuchet.url = "github:ConnorBaker/tribuchet/823dc2edd7b738feb4e9a69148c8842553c31769";
+    tribuchet.url = "github:ConnorBaker/tribuchet/05a14690064881247f5ae1f821e03c0f45a103e1";
   };
 
   outputs =
