@@ -36,7 +36,6 @@
 #
 # usage: client-keepalive-test.py <nix-grpc-daemon> <keepalive-client> <store-query-client> <plugin>
 # exit 0: pass, 1: fail, 2: the test never reached the state it tests.
-import os
 import re
 import socket
 import struct
@@ -46,6 +45,8 @@ import tempfile
 import threading
 import time
 import urllib.request
+
+import testdaemon
 
 ALIVE_S = 3  # forward this long after Assigned, like a live connection
 SETUP_S = 30
@@ -278,55 +279,16 @@ def scrape(port):
     return vals
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def since(times, origin):
     return ", ".join(f"+{t - origin:.1f}s" for t in times)
 
 
-def greeter(path):
-    """A nix-daemon that only says hello: the builder takes no builds while
-    its local nix-daemon does not answer (Coordinator::askLocalDaemon)."""
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(path)
-    srv.listen()
-
-    def serve():
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                if conn.recv(8):
-                    conn.sendall(struct.pack("<Q", 0x6478696F))
-                while conn.recv(4096):
-                    pass
-
-    threading.Thread(target=serve, daemon=True).start()
-
-
 def main():
     daemon, client_exe, query_exe, plugin = sys.argv[1:5]
-    port, mport = free_port(), free_port()
     tmp = tempfile.mkdtemp()
-    log = open(os.path.join(tmp, "daemon.log"), "w+")
-    greeter(os.path.join(tmp, "nix-daemon"))
-    proc = subprocess.Popen(
-        [
-            daemon,
-            "--listen", f"127.0.0.1:{port}",
-            "--proxy-socket", os.path.join(tmp, "nix-daemon"),
-            # Store queries get an answer without a nix-daemon: nothing is valid.
-            "--proxy-store", "dummy://",
-            "--metrics-listen", f"127.0.0.1:{mport}",
-            # A slot for each client's build.
-            "--max-jobs", "3",
-        ],
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
+    # Store queries get an answer without a nix-daemon (nothing is valid); a
+    # slot for each client's build.
+    proc, log = testdaemon.start(daemon, tmp, "--proxy-store", "dummy://", "--max-jobs", "3")
     clients = {}
     proxies = []
 
@@ -343,6 +305,10 @@ def main():
 
     try:
         start = time.monotonic()
+        ports = testdaemon.bound(proc, log, start + SETUP_S)
+        if ports is None:
+            return setup_fail(f"no startup line with the bound ports; daemon exit {proc.poll()}")
+        port, mport = ports
         while True:
             if proc.poll() is not None:
                 return setup_fail(f"daemon exited with {proc.returncode}")
