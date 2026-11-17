@@ -350,6 +350,9 @@ public:
         }
     }
 
+    // As bound, also for port 0; 0 while not serving.
+    [[nodiscard]] auto port() const -> int { return exposer ? exposer->GetListeningPorts().at(0) : 0; }
+
     void countRpc(const std::string & method, const std::string & commonName)
     {
         rpcs->Add({{"method", method}, {"cn", commonName}}).Increment();

@@ -21,16 +21,16 @@
 #
 # usage: keepalive-test.py <nix-grpc-daemon>
 # exit 0: pass, 1: fail, 2: the test never reached the state it tests.
-import os
 import re
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import urllib.request
+
+import testdaemon
 
 ALIVE_S = 3  # answer pings this long after Assigned, like a live client
 DEADLINE_S = 120  # keepalive time (20 s) + gRPC ping timeout (60 s), plus slack
@@ -173,47 +173,10 @@ def show(vals):
     )
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def greeter(path):
-    """A nix-daemon that only says hello: the builder takes no builds while
-    its local nix-daemon does not answer (Coordinator::askLocalDaemon)."""
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(path)
-    srv.listen()
-
-    def serve():
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                if conn.recv(8):
-                    conn.sendall(struct.pack("<Q", 0x6478696F))
-                while conn.recv(4096):
-                    pass
-
-    threading.Thread(target=serve, daemon=True).start()
-
-
 def main():
     daemon = sys.argv[1]
-    port, mport = free_port(), free_port()
     tmp = tempfile.mkdtemp()
-    log = open(os.path.join(tmp, "daemon.log"), "w+")
-    greeter(os.path.join(tmp, "nix-daemon"))
-    proc = subprocess.Popen(
-        [
-            daemon,
-            "--listen", f"127.0.0.1:{port}",
-            "--proxy-socket", os.path.join(tmp, "nix-daemon"),
-            "--metrics-listen", f"127.0.0.1:{mport}",
-        ],
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
+    proc, log = testdaemon.start(daemon, tmp)
 
     def daemon_log():
         log.seek(0)
@@ -229,6 +192,10 @@ def main():
 
     try:
         start = time.monotonic()
+        ports = testdaemon.bound(proc, log, start + SETUP_S)
+        if ports is None:
+            return setup_fail(f"no startup line with the bound ports; daemon exit {proc.poll()}")
+        port, mport = ports
         vals = None
         while time.monotonic() - start < SETUP_S:
             if proc.poll() is not None:
