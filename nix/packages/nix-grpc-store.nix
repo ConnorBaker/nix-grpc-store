@@ -58,6 +58,7 @@ stdenv.mkDerivation {
         ../../tests/.clang-tidy
         ../../tests/farm-mock.py
         ../../tests/keepalive-test.py
+        ../../tests/testdaemon.py
         ../../tests/client-keepalive-test.py
         ../../tests/keepalive-client.cc
         ../../tests/store-query-client.cc

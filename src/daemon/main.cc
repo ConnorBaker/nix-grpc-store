@@ -1446,8 +1446,9 @@ try {
     builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, minPingIntervalMs);
     auto const creds = nixgrpc::makeServerCredentials(options);
     std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> acceptor;
+    int port = 0;
     if (listenFds.empty()) {
-        builder.AddListeningPort(options.listen, creds);
+        builder.AddListeningPort(options.listen, creds, &port);
     } else {
         options.listen = "systemd";
         acceptor = builder.experimental().AddExternalConnectionAcceptor(
@@ -1471,9 +1472,12 @@ try {
         nixgrpc::acceptInto(listenFds, acceptor);
     }
 
+    // The ports as bound, also for port 0: tests ask for it, since a port they
+    // picked and let go of may meanwhile be another test's.
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
-        {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
+        {{"event", "startup"}, {"listen", options.listen}, {"port", listenFds.empty() ? std::to_string(port) : "activated"},
+         {"metrics_port", std::to_string(metrics.port())}, {"proxy_socket", options.socketPath}});
     coord.start(*server);
     if (tunnelled && coord.builder) {
         startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);
