@@ -258,14 +258,14 @@ if build_server
     include_directories : [include_directories('src/client')],
     dependencies : [dispatcher_dep, jemalloc_dep],
   )
-  benchmark('dispatcher', dispatcher_bench, args : ['large'], timeout : 300)
+  benchmark('dispatcher', dispatcher_bench, args : ['large'])
 
   # Same Dispatcher behind the real gRPC service on loopback.
   scheduler_grpc_bench = executable('scheduler-grpc-bench',
     sources : ['tests/scheduler-grpc-bench.cc', gen[2], gen[3]],
     dependencies : [dispatcher_dep, grpc_dep, jemalloc_dep],
   )
-  benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'], timeout : 60)
+  benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'])
 
   # --- tests ------------------------------------------------------------------
 
