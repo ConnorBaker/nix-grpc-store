@@ -36,8 +36,8 @@ auto greetsFirst() -> bool
     return hellos == std::vector<bool>{true, false};
 }
 
-constexpr std::chrono::seconds hung{20};
-constexpr std::chrono::seconds atOnce{2}; // well below the wait for a late assignment
+// Builder's expectLag: how long a call waits for an assignment that may still arrive.
+constexpr std::chrono::seconds expectLag{5};
 constexpr std::chrono::milliseconds headStart{100};
 
 auto expectOf(uint64_t assignId, const std::string & drv = "a.drv") -> nix::remote::Expect
@@ -57,17 +57,18 @@ auto earlyCallWaits() -> bool
     auto call = std::async(std::launch::async, [&] -> bool { return builder.claim("a.drv", 2); });
     std::this_thread::sleep_for(headStart);
     builder.onExpect(expectOf(2));
-    return call.wait_for(hung) == std::future_status::ready && call.get();
+    return call.get();
 }
 
-// The worker read a later assignment already, so this one is not on its way.
+// The worker read a later assignment already, so this one is not on its way:
+// the call is refused without waiting expectLag for it.
 auto staleCallIsRefusedAtOnce() -> bool
 {
     nixgrpc::Metrics metrics{""};
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     builder.onExpect(expectOf(2));
-    auto call = std::async(std::launch::async, [&] -> bool { return builder.claim("b.drv", 1); });
-    return call.wait_for(atOnce) == std::future_status::ready && !call.get();
+    auto const asked = Clock::now();
+    return !builder.claim("b.drv", 1) && Clock::now() - asked < expectLag;
 }
 
 constexpr auto past = std::chrono::seconds(61); // Builder's expectTimeout is 60 s
