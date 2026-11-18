@@ -205,8 +205,10 @@ let
       system = builtins.currentSystem;
       requiredSystemFeatures = features;
       builder = "/bin/sh";
-      # Runs until a test pkills the inner sh, which lets the build succeed.
-      args = [ "-c" "/bin/sh -c 'read x < /dev/zero'; echo ''${tag} > $out" ];
+      # Runs until a test pkills the inner sh, which lets the build succeed:
+      # a read of a pipe it also holds open for writing, which never ends
+      # nor spins.
+      args = [ "-c" "/bin/sh -c ': | { exec 3<>/proc/self/fd/0; read x <&3; }' slow-holding; echo ''${tag} > $out" ];
     }
   '';
   # Floating content-addressed derivations: `a`, `b` on `a`, and `slow` (as
@@ -228,7 +230,7 @@ let
     rec {
       a = ca "ca-a-''${tag}" "echo a-''${tag} > $out";
       b = ca "ca-b-''${tag}" "read x < ''${a}; echo b-$x > $out";
-      slow = ca "ca-slow-''${tag}" "/bin/sh -c 'read x < /dev/zero'; echo slow-''${tag} > $out";
+      slow = ca "ca-slow-''${tag}" "/bin/sh -c ': | { exec 3<>/proc/self/fd/0; read x <&3; }' slow-holding; echo slow-''${tag} > $out";
       inner = ca "ca-inner-''${tag}" "echo inner-''${tag} > $out";
       producer = derivation {
         name = "ca-inner-''${tag}.drv";
