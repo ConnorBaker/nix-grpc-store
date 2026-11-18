@@ -438,11 +438,11 @@ in
             # The grace ends with the next link held in its gap: the build
             # was kept (not revoked as the link left), then let go with no
             # lease's linger (no event=lingering), by the grace's end.
-            wait_journal(hub, "nix-grpc-daemon", "event=linger_expired ", "tt-bob", clients=[(client, "bob-chain")])
-            seq = lines(hub, "nix-grpc-daemon", "tt-bob")
+            ends = "event=(linger_expired|revoked_running) "
+            wait_journal(hub, "nix-grpc-daemon", ends, "tt-bob", clients=[(client, "bob-chain")])
+            seq = [line for line in lines(hub, "nix-grpc-daemon", "tt-bob") if re.search(ends, line)]
             print(f"bob: {seq}")
-            expired = next(i for i, line in enumerate(seq) if "event=linger_expired " in line)
-            check(not any("event=revoked_running " in line for line in seq[:expired]), f"an untrusted user's build was revoked as its link left, not kept for the grace: {seq}")
+            check("event=linger_expired " in seq[0], f"an untrusted user's build was revoked as its link left, not kept for the grace: {seq}")
             check(of("bob", "event=lingering") == 0, "an untrusted user's build was kept for a linger")
             dropped_note = ansi.sub("", client.succeed(f"cat {bob}/client-1.log"))
             check(
