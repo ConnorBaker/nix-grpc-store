@@ -470,6 +470,45 @@ void testGiveBackRemembersEveryGiver()
     assert(out.size() == 1 && out.at(0).worker == small);
 }
 
+// w0's last publish failed: it gets builds only while no other worker has a
+// slot, its outputs do not draw builds to it, and passing over a giver does
+// not pick it either, until it can publish again.
+void testFaulty()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 3);
+    auto const w1 = hello(shard, "w1", 2);
+    shard.setFaulty(w0, true);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.want(1, {.drvPath = "b.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.want(1, {.drvPath = "c.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 3 && out.at(0).worker == w1 && out.at(1).worker == w1 && out.at(2).worker == w0); // w1 is full
+    shard.done(lease(shard, w0, "c.drv"), {{"/nix/store/c-out", 1'000'000'000}});
+    shard.done(lease(shard, w1, "a.drv"), {});
+    shard.done(lease(shard, w1, "b.drv"), {});
+    out.clear();
+    shard.want(1, {.drvPath = "d.drv", .inputs = {"/nix/store/c-out"}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.at(0).worker == w1);
+    auto const w2 = hello(shard, "w2", 1);
+    shard.giveBack(lease(shard, w1, "d.drv"), GaveBack::drv);
+    out.clear();
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.at(0).worker == w2); // w0 has more slots and the input
+    shard.done(lease(shard, w2, "d.drv"), {});
+    shard.setFaulty(w0, false);
+    out.clear();
+    shard.want(1, {.drvPath = "e.drv", .inputs = {"/nix/store/c-out"}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.at(0).worker == w0);
+    // A reconnect carries the state.
+    std::vector<Core::Superseded> sup;
+    shard.hello({.addr = "w0", .systems = {"x"}, .features = {}, .maxJobs = 3, .running = {}, .faulty = true}, sup);
+    assert(shard.worker(w0).faulty);
+}
+
 // A worker that keeps failing for a reason of its own gets no work for a
 // while, longer each time, until it finishes a build.
 void testFailingWorkerRests()
@@ -1155,6 +1194,7 @@ try {
     testHelloAdoptsQueued();
     testGiveBack();
     testGiveBackRemembersEveryGiver();
+    testFaulty();
     testFailingWorkerRests();
     testCrossSystemPriority();
     testPlaceabilityFlips();

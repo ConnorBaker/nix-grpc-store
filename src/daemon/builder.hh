@@ -149,6 +149,9 @@ public:
     }
     // The capacity changed (nix's max-jobs read anew): tell the scheduler.
     void setMaxJobs(uint32_t maxJobs);
+    // Every publish to the cache reports how it went. The scheduler hears
+    // when that changes, see Load.publish_failing.
+    void published(bool works);
 
     // Give back Expects nobody came for, or whose client went quiet. Called
     // from the serve loop.
@@ -206,6 +209,7 @@ private:
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<uint8_t> unavailable_{0};
     std::atomic<uint32_t> maxJobs_;
+    std::atomic<bool> publishFailing_{false};
     // Orders the Load messages of concurrent setUnavailable() and
     // setMaxJobs() calls, and keeps them behind the Hello of their session.
     std::mutex unavailableMutex;
