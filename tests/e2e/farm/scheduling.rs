@@ -1482,7 +1482,7 @@ impl<F> Worker2Full<F> {
     fn new(tag: &str, full: impl FnOnce() -> F) -> Self {
         let busy = format!("busy-{tag}");
         let slow = format!(
-            r#"derivation {{ name = "{busy}"; system = builtins.currentSystem; requiredSystemFeatures = [ "vip" ]; builder = "/bin/sh"; args = [ "-c" "/bin/sh -c 'read x < /dev/zero'; echo {tag} > $out" ]; }}"#
+            r#"derivation {{ name = "{busy}"; system = builtins.currentSystem; requiredSystemFeatures = [ "vip" ]; builder = "/bin/sh"; args = [ "-c" "/bin/sh -c ': | {{ exec 3<>/proc/self/fd/0; read x <&3; }}' slow-holding; echo {tag} > $out" ]; }}"#
         );
         spawn(&busy, &["--impure", "--expr", &slow]);
         retry_with_clients(CLIENT, &[&busy], "a slow build holds worker1", || {

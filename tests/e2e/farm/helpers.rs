@@ -11,7 +11,9 @@ pub const WORKER2: Node = Node("worker2");
 pub const WORKERS: [Node; 2] = [WORKER1, WORKER2];
 
 /// The slow builds (farm.nix), which run until released.
-pub const BUILDER: &[&str] = &["pgrep", "-f", "[r]ead x < /dev/zero"];
+/// The inner sh, its last argument, not the build's outer sh, which has
+/// more after it; [g] keeps the pattern from matching the probe's own shell.
+pub const BUILDER: &[&str] = &["pgrep", "-f", "slow-holdin[g]$"];
 
 pub fn system() -> String {
     env("NGS_SYSTEM")
