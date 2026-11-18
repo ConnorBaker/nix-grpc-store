@@ -68,8 +68,8 @@ let
     ];
     testCerts.trusted = [ "public-ca" ];
     nix.package = nixPkgs.nix-everything;
-    # The other parts keep nix's default configuration, so their builders
-    # offer their system-features alone.
+    # The other parts keep nix's default configuration, but for the
+    # ca-derivations the workers enable below.
     nix.settings.experimental-features = [
       "nix-command"
     ]
