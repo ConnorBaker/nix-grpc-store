@@ -6,6 +6,9 @@
     # Build farm mode (PLAN.md). Only the NixOS test uses it.
     niks3.url = "github:Mic92/niks3";
     niks3.inputs.nixpkgs.follows = "nixpkgs";
+    # The lease checks' hub and worker. Only those checks use it, in its own
+    # package set: the Nix its hub patches.
+    tribuchet.url = "github:ConnorBaker/tribuchet/05a14690064881247f5ae1f821e03c0f45a103e1";
   };
 
   outputs =
@@ -13,6 +16,7 @@
       self,
       nixpkgs,
       niks3,
+      tribuchet,
     }:
     let
       lib = nixpkgs.lib;
@@ -166,7 +170,7 @@
           nixPackages = nixPackagesFor nixpkgs.legacyPackages.${system};
           nixosModule = self.nixosModules.default;
           nixToolsWithPlugin = self.lib.nixToolsWithPlugin;
-          inherit niks3;
+          inherit niks3 tribuchet;
         }
       );
 
