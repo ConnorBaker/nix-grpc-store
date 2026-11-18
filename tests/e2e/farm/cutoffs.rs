@@ -357,8 +357,10 @@ fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
 fn an_upload_cut_off_after_longer_than_the_restart_grace_is_retried() {
     farm_ready();
     // An upload is answered once niks3 has it, so a stopped niks3 push holds it.
-    // Bracketed so pkill does not stop the shell running it.
-    let push = "push --[s]tdin";
+    // Bracketed so pkill does not stop the shell running it. pushFlags come
+    // between `push` and `--stdin`; the daemon's own command line names
+    // `niks3 push` but not `--stdin`.
+    let push = "push .*--[s]tdin";
     for w in WORKERS {
         let path = succeed(
             CLIENT,
@@ -510,7 +512,7 @@ fn a_builder_the_balancer_cannot_reach_hands_its_builds_to_another() {
     retry(30, "the balancer lost the builder", || {
         unhealthy(&sys).contains(&cut)
     });
-    let bounced = events(leader(), "bounced");
+    let refused = events(leader(), "refused");
     let tags = (0..4)
         .map(|i| format!("\"cut{i}\""))
         .collect::<Vec<_>>()
@@ -534,7 +536,7 @@ fn a_builder_the_balancer_cannot_reach_hands_its_builds_to_another() {
     );
     reject("-D");
     assert_eq!(o.code, 0, "{}", o.combined());
-    assert!(events(leader(), "bounced") > bounced);
+    assert!(events(leader(), "refused") > refused);
     wait_members(&sys, &WORKERS);
     retry(60, "scheduler settled", settled);
 }
