@@ -833,12 +833,26 @@ fn has_vip_build_info(line: &str) -> bool {
 #[test]
 fn required_system_features_are_placed_or_refused() {
     farm_ready();
-    // In nix's default configuration, without the experimental features
-    // that add to them, a builder offers and shows its `system-features`.
+    // A builder offers and shows its `system-features`, and what its
+    // experimental features add to them (docs/farm.md). The workers enable
+    // ca-derivations for the recovery test.
     let mut offered = Vec::new();
     for w in WORKERS {
-        let set = succeed(w, &["nix", "config", "show", "system-features"]);
-        let set = set.split_whitespace().collect::<Vec<_>>().join(",");
+        let mut set = succeed(w, &["nix", "config", "show", "system-features"])
+            .split_whitespace()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>();
+        let xp = succeed(w, &["nix", "config", "show", "experimental-features"]);
+        for (feature, adds) in [
+            ("ca-derivations", "ca-derivations"),
+            ("recursive-nix", "recursive-nix"),
+            ("dynamic-derivations", "builder-rpc-v0"),
+        ] {
+            if xp.split_whitespace().any(|f| f == feature) {
+                set.insert(adds.to_string());
+            }
+        }
+        let set = set.into_iter().collect::<Vec<_>>().join(",");
         assert_eq!(features_label(&build_info(w)), Some(set.as_str()));
         offered.extend(set.split(',').map(String::from));
     }
