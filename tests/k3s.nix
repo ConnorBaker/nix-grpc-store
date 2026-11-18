@@ -213,9 +213,6 @@ let
       };
     };
     logLevel = "debug";
-    # Above the time the test holds the slow build after deleting its pod,
-    # so a pod delete can drain it.
-    terminationGracePeriodSeconds = 60;
   };
 in
 pkgs.testers.runNixOSTest {
@@ -335,10 +332,6 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     ${import ./lib/waits.nix}
-    from datetime import timedelta
-    def sec(n: int) -> timedelta:
-        return timedelta(seconds=n)
-
     def kubectl(args: str) -> str:
         return machine.succeed("kubectl -n farm " + args)
     def release(tag: str, in_pods: list[str], unit: str) -> None:
@@ -473,7 +466,8 @@ pkgs.testers.runNixOSTest {
         busy = holder()
         assert busy is not None
         kubectl(f"delete pod {busy} --wait=false")
-        machine.sleep(duration=sec(5))
+        # The worker has its SIGTERM and drains; its build still runs after.
+        wait_stream(machine, f"kubectl -n farm logs -f {busy} -c nix-grpc-daemon", "event=draining( |$)")
         assert holder() == busy, "pod delete killed the build instead of draining"
         release("s1", [busy], "slow")
         wait_succeeds(machine, "! systemctl is-active slow")
