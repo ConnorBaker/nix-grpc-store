@@ -30,7 +30,6 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-handover-${part}";
-  globalTimeout = 540;
 
   sshBackdoor.enable = true;
   # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
@@ -88,8 +87,9 @@ pkgs.testers.runNixOSTest {
     { nodes, ... }:
     ''
       ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
-      machine.wait_for_unit("nix-daemon.socket")
-      machine.wait_for_unit("nix-grpc-daemon.socket")
+      ${import ./lib/waits.nix}
+      wait_unit(machine, "nix-daemon.socket")
+      wait_unit(machine, "nix-grpc-daemon.socket")
 
       with subtest("${part}"):
           run_e2e(

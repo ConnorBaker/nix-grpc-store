@@ -25,7 +25,6 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-acme-substituter";
-  globalTimeout = 600;
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
   # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
@@ -195,10 +194,11 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/waits.nix}
     start_all()
-    server.wait_for_unit("step-ca.service")
-    server.wait_for_unit("nix-grpc-daemon.socket")
-    server.wait_for_open_port(50051)
+    wait_unit(server, "step-ca.service")
+    wait_unit(server, "nix-grpc-daemon.socket")
+    wait_port(server, 50051)
 
     run_e2e({"server": server, "host1": host1}, {}, "acme::", "--test-threads=4")
   '';
