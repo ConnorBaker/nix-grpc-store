@@ -301,7 +301,7 @@ in
     def restart_hub():
         registered = count(hub, "tribuchet-hub", "worker registered")
         hub.succeed("systemctl restart tribuchet-hub")
-        wait_journal(hub, "tribuchet-hub", "worker registered", more_than=registered)
+        wait_journal(hub, "tribuchet-hub", "worker registered", more_than=registered, clients=[(hub, "tribuchet-hub"), (worker, "tribuchet-worker")])
 
     def of_chain(needle):
         # lines that name one of the chain's builds by id only
@@ -346,7 +346,7 @@ in
         worker.succeed("systemctl start tribuchet-worker")
         wait_succeeds(hub, "journalctl -u tribuchet-hub | grep -q 'worker registered'", clients=[(worker, "tribuchet-worker")])
         wait_unit(hub, "nix-grpc-daemon.service")
-        wait_port(hub, 50051)
+        wait_succeeds(hub, "nc -z localhost 50051")
 
   ''
   + (
@@ -391,13 +391,13 @@ in
             wait_succeeds(worker, running("blocker"), clients=[(client, "blocker")])
             qchain = chain_of("alice", "qchain", 600, unbounded, gap=True)
             # the chain's build in the scheduler's queue, then the rival behind it
-            wait_journal(hub, "nix-grpc-daemon", "event=want ", "tt-qchain")
+            wait_journal(hub, "nix-grpc-daemon", "event=want ", "tt-qchain", clients=[(client, "qchain-chain")])
             root_build("rival")
-            wait_journal(hub, "nix-grpc-daemon", "event=want ", "tt-rival")
+            wait_journal(hub, "nix-grpc-daemon", "event=want ", "tt-rival", clients=[(client, "rival")])
             end_link(qchain, "qchain-chain", 1)
             # kept (event=lingering); without the linger, forgotten without
             # a word, and the test waits here
-            wait_journal(hub, "nix-grpc-daemon", "event=lingering ", "tt-qchain")
+            wait_journal(hub, "nix-grpc-daemon", "event=lingering ", "tt-qchain", clients=[(client, "qchain-chain")])
             gap = time.monotonic()
             kept = lines(hub, "nix-grpc-daemon", "event=lingering", "tt-qchain")
             print(f"in the gap: {kept}")
@@ -409,13 +409,13 @@ in
             # a build that comes in the gap, once the slot is gone, into the
             # scheduler's queue
             root_build("late")
-            wait_journal(hub, "nix-grpc-daemon", "event=want ", "tt-late")
+            wait_journal(hub, "nix-grpc-daemon", "event=want ", "tt-late", clients=[(client, "late")])
             check(
                 first("tribuchet-hub", hub, "queueing build", "qchain") is None,
                 "the chain's build was placed with no client there to take it",
             )
             end_gap("/home/alice", "qchain-chain", gap)
-            wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-qchain")
+            wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-qchain", clients=[(client, "qchain-chain")])
             # the next slot frees with the chain's link back
             release("rival")
             wait_succeeds(client, f"test -s {qchain}/status.json", clients=[(client, "qchain-chain")])
@@ -453,7 +453,8 @@ in
             check(not procs, f"the lease id is on a command line: {procs}")
             stopped_at = time.monotonic()
             client.succeed("systemctl stop --no-block stopme-chain")
-            wait_journal(hub, "nix-grpc-daemon", "event=revoked_running ", "tt-stopme")
+            # the chain ends once its release is answered, after the revoke
+            wait_journal(hub, "nix-grpc-daemon", "event=revoked_running ", "tt-stopme", clients=[(client, "stopme-chain")])
             took = time.monotonic() - stopped_at
             wait_succeeds(client, f"test -s {stop}/status.json")
             status = json.loads(client.succeed(f"cat {stop}/status.json"))
@@ -483,7 +484,8 @@ in
             # the link leaves without releasing: SIGKILL, no trap
             left_at = time.monotonic()
             client.succeed("systemctl kill --signal=SIGKILL racer-chain")
-            wait_journal(hub, "nix-grpc-daemon", "event=revoked_running ", "tt-racer")
+            # the link is gone: the scheduler is the one to log it
+            wait_journal(hub, "nix-grpc-daemon", "event=revoked_running ", "tt-racer", clients=[(hub, "nix-grpc-daemon")])
             took = time.monotonic() - left_at
             print(f"racer: revoked {took:.1f} s after its link was killed; lingering {of('racer', 'event=lingering')}")
             check(of("racer", "event=lingering") == 0, "the released lease kept the build once its link left")
@@ -510,7 +512,7 @@ in
             end_link(chain, "chain", 1)
             # the first client is gone: the scheduler has kept the build, or
             # (without the linger) revoked it
-            wait_journal(hub, "nix-grpc-daemon", "event=(lingering|revoked_running) ", "tt-chain")
+            wait_journal(hub, "nix-grpc-daemon", "event=(lingering|revoked_running) ", "tt-chain", clients=[(client, "chain")])
             gap = time.monotonic()
             before = seen()
             print(f"in the first gap: {before}")
@@ -532,7 +534,7 @@ in
             hub.succeed("systemctl kill --signal=SIGKILL hold2")
             wait_succeeds(worker, "pkill -KILL -f 'hold2-marker-runnin[g]'")
             end_gap("/home/alice", "chain", gap)
-            wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-chain")
+            wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-chain", clients=[(client, "chain")])
 
         with subtest("a gap while it runs and other builds wait for its slot"):
             hub.succeed(
@@ -542,13 +544,13 @@ in
             )
             wait_succeeds(hub, "journalctl -u tribuchet-hub | grep 'queueing build' | grep -qE 'tt-after-1([^0-9]|$)'", clients=[(hub, "after")])
             end_link(chain, "chain", 2)
-            wait_journal(hub, "nix-grpc-daemon", "event=(lingering|revoked_running) ", "tt-chain", more_than=1)
+            wait_journal(hub, "nix-grpc-daemon", "event=(lingering|revoked_running) ", "tt-chain", more_than=1, clients=[(client, "chain")])
             gap = time.monotonic()
             # the second client is gone, and a build waits for the slot
             check(hub.execute("test -s /tmp/after-1.path", timeout=None)[0] != 0, "no build waited in the second gap")
             restart_hub()
             end_gap("/home/alice", "chain", gap)
-            wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-chain", more_than=1)
+            wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-chain", more_than=1, clients=[(client, "chain")])
             release("chain")
             wait_succeeds(client, f"test -s {chain}/status.json", clients=[(client, "chain")])
             status = json.loads(client.succeed(f"cat {chain}/status.json"))

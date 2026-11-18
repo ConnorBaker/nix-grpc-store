@@ -151,8 +151,7 @@ pkgs.testers.runNixOSTest {
     ${import ./lib/waits.nix}
     start_all()
     wait_unit(lb, "niks3.service")
-    wait_port(lb, 5751)
-    wait_port(lb, 50051)
+    wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")
     for node in [dialled, tunnelled1, tunnelled2]:
         node.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 
@@ -196,7 +195,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a farm of tunnelled builders answers store queries too"):
         lb.succeed("/run/current-system/specialisation/tunnelsOnly/bin/switch-to-configuration test")
-        wait_port(lb, 50051)
+        wait_succeeds(lb, "nc -z localhost 50051")
         tunnelled2.succeed(f"test -e {build('alone', 'two')}")
         assert requests("tunnelled") > 0, "the build did not go through a tunnel"
         assert requests("tunnelled-any") > 0, "store queries did not go through a tunnel"
