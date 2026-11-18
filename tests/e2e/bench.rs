@@ -70,7 +70,7 @@ fn perf_profile_of_grpc_copy() {
             "--",
         ];
         stat.extend(copy_cmd(uri, &path));
-        let o = run_t(&stat, 600);
+        let o = run(&stat);
         assert_eq!(o.code, 0, "{}", o.combined());
         println!("[perf-stat {label}]\n{}", o.combined());
     }

@@ -39,7 +39,6 @@ pub struct Out {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
-    pub timed_out: bool,
     /// ssh itself failed (exit 255) and the command never reported its
     /// status, so we do not know whether it ran to the end. A command that
     /// returns 255 on its own still reports, so it is not mistaken for this.
@@ -60,7 +59,8 @@ fn drain<R: Read + Send + 'static>(mut r: R) -> thread::JoinHandle<String> {
     })
 }
 
-fn run_once(node: Node, cmd: &str, timeout: Duration) -> Out {
+/// Runs `cmd` on `node` to its end, however long it takes.
+fn run_once(node: Node, cmd: &str) -> Out {
     let mut child = Command::new(env("NGS_SSH"))
         .args(ssh_args(node))
         .arg(format!(
@@ -74,20 +74,7 @@ fn run_once(node: Node, cmd: &str, timeout: Duration) -> Out {
     // Readers keep a chatty command from filling the pipe and blocking.
     let out = drain(child.stdout.take().unwrap());
     let err = drain(child.stderr.take().unwrap());
-
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(s) = child.try_wait().expect("try_wait") {
-            break s;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            timed_out = true;
-            break child.wait().expect("wait after kill");
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
+    let status = child.wait().expect("wait");
     let mut stdout = out.join().unwrap();
     // ssh exits 255 when the remote command dies from a signal, so the
     // command's own status travels in the output.
@@ -103,7 +90,6 @@ fn run_once(node: Node, cmd: &str, timeout: Duration) -> Out {
         code,
         stdout,
         stderr: err.join().unwrap(),
-        timed_out,
         lost,
     }
 }
@@ -139,13 +125,8 @@ fn ensure_ready(node: Node) {
     if ready.contains(&node.0) {
         return;
     }
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while run_once(node, "true", Duration::from_secs(20)).code != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "ssh backdoor of {} never became ready",
-            node.0
-        );
+    // No deadline: a backdoor that never comes up hangs the run.
+    while run_once(node, "true").code != 0 {
         thread::sleep(Duration::from_millis(500));
     }
     ready.push(node.0);
@@ -157,7 +138,7 @@ fn ensure_ready(node: Node) {
 fn retrying(repeatable: bool, mut attempt: impl FnMut() -> Out) -> Out {
     let mut o = attempt();
     for _ in 0..4 {
-        if o.timed_out || !o.lost || !(repeatable || connect_failed(&o.stderr)) {
+        if !o.lost || !(repeatable || connect_failed(&o.stderr)) {
             break;
         }
         thread::sleep(Duration::from_secs(2));
@@ -184,19 +165,11 @@ fn shell_join(argv: &[&str]) -> String {
     argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
 }
 
-fn run(node: Node, argv: &[&str], secs: u64, repeatable: bool) -> Out {
+fn run_ssh(node: Node, argv: &[&str], repeatable: bool) -> Out {
     let cmd = shell_join(argv);
     let cmd = cmd.as_str();
     ensure_ready(node);
-    let o = retrying(repeatable, || {
-        run_once(node, cmd, Duration::from_secs(secs))
-    });
-    assert!(
-        !o.timed_out,
-        "[{}] timed out after {secs}s: {cmd}\n{}",
-        node.0,
-        o.combined()
-    );
+    let o = retrying(repeatable, || run_once(node, cmd));
     assert!(
         !o.lost,
         "[{}] ssh connection lost: {cmd}\n{}",
@@ -206,8 +179,9 @@ fn run(node: Node, argv: &[&str], secs: u64, repeatable: bool) -> Out {
     o
 }
 
-pub fn run_t(node: Node, argv: &[&str], secs: u64) -> Out {
-    run(node, argv, secs, false)
+/// Runs `argv` on `node` to its end, whatever its status.
+pub fn run(node: Node, argv: &[&str]) -> Out {
+    run_ssh(node, argv, false)
 }
 
 /// An argv of `String`s as one of `&str`s.
@@ -217,7 +191,7 @@ pub fn strs(args: &[String]) -> Vec<&str> {
 
 fn expect_ok(node: Node, argv: &[&str], repeatable: bool) -> String {
     let cmd = shell_join(argv);
-    let o = run(node, argv, 300, repeatable);
+    let o = run_ssh(node, argv, repeatable);
     assert_eq!(
         o.code,
         0,
@@ -241,7 +215,7 @@ pub fn query(node: Node, argv: &[&str]) -> String {
 
 pub fn fail(node: Node, argv: &[&str]) -> String {
     let cmd = shell_join(argv);
-    let o = run_t(node, argv, 300);
+    let o = run(node, argv);
     assert_ne!(
         o.code,
         0,
@@ -252,34 +226,34 @@ pub fn fail(node: Node, argv: &[&str]) -> String {
     o.combined()
 }
 
-pub fn wait_until_succeeds(node: Node, argv: &[&str], secs: u64) {
-    let cmd = shell_join(argv);
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    loop {
-        let o = run(node, argv, 60, true);
-        if o.code == 0 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "[{}] not true after {secs}s: {cmd}\nlast output (exit {}): {}",
-            node.0,
-            o.code,
-            o.combined()
-        );
+/// Re-runs `argv` until it succeeds, with no deadline: for a state the node
+/// gives no event of. One that never comes hangs the test.
+pub fn wait_until_succeeds(node: Node, argv: &[&str]) {
+    while run_ssh(node, argv, true).code != 0 {
         thread::sleep(Duration::from_millis(500));
     }
 }
 
+/// Waits for `unit` to be active. A unit that failed never gets there by
+/// itself, so that ends the wait too, showing its journal.
 pub fn wait_for_unit(node: Node, unit: &str) {
-    wait_until_succeeds(node, &["systemctl", "is-active", unit], 120);
+    loop {
+        match unit_state(node, unit).as_str() {
+            "active" => return,
+            "failed" => panic!(
+                "[{}] {unit} failed while waited for:\n{}",
+                node.0,
+                journal(node, unit)
+            ),
+            _ => thread::sleep(Duration::from_millis(500)),
+        }
+    }
 }
 
 pub fn wait_for_open_port(node: Node, port: u16) {
     wait_until_succeeds(
         node,
         &["bash", "-c", &format!(": < /dev/tcp/127.0.0.1/{port}")],
-        60,
     );
 }
 
@@ -337,7 +311,7 @@ pub fn journal_matches(node: Node, unit: &str, pattern: &str) -> Vec<String> {
         "--grep",
         &regex,
     ];
-    let o = run(node, &argv, 300, true);
+    let o = run_ssh(node, &argv, true);
     // 1: no line matched.
     assert!(
         o.code <= 1,
@@ -377,16 +351,18 @@ pub fn assert_no_journal(node: Node, unit: &str, pattern: &str) {
     );
 }
 
-pub fn wait_journal_above(node: Node, unit: &str, pattern: &str, before: u64, secs: u64) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while journal_count(node, unit, pattern) <= before {
-        assert!(
-            Instant::now() < deadline,
-            "[{}] journal of {unit} never got a new line matching: {pattern}",
-            node.0
-        );
-        thread::sleep(Duration::from_millis(500));
-    }
+/// Waits for `unit`'s journal to have more than `before` lines matching
+/// `pattern`, as journal_count counts them. An event: journalctl -f hands
+/// over each line as it is written, and awk ends at the one past `before`;
+/// journalctl is killed then. No deadline.
+pub fn wait_journal_above(node: Node, unit: &str, pattern: &str, before: u64) {
+    let script = r#"coproc J { exec journalctl -u "$1" -f -q --no-tail --no-pager --case-sensitive=true --grep "$2" 2>/dev/null </dev/null; }
+p=$J_PID
+awk -v n="$3" 'NR > n { f = 1; exit } END { exit !f }' <&"${J[0]}" && r=0 || r=$?
+kill "$p" 2>/dev/null || true
+exit $r"#;
+    let (regex, n) = (grep_pattern(pattern), before.to_string());
+    query(node, &["bash", "-c", script, "follow", unit, &regex, &n]);
 }
 
 pub fn write_file(node: Node, path: &str, content: &str) {
@@ -403,10 +379,31 @@ pub fn write_file(node: Node, path: &str, content: &str) {
     );
 }
 
-pub fn retry(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
+/// Re-checks `f` until it holds, with no deadline: for a state the nodes
+/// give no event of. `what` names it for whoever reads a hung run.
+pub fn retry(what: &str, mut f: impl FnMut() -> bool) {
+    println!("[e2e] waiting: {what}");
     while !f() {
-        assert!(Instant::now() < deadline, "not true after {secs}s: {what}");
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// `retry`, for a state that `node`'s units `clients` bring about: one of
+/// them no longer active, with the state still not there, can never bring
+/// it about, which ends the wait too, a failure showing its journal.
+pub fn retry_with_clients(node: Node, clients: &[&str], what: &str, mut f: impl FnMut() -> bool) {
+    println!("[e2e] waiting: {what}");
+    loop {
+        if f() {
+            return;
+        }
+        if let Some(c) = clients.iter().find(|c| unit_state(node, c) != "active") {
+            // It may have brought the state about just before it ended.
+            if f() {
+                return;
+            }
+            panic!("[{}] {c} ended before: {what}\n{}", node.0, journal(node, c));
+        }
         thread::sleep(Duration::from_millis(500));
     }
 }
@@ -443,7 +440,6 @@ mod tests {
             code: if lost { 255 } else { 0 },
             stdout: String::new(),
             stderr: stderr.into(),
-            timed_out: false,
             lost,
         }
     }

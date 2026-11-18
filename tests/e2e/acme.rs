@@ -1,7 +1,6 @@
 //! README access-control example: step-ca and the daemon on `server`, a
 //! read-only ACME client on `host1`.
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 
 use crate::harness::*;
 
@@ -30,18 +29,9 @@ fn cert_field(field: &str) -> String {
 
 // A placeholder self-signed cert sits there until the ACME order completes.
 fn wait_for_acme_cert() {
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        let issuer = cert_field("issuer");
-        if issuer.contains("Test Intermediate CA") {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "host1 still has a placeholder certificate, issuer: {issuer}"
-        );
-        sleep(1);
-    }
+    retry("host1's certificate from the ACME order", || {
+        cert_field("issuer").contains("Test Intermediate CA")
+    });
 }
 
 fn signed_path() -> &'static str {
