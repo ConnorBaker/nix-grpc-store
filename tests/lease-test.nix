@@ -40,8 +40,9 @@
 # chain's build is forgotten and comes back behind that one. (B) An
 # untrusted user's chain declares a lease that the client's nix-daemon
 # drops: its build is kept for no lease, only for the scheduler's hold
-# for a client's return (60 s), which every broken stream gets, and its
-# next link follows it within that. (C) A trusted chain
+# for a client's return, which every broken stream gets: with its next
+# link held in its gap, the hold ends (hold_expired) before any revoke.
+# (C) A trusted chain
 # stopped (systemctl stop) while its build runs releases its lease at
 # once, instead of leaving the build kept: its revoke comes from the
 # release, with no end of a linger or of a hold before it.
@@ -219,7 +220,7 @@ in
         # These end by themselves; nothing checks how long they run.
         environment.etc."tt/qchain.nix".text = build "qchain" 15;
         environment.etc."tt/late.nix".text = build "late" 10;
-        environment.etc."tt/bob.nix".text = build "bob" 120;
+        environment.etc."tt/bob.nix".text = held "bob";
         environment.etc."tt/blocker.nix".text = held "blocker";
         environment.etc."tt/rival.nix".text = held "rival";
         environment.etc."tt/stopme.nix".text = held "stopme";
@@ -278,11 +279,11 @@ in
         # `chain` must not match `qchain`)
         wait_succeeds(worker, f"pkill -USR1 -f ' {name}-marker-runnin[g]'")
 
-    def end_link(path, unit, n):
+    def end_link(path, unit, n, user="alice"):
         # The running link ends as its CLIENT_S bound would end it, by
         # timeout's SIGALRM: it exits 124, and the next one follows into its
         # gap. Then its record is written.
-        client.succeed("pkill -ALRM -u alice -x timeout")
+        client.succeed(f"pkill -ALRM -u {user} -x timeout")
         wait_succeeds(client, f"[ $(wc -l < {path}/clients.jsonl) -ge {n} ]", clients=[(client, unit)])
 
     # The scheduler's hold for a client's return (src/daemon/scheduler.hh,
@@ -382,9 +383,11 @@ in
 
         # Links that run until the test ends them (CLIENT_S at its most, a
         # product input), builds with no time limit (RUNNING_S=0, Nix's
-        # `--timeout 0`), and a budget for following that no run reaches
-        # (QUEUE_S, a day): neither decides an outcome.
-        unbounded = "--setenv=QUEUE_S=86400 --setenv=RUNNING_S=0"
+        # `--timeout 0`), a budget for following that no run reaches
+        # (QUEUE_S, a day), and a release asked for as long as
+        # build-client.sh allows (RELEASE_S at its most, 600): none decides
+        # an outcome.
+        unbounded = "--setenv=QUEUE_S=86400 --setenv=RUNNING_S=0 --setenv=RELEASE_S=600"
 
         with subtest("(A) a gap while the chain's build waits in the scheduler's own queue"):
             root_build("blocker")
@@ -429,23 +432,36 @@ in
             wait_succeeds(client, "! systemctl is-active -q late")
 
         with subtest("(B) an untrusted user's linger is dropped: its build is kept for the hold only"):
-            bob = chain_of("bob", "bob", 20, "--setenv=QUEUE_S=0 --setenv=RUNNING_S=25 --setenv=RELEASE_S=10")
-            wait_succeeds(client, f"test -s {bob}/status.json", clients=[(client, "bob-chain")])
+            bob = chain_of("bob", "bob", 600, unbounded, gap=True)
+            wait_succeeds(worker, running("bob"), clients=[(client, "bob-chain")])
+            end_link(bob, "bob-chain", 1, user="bob")
+            # The hold ends with the next link held in its gap: the build
+            # was kept (not revoked as the link left), then let go with no
+            # lease's linger (no event=lingering), by the hold's end.
+            wait_journal(hub, "nix-grpc-daemon", "event=hold_expired ", "tt-bob", clients=[(client, "bob-chain")])
+            seq = lines(hub, "nix-grpc-daemon", "tt-bob")
+            print(f"bob: {seq}")
+            expired = next(i for i, line in enumerate(seq) if "event=hold_expired " in line)
+            check(not any("event=revoked_running " in line for line in seq[:expired]), f"an untrusted user's build was revoked as its link left, not kept for the hold: {seq}")
+            check(of("bob", "event=lingering") == 0, "an untrusted user's build was kept for a linger")
             dropped_note = ansi.sub("", client.succeed(f"cat {bob}/client-1.log"))
-            print(f"bob: lingering {of('bob', 'event=lingering')}, revoked {of('bob', 'event=revoked_running')}")
             check(
                 "ignoring the client-specified setting 'grpc-linger'" in dropped_note
                 and "ignoring the client-specified setting 'grpc-lease'" in dropped_note,
                 "the client's nix-daemon did not drop bob's grpc-linger and grpc-lease",
             )
-            check(of("bob", "event=lingering") == 0, "an untrusted user's build was kept for a linger")
-            # Links follow each other at once, so the next one comes within
-            # the hold for its return: a build revoked as its link left
-            # would be revoked before the chain ended.
-            check(of("bob", "event=revoked_running") == 0, "an untrusted user's build was revoked as its link left, not held for the next")
+            # the next link builds it again: released until the chain ends
+            wait_succeeds(client, f"python3 -c {shlex.quote(gap_word)} /home/bob/gap", clients=[(client, "bob-chain")])
+
+            def bob_done():
+                worker.execute("pkill -USR1 -f ' bob-marker-runnin[g]'", timeout=None)
+                return client.execute(f"test -s {bob}/status.json", timeout=None)[0] == 0
+
+            wait_until("bob's chain to end", bob_done, clients=[(client, "bob-chain")])
 
         with subtest("(C) a trusted chain stopped while its build runs releases it at once"):
-            stop = chain_of("alice", "stopme", 600, f"{unbounded} --setenv=RELEASE_S=15")
+            # systemd's stop takes as long as the release does
+            stop = chain_of("alice", "stopme", 600, f"{unbounded} --property=TimeoutStopSec=infinity")
             wait_succeeds(worker, running("stopme"), clients=[(client, "stopme-chain")])
             lease = client.succeed(f"cat {stop}/lease").strip()
             # the id is in the links' environment, on no command line
@@ -472,10 +488,12 @@ in
             race = chain_of("alice", "racer", 600, unbounded)
             wait_succeeds(worker, running("racer"), clients=[(client, "racer-chain")])
             lease = client.succeed(f"cat {race}/lease").strip()
-            # the release, while the chain's link still follows the build
+            # the release, while the chain's link still follows the build;
+            # its call ends at connect-timeout + 10 s (src/client/build.cc,
+            # releaseLease): with a day's, that decides nothing
             answer = client.succeed(
                 f"NIX_CONFIG='grpc-lease = {lease}'"
-                " nix store info --store 'grpc://hub:50051?insecure=1&connect-timeout=5&release-lease=true' 2>&1"
+                " nix store info --store 'grpc://hub:50051?insecure=1&connect-timeout=86400&release-lease=true' 2>&1"
             )
             print(f"racer: {answer}")
             check(f"released lease {lease[:8]} on" in answer and ": 1 builds" in answer, f"the release was not answered for the build: {answer}")
@@ -505,7 +523,7 @@ in
                 " --setenv=PATH=/etc/tt/gap:/run/current-system/sw/bin"
                 # links the test ends, no build timeout, a budget no run
                 # reaches: see the queue scenario's `unbounded`
-                " --setenv=CLIENT_S=600 --setenv=QUEUE_S=86400 --setenv=RUNNING_S=0"
+                " --setenv=CLIENT_S=600 --setenv=QUEUE_S=86400 --setenv=RUNNING_S=0 --setenv=RELEASE_S=600"
                 f" bash /etc/tt/build-client.sh {chain} {drv}"
             )
             wait_succeeds(hub, "journalctl -u tribuchet-hub | grep 'queueing build' | grep -q tt-chain", clients=[(client, "chain")])
