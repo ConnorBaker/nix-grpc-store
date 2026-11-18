@@ -305,6 +305,7 @@ struct GrpcStore::Run {
       auto * msg = batch.add_msgs();
       fillWant(msg->mutable_want(), *byId.at(jid));
       msg->mutable_want()->set_refused(exe.refused(jid));
+      msg->mutable_want()->set_bounced_assign_id(exe.refused(jid));
       bytes += msg->ByteSizeLong();
       sent.push_back(jid);
       if (bytes >= maxBatchBytes) {
