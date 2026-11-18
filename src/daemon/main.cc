@@ -1491,6 +1491,8 @@ struct Generation
     std::optional<takeover::Predecessor> predecessor;
     // Shutdown() since the takeover: GOAWAY, then it waits for the calls.
     std::thread goaway;
+    // Their idle ones end with the takeover: our server takes none after it.
+    nixgrpc::tunnel::Tunnels * tunnels = nullptr;
 
     // Until it is gone this process may not end: systemd would take that for
     // the unit's end and kill the predecessor's builds (KillMode=mixed).
@@ -1648,6 +1650,9 @@ void takeOverStep(
         // New calls on our connections go to new ones, which the successor
         // accepts. Calls in flight here go on.
         gen.goaway = std::thread([&server] -> void { server.Shutdown(); });
+        if (gen.tunnels != nullptr) {
+            gen.tunnels->stop();
+        }
         // Our scheduler's clients reconnect, to the successor's.
         coord.restarting();
         next.paused.reset();
@@ -1952,6 +1957,7 @@ try {
     coord.start(*server);
     if (tunnelled && coord.builder) {
         startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);
+        gen.tunnels = &*tunnels;
     }
     announceReady(detached, gen);
 
