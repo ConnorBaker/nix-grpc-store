@@ -144,24 +144,46 @@ nix_header_deps = [
 ]
 if host_machine.system() == 'darwin'
   plugin_link_args = ['-Wl,-undefined,dynamic_lookup']
-  module_suffix = 'dylib'
+  module_suffix_arg = '-DNIX_GRPC_MODULE_SUFFIX="dylib"'
 else
   plugin_link_args = ['-Wl,--unresolved-symbols=ignore-all']
-  module_suffix = 'so'
+  module_suffix_arg = '-DNIX_GRPC_MODULE_SUFFIX="so"'
 endif
 
-client_plugin = shared_module('nix-grpc-store',
-  sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
-  include_directories : [gen_inc, src_inc],
-  cpp_pch : do_pch ? ['pch/client_pch.hh'] : [],
+# The plugin itself: the store type and the settings, without gRPC, so that
+# the processes that never open a grpc:// store (every daemon worker, say)
+# do not load it. GrpcStoreConfig::openStore loads the gRPC client below
+# from the same directory. See src/client/store-config.hh.
+client_plugin = shared_library('nix-grpc-store',
+  sources : ['src/client/store-config.cc'],
+  include_directories : [src_inc],
   # nix_plugin_entry() skips registering the store when the running Nix
   # version differs from the one the plugin was built against.
-  cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
-  dependencies : common_deps + nix_header_deps + [openssl_dep],
+  cpp_args : nix_compat_args + [module_suffix_arg, '-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
+  dependencies : nix_header_deps + [dependency('dl')],
   link_args : plugin_link_args,
   name_prefix : '',
   install : true,
   install_dir : get_option('libdir') / 'nix' / 'nix-grpc-store-versions' / nix_soversion,
+)
+
+# The gRPC client. It links the plugin above for nixgrpc::lingerSeconds and
+# nixgrpc::leaseId alone. Its RUNPATH does not name its own directory: the
+# dynamic linker binds them to the copy the loader already opened, which has
+# the same soname (lazy-plugin checks that it does). On Darwin, @loader_path is meant
+# to find that same file; that is untested.
+shared_module('nix-grpc-store-impl',
+  sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
+  include_directories : [gen_inc, src_inc],
+  cpp_pch : do_pch ? ['pch/client_pch.hh'] : [],
+  cpp_args : nix_compat_args,
+  dependencies : common_deps + nix_header_deps + [openssl_dep],
+  link_with : client_plugin,
+  link_args : plugin_link_args,
+  name_prefix : '',
+  install : true,
+  install_dir : get_option('libdir') / 'nix' / 'nix-grpc-store-versions' / nix_soversion,
+  install_rpath : host_machine.system() == 'darwin' ? '@loader_path' : '',
 )
 
 # Loaded via nix.conf `plugin-files`. It dlopen()s the build matching the
@@ -170,7 +192,7 @@ client_plugin = shared_module('nix-grpc-store',
 
 shared_module('nix-grpc-store-loader',
   sources : ['src/client/plugin-loader.cc'],
-  cpp_args : ['-DNIX_GRPC_MODULE_SUFFIX="' + module_suffix + '"'],
+  cpp_args : [module_suffix_arg],
   dependencies : dependency('dl'),
   link_args : plugin_link_args,
   name_prefix : '',

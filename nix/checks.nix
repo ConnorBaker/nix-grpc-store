@@ -117,6 +117,28 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   };
 }
 // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+  # tests/lazy-plugin-test.cc on the installed dispatcher, opened through a
+  # symlink (as from a profile) that is switched to an output with a broken
+  # client after the plugin is loaded: the client must come from the output
+  # the plugin was mapped from.
+  lazy-plugin =
+    pkgs.runCommandCC "nix-grpc-store-lazy-plugin"
+      {
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ nixPackages.nix-store ];
+      }
+      ''
+        $CXX -std=c++23 -UNDEBUG -o lazy-plugin-test ${../tests/lazy-plugin-test.cc} \
+          $(pkg-config --cflags --libs nix-store) -ldl
+        other=other/lib/nix/nix-grpc-store-versions/$(basename ${packages.default}/lib/nix/nix-grpc-store-versions/*)
+        mkdir -p $other
+        echo broken > $other/nix-grpc-store-impl.so
+        ln -s ${packages.plugin-dispatcher} current
+        HOME=$TMPDIR NIX_STATE_DIR=$TMPDIR/state \
+          ./lazy-plugin-test current/lib/nix/plugins/nix-grpc-store-loader.so current other
+        touch $out
+      '';
+
   sanitize-smoke = import ../tests/sanitize-smoke.nix {
     inherit pkgs;
     nix = nixPackages.nix-everything;
