@@ -26,7 +26,7 @@ Builder::Builder(Config config, Metrics & metrics)
     , metrics(metrics)
     , maxJobs_(this->config.maxJobs)
 {
-    for (auto const why : {Unavailable::stopping, Unavailable::lowDisk, Unavailable::localDaemonDown}) {
+    for (auto const why : {Unavailable::stopping, Unavailable::localDaemonDown}) {
         metrics.unavailable(name(why), false);
     }
 }
