@@ -200,7 +200,7 @@ pub fn unhealthy(cluster: &str) -> Vec<Node> {
 pub fn wait_members(cluster: &str, want: &[Node]) {
     let mut want = want.to_vec();
     want.sort_by_key(|n| n.0);
-    retry(&format!("healthy members of {cluster} are {want:?}"), || {
+    retry(&[], &format!("healthy members of {cluster} are {want:?}"), || {
         let mut got = members(cluster);
         got.sort_by_key(|n| n.0);
         got == want
@@ -235,7 +235,7 @@ pub fn farm_ready() {
     static READY: Once = Once::new();
     READY.call_once(|| {
         wait_members(&system(), &WORKERS);
-        retry("one scheduler with both workers", settled);
+        retry(&[], "one scheduler with both workers", settled);
     });
     // A test that stopped a daemon and then failed must not fail every later one.
     for w in WORKERS {
@@ -248,7 +248,7 @@ pub fn farm_ready() {
             ],
         );
     }
-    retry("one scheduler with both workers", settled);
+    retry(&[], "one scheduler with both workers", settled);
 }
 
 pub fn building() -> Vec<Node> {
@@ -290,7 +290,7 @@ pub fn spawn_build(unit: &str, tag: &str) {
 /// may start again (moved, or rebuilt after its builder died) after a
 /// release, which a slow build no longer ends by itself.
 pub fn release_until_done(unit: &str) {
-    retry(&format!("{unit} ended, its slow builds released"), || {
+    retry(&[], &format!("{unit} ended, its slow builds released"), || {
         release_slow();
         run(CLIENT, &["systemctl", "is-active", unit]).code != 0
     });
@@ -312,7 +312,7 @@ pub fn assert_unit_success(unit: &str) {
 
 /// Waits for a slow build to run, which the client in `unit` asked for.
 pub fn wait_building(unit: &str) {
-    retry_with_clients(CLIENT, &[unit], "a slow build is running", || {
+    retry(&[(CLIENT, unit)],"a slow build is running", || {
         !building().is_empty()
     });
 }
@@ -457,5 +457,5 @@ pub fn restart_daemon(w: Node) {
         ],
     );
     wait_members(&system(), &WORKERS);
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
 }

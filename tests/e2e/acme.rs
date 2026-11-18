@@ -29,7 +29,7 @@ fn cert_field(field: &str) -> String {
 
 // A placeholder self-signed cert sits there until the ACME order completes.
 fn wait_for_acme_cert() {
-    retry("host1's certificate from the ACME order", || {
+    retry(&[], "host1's certificate from the ACME order", || {
         cert_field("issuer").contains("Test Intermediate CA")
     });
 }

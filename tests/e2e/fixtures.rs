@@ -121,8 +121,8 @@ pub fn assert_no_journal(unit: &str, pattern: &str) {
     harness::assert_no_journal(MACHINE, unit, pattern);
 }
 
-pub fn wait_journal_above(unit: &str, pattern: &str, before: u64) {
-    harness::wait_journal_above(MACHINE, unit, pattern, before);
+pub fn wait_journal_above(unit: &str, pattern: &str, before: u64, clients: &[&str]) {
+    harness::wait_journal_above(MACHINE, unit, pattern, before, clients);
 }
 
 pub fn write_file(path: &str, content: &str) {

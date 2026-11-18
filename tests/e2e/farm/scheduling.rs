@@ -256,7 +256,7 @@ fn two_clients_wanting_the_same_drv_build_it_once() {
     spawn_build("dedup1", "dedup");
     wait_building("dedup1");
     spawn_build("dedup2", "dedup");
-    retry_with_clients(CLIENT, &["dedup2"], "the second client attached", || {
+    retry(&[(CLIENT, "dedup2")],"the second client attached", || {
         attached() > before
     });
     release_slow();
@@ -368,7 +368,7 @@ fn the_first_client_leaving_does_not_fail_the_second() {
     spawn_build("share1", "share");
     wait_building("share1");
     spawn_build("share2", "share");
-    retry_with_clients(CLIENT, &["share2"], "the second client attached", || {
+    retry(&[(CLIENT, "share2")],"the second client attached", || {
         attached() > before
     });
     succeed(CLIENT, &["systemctl", "kill", "-s", "INT", "share1"]);
@@ -691,7 +691,7 @@ fn a_failed_upload_fails_the_build_instead_of_rebuilding_it() {
     release_slow();
     wait_unit_done("pubdown");
     drop(unblock);
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
     let log = journal(CLIENT, "pubdown");
     assert_ne!(unit_result(CLIENT, "pubdown"), "success", "{log}");
     assert!(log.contains("publish failed"), "{log}");
@@ -735,11 +735,11 @@ fn stop_publishing(broken: Node) -> Restore {
     // --collect: two tests stop a copy of this name, which then failed.
     let argv = ["systemd-run", "--collect", "--unit", copy, "nix", "copy", "--no-check-sigs", "--to", &to, &path];
     succeed(CLIENT, &argv);
-    retry_with_clients(CLIENT, &[copy], "the scheduler hears that the builder cannot publish", || {
+    retry(&[(CLIENT, copy)],"the scheduler hears that the builder cannot publish", || {
         failing() > before
     });
     succeed(CLIENT, &["systemctl", "stop", copy]);
-    retry("the balancer sends the builder nothing", || !members(&sys).contains(&broken));
+    retry(&[], "the balancer sends the builder nothing", || !members(&sys).contains(&broken));
     mounted
 }
 
@@ -792,7 +792,7 @@ fn a_builder_that_cannot_publish_gets_no_work_while_another_can_take_it() {
     assert_eq!(o.code, 0, "{}", o.combined());
     assert_eq!(built() - built_before, 0, "{}", o.combined());
     wait_members(&sys, &WORKERS);
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
 }
 
 /// Only a publish tells a builder that publishing works again, and it gets
@@ -822,15 +822,15 @@ fn a_builder_that_can_publish_again_gets_a_build_once_the_other_is_full() {
         CLIENT,
         &["systemd-run", "--unit", "full", "nix", "build", "--store", &envoy(), "--eval-store", "auto", "--impure", "--expr", &burst],
     );
-    retry_with_clients(CLIENT, &["full"], "the builder takes the build the other has no slot for", || {
+    retry(&[(CLIENT, "full")],"the builder takes the build the other has no slot for", || {
         building().contains(&broken)
     });
     release_until_done("full");
     assert_unit_success("full");
     assert_eq!(built() - built_before, 1);
-    retry("its publish brings the builder back", || members(&sys).contains(&broken));
+    retry(&[], "its publish brings the builder back", || members(&sys).contains(&broken));
     drop(mounted);
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
 }
 
 #[test]
@@ -839,7 +839,7 @@ fn interrupting_the_client_stops_the_build_on_the_worker() {
     spawn_build("intr", "intr");
     wait_building("intr");
     succeed(CLIENT, &["systemctl", "kill", "-s", "INT", "intr"]);
-    retry("the build stopped", || building().is_empty());
+    retry(&[], "the build stopped", || building().is_empty());
 }
 
 #[test]
@@ -875,10 +875,10 @@ fn queue_gauges_show_a_burst_while_every_build_blocks() {
     );
     // The Wants arrive within a second and nothing else happens until a build
     // ends, so only the trailing export can show the queue.
-    retry_with_clients(CLIENT, &["burst"], "two builds queued", || queued() == 2);
+    retry(&[(CLIENT, "burst")],"two builds queued", || queued() == 2);
     release_until_done("burst");
     assert_unit_success("burst");
-    retry("queue empty", || queued() == 0);
+    retry(&[], "queue empty", || queued() == 0);
     let waits = gauge(
         leader(),
         &format!(r#"nix_grpc_queue_seconds_count{{system="{sys}"}}"#),
@@ -984,7 +984,7 @@ fn required_system_features_are_placed_or_refused() {
         r#"nix_grpc_sched_system{{features="gpu",kind="unplaceable",system="{}"}}"#,
         system()
     );
-    retry_with_clients(CLIENT, &["gpu"], "one unplaceable build", || {
+    retry(&[(CLIENT, "gpu")],"one unplaceable build", || {
         gauge(leader(), &unplaceable) == 1
     });
     wait_unit_done("gpu");
@@ -992,7 +992,7 @@ fn required_system_features_are_placed_or_refused() {
     assert_eq!(unit_result(CLIENT, "gpu"), "exit-code", "{out}");
     let why = format!("features {{gpu}}, the workers offer {{{}}}", offered.join(","));
     assert!(out.contains(&why), "{out}");
-    retry("no unplaceable build", || gauge(leader(), &unplaceable) == 0);
+    retry(&[], "no unplaceable build", || gauge(leader(), &unplaceable) == 0);
 }
 
 fn farm_gives(path: &str) {
@@ -1345,12 +1345,12 @@ fn sighup_rereads_nix_max_jobs_and_the_scheduler_counts_it() {
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert_eq!(own(), own0);
     hup();
-    wait_journal_above(WORKER1, UNIT, "event=max_jobs ", reads0);
-    retry("worker1 took nix's new max-jobs", || own() == own0 + 3);
-    retry("the scheduler counts the new slots", || total() == total0 + 3);
+    wait_journal_above(WORKER1, UNIT, "event=max_jobs ", reads0, &[UNIT]);
+    retry(&[], "worker1 took nix's new max-jobs", || own() == own0 + 3);
+    retry(&[], "the scheduler counts the new slots", || total() == total0 + 3);
     succeed(WORKER1, &["rm", conf]);
     hup();
-    retry("back to nix.conf's own max-jobs", || {
+    retry(&[], "back to nix.conf's own max-jobs", || {
         own() == own0 && total() == total0
     });
     assert_eq!(pid(), pid0, "nix-grpc-daemon restarted");
@@ -1370,7 +1370,7 @@ impl<F> Worker2Full<F> {
             r#"derivation {{ name = "{busy}"; system = builtins.currentSystem; requiredSystemFeatures = [ "vip" ]; builder = "/bin/sh"; args = [ "-c" "/bin/sh -c ': | {{ exec 3<>/proc/self/fd/0; read x <&3; }}' slow-holding; echo {tag} > $out" ]; }}"#
         );
         spawn(&busy, &["--impure", "--expr", &slow]);
-        retry_with_clients(CLIENT, &[&busy], "a slow build holds worker1", || {
+        retry(&[(CLIENT, &busy)],"a slow build holds worker1", || {
             building() == [WORKER1]
         });
         Worker2Full { busy, _full: full() }
@@ -1388,7 +1388,7 @@ impl<F> Worker2Full<F> {
         let (before, calls) = (given(), build_calls(WORKER2));
         let unit = format!("{}-build", self.busy);
         spawn(&unit, &[format!("{drv}^*").as_str()]);
-        retry("worker2 gave the drv back, or the build ended", || {
+        retry(&[], "worker2 gave the drv back, or the build ended", || {
             given() > before || unit_state(CLIENT, &unit) != "active"
         });
         assert!(build_calls(WORKER2) > calls, "worker2 never got the drv");
@@ -1613,7 +1613,7 @@ fn a_drv_the_cache_lost_fails_as_missing() {
     );
     let out = o.combined();
     assert!(o.code != 0 && out.contains("missing: ") && !out.contains("gave up"), "{out}");
-    retry("the lease ended", || done() > before);
+    retry(&[], "the lease ended", || done() > before);
 }
 
 /// Both workers low on disk but not out of it, and the cache lost the drv:

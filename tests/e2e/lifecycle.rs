@@ -1,5 +1,5 @@
 use crate::fixtures::*;
-use crate::harness::{MACHINE, journal_count, query, retry, retry_with_clients, unit_result};
+use crate::harness::{MACHINE, journal_count, query, retry, unit_result};
 
 #[test]
 fn idle_exit_and_socket_activation() {
@@ -12,7 +12,7 @@ fn idle_exit_and_socket_activation() {
     let pid = query(MACHINE, &["systemctl", "show", "-P", "MainPID", "nix-grpc-daemon.service"]);
     // The daemon exits when idle: its line and then its process gone, which
     // no new activation undoes, unlike the unit's state.
-    wait_journal_above("nix-grpc-daemon", "event=idle_exit", idle0);
+    wait_journal_above("nix-grpc-daemon", "event=idle_exit", idle0, &[]);
     wait_until_succeeds(&["sh", "-c", &format!("! test -d /proc/{}", pid.trim())]);
     succeed(&["nix", "store", "info", "--store", STORE]);
 }
@@ -84,7 +84,7 @@ fn a_failed_connection_while_nix_daemon_is_down_does_not_poison_the_worker() {
     argv.extend(build_argv(&store, "/tmp/reconnect.nix"));
     succeed(&argv);
     let lost = "local nix-daemon connection lost";
-    retry_with_clients(MACHINE, &[down], "the RPC reached the unavailable daemon", || {
+    retry(&[(MACHINE, down)],"the RPC reached the unavailable daemon", || {
         journal_count(MACHINE, down, lost) > 0
     });
     // Still running, or ended by itself with a failure: a stopped unit
@@ -122,7 +122,7 @@ fn renewed_server_certificate_is_served_without_restart() {
         "bash",
         &d,
     ]);
-    retry("the server presents the renewed certificate", || {
+    retry(&[], "the server presents the renewed certificate", || {
         // s_client may exit non-zero because the server wants a client
         // certificate, so only the printed SANs count.
         let sans = succeed(&[
