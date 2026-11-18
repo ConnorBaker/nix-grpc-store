@@ -692,7 +692,8 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
         client.send(reply);
         return;
     }
-    if (auto const wid = core.refuse(client.id, want.drv_path(), want.refused())) {
+    if (auto const wid =
+            core.refuse(client.id, want.drv_path(), want.refused() != 0 ? want.refused() : want.bounced_assign_id())) {
         revokeOn(*wid, want.drv_path());
         metrics.event("refused");
     }

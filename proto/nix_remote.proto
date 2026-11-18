@@ -173,6 +173,9 @@ message Want {
   // The assignment this client got for the drv and whose worker would not
   // serve it. The scheduler places the drv on another worker.
   uint64 refused = 11;
+  // `refused` as clients before it name it. Clients send both, so that
+  // schedulers before `refused` read it too.
+  uint64 bounced_assign_id = 8;
   // Seconds to keep this drv's build once no client follows it any more,
   // because this client will ask for it again: a chain of time-bounded
   // `nix build`s, each started as the last one ends. Until that long after
