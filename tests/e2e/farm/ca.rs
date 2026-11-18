@@ -157,7 +157,7 @@ fn a_second_client_attaches_to_a_floating_build() {
             wait_building(unit);
         }
     }
-    retry_with_clients(CLIENT, &["ca-share2"], "the second client attached", || {
+    retry(&[(CLIENT, "ca-share2")],"the second client attached", || {
         attached() - before == 1
     });
     release_slow();
