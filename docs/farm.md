@@ -562,9 +562,9 @@ isn't in `accessRules`.
 
 **`no connected, non-draining worker for system … offers features {…}`** —
 no builder for that system (with those `system-features`) is connected
-to the scheduler, or all of them are low on disk, stopping, or have a
-local nix-daemon that does not answer. Each builder says which in
-`nix_grpc_unavailable{reason="stopping|low_disk|local_daemon"}` and in
+to the scheduler, or all of them are stopping or have a local
+nix-daemon that does not answer. Each builder says which in
+`nix_grpc_unavailable{reason="stopping|local_daemon"}` and in
 its journal (`event=unhealthy`). The client
 prints this as a warning and waits two minutes before giving up, because
 right after a scheduler restart the builders may still be reconnecting.
