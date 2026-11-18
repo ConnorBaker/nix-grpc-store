@@ -15,6 +15,10 @@
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/file-system.hh>
+// Late 2.36 moved SysError out of error.hh.
+#if __has_include(<nix/util/system-error.hh>)
+#  include <nix/util/system-error.hh>
+#endif
 
 #include "logfmt.hh"
 

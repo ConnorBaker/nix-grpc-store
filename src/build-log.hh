@@ -21,7 +21,6 @@
 namespace nixgrpc {
 
 // An error reported by the backend daemon, as opposed to a malformed stream.
-#if NIX_COMPAT_AT_LEAST(2, 34)
 class BackendError final : public nix::CloneableError<BackendError, nix::Error>
 {
 #if NIX_COMPAT_AT_LEAST(2, 35)
@@ -31,13 +30,6 @@ class BackendError final : public nix::CloneableError<BackendError, nix::Error>
 public:
     using CloneableError<BackendError, nix::Error>::CloneableError;
 };
-#else
-class BackendError final : public nix::Error
-{
-public:
-    using Error::Error;
-};
-#endif
 
 constexpr size_t kMaxLogString = size_t{1} << 20U;
 

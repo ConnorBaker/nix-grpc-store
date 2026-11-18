@@ -43,8 +43,9 @@ endif
 # See src/macro-compat.hh: gRPC has to be parsed before nix/util/error.hh.
 add_project_arguments('-include', meson.current_source_dir() / 'src' / 'macro-compat.hh', language : 'cpp')
 
-nix_store_dep = dependency('nix-store')
-nix_util_dep  = dependency('nix-util')
+# Nix 2.34 or newer: nix/packages/default.nix.
+nix_store_dep = dependency('nix-store', version : '>=2.34')
+nix_util_dep  = dependency('nix-util', version : '>=2.34')
 
 if build_server
   # glibc malloc stalls the scheduler for 5-40 ms consolidating its heap after
@@ -74,11 +75,20 @@ has_add_temp_roots = cxx.compiles('''
 void f(nix::Store & s) { s.addTempRoots({}); }
 ''', dependencies : [nix_store_dep, nix_util_dep], name : 'Store::addTempRoots')
 
+# Store::queryMissing with an evaluation store (Nix pull request 16433) is only in
+# the Nix forks that carry that PR; released Nix and master have the
+# one-argument virtual alone.
+has_query_missing_eval_store = cxx.compiles('''
+#include <nix/store/store-api.hh>
+void f(nix::Store & s) { static_cast<void>(s.queryMissing({}, &s)); }
+''', dependencies : [nix_store_dep, nix_util_dep], name : 'Store::queryMissing with an evaluation store')
+
 # Version macros for src/nix-compat.hh.
 nix_compat_args = [
   '-DNIX_COMPAT_VERSION_MAJOR=' + nix_ver[0],
   '-DNIX_COMPAT_VERSION_MINOR=' + nix_ver_minor,
   '-DNIX_COMPAT_HAS_ADD_TEMP_ROOTS=' + (has_add_temp_roots ? '1' : '0'),
+  '-DNIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE=' + (has_query_missing_eval_store ? '1' : '0'),
 ]
 
 # --- protobuf / gRPC codegen -----------------------------------------------
@@ -144,24 +154,46 @@ nix_header_deps = [
 ]
 if host_machine.system() == 'darwin'
   plugin_link_args = ['-Wl,-undefined,dynamic_lookup']
-  module_suffix = 'dylib'
+  module_suffix_arg = '-DNIX_GRPC_MODULE_SUFFIX="dylib"'
 else
   plugin_link_args = ['-Wl,--unresolved-symbols=ignore-all']
-  module_suffix = 'so'
+  module_suffix_arg = '-DNIX_GRPC_MODULE_SUFFIX="so"'
 endif
 
-shared_module('nix-grpc-store',
-  sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
-  include_directories : [gen_inc, src_inc],
-  cpp_pch : do_pch ? ['pch/client_pch.hh'] : [],
+# The plugin itself: the store type and the settings, without gRPC, so that
+# the processes that never open a grpc:// store (every daemon worker, say)
+# do not load it. GrpcStoreConfig::openStore loads the gRPC client below
+# from the same directory. See src/client/store-config.hh.
+client_plugin = shared_library('nix-grpc-store',
+  sources : ['src/client/store-config.cc'],
+  include_directories : [src_inc],
   # nix_plugin_entry() skips registering the store when the running Nix
   # version differs from the one the plugin was built against.
-  cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
-  dependencies : common_deps + nix_header_deps + [openssl_dep],
+  cpp_args : nix_compat_args + [module_suffix_arg, '-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
+  dependencies : nix_header_deps + [dependency('dl')],
   link_args : plugin_link_args,
   name_prefix : '',
   install : true,
   install_dir : get_option('libdir') / 'nix' / 'nix-grpc-store-versions' / nix_soversion,
+)
+
+# The gRPC client. It links the plugin above for nixgrpc::lingerSeconds and
+# nixgrpc::leaseId alone. Its RUNPATH does not name its own directory: the
+# dynamic linker binds them to the copy the loader already opened, which has
+# the same soname (lazy-plugin checks that it does). On Darwin, @loader_path is meant
+# to find that same file; that is untested.
+shared_module('nix-grpc-store-impl',
+  sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
+  include_directories : [gen_inc, src_inc],
+  cpp_pch : do_pch ? ['pch/client_pch.hh'] : [],
+  cpp_args : nix_compat_args,
+  dependencies : common_deps + nix_header_deps + [openssl_dep],
+  link_with : client_plugin,
+  link_args : plugin_link_args,
+  name_prefix : '',
+  install : true,
+  install_dir : get_option('libdir') / 'nix' / 'nix-grpc-store-versions' / nix_soversion,
+  install_rpath : host_machine.system() == 'darwin' ? '@loader_path' : '',
 )
 
 # Loaded via nix.conf `plugin-files`. It dlopen()s the build matching the
@@ -170,7 +202,7 @@ shared_module('nix-grpc-store',
 
 shared_module('nix-grpc-store-loader',
   sources : ['src/client/plugin-loader.cc'],
-  cpp_args : ['-DNIX_GRPC_MODULE_SUFFIX="' + module_suffix + '"'],
+  cpp_args : [module_suffix_arg],
   dependencies : dependency('dl'),
   link_args : plugin_link_args,
   name_prefix : '',
@@ -211,7 +243,7 @@ if build_server
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
 
-  executable('nix-grpc-daemon',
+  daemon_exe = executable('nix-grpc-daemon',
     sources : daemon_sources + [gen, eds_gen],
     include_directories : [gen_inc, src_inc],
     cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
@@ -267,6 +299,48 @@ if build_server
     dependencies : [nix_util_dep, curl_dep, json_dep, threads_dep],
     cpp_args : ['-UNDEBUG'],
   ))
+
+  # A client that vanished without closing its connection must not keep its
+  # builds wanted: the daemon ends its Schedule stream, and the build only
+  # that client followed ends, revoked or given back, and is not placed again.
+  test('keepalive', find_program('python3'),
+    args : [files('tests/keepalive-test.py'), daemon_exe],
+    timeout : 180,
+  )
+
+  # The other side: a client waiting on its Schedule stream must notice by
+  # itself that the daemon is gone when no FIN reaches it, and the pings
+  # that tell it must not get it GOAWAY too_many_pings.
+  keepalive_client = executable('keepalive-client',
+    sources : ['tests/keepalive-client.cc', 'src/client/channel.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/client')],
+    cpp_args : nix_compat_args,
+    dependencies : common_deps + [nix_store_dep, nix_util_dep, openssl_dep],
+  )
+  # A store query through the plugin as nix loads it, to see that one cut
+  # off by those pings is asked again.
+  store_query_client = executable('store-query-client',
+    sources : ['tests/store-query-client.cc'],
+    dependencies : common_deps + [nix_store_dep, nix_util_dep, dependency('dl')],
+  )
+  test('client-keepalive', find_program('python3'),
+    args : [files('tests/client-keepalive-test.py'), daemon_exe, keepalive_client, store_query_client, client_plugin],
+    timeout : 300,
+  )
+
+  # queryMissing with an evaluation store, through the plugin as nix loads
+  # it: a QueryValidPaths per batch of derivations, not per output, and
+  # Nix's own answer. Skips (77) without Nix pull request 16433.
+  query_missing_client = executable('query-missing-client',
+    sources : ['tests/query-missing-client.cc'],
+    include_directories : [src_inc],
+    cpp_args : nix_compat_args,
+    dependencies : common_deps + [nix_store_dep, nix_util_dep, dependency('dl')],
+  )
+  test('query-missing', find_program('python3'),
+    args : [files('tests/query-missing-test.py'), daemon_exe, query_missing_client, client_plugin],
+    timeout : 300,
+  )
 
   test('scheduler', executable('scheduler-test',
     sources : ['tests/scheduler-test.cc'],

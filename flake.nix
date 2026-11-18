@@ -24,12 +24,17 @@
       # nixVersions.git lags behind, so pin master in nix-git.json (bumped
       # weekly by the update-nix-git effect) to see API breakage here first.
       nixGitPin = lib.importJSON ./nix-git.json;
-      nixGitFor =
-        pkgs:
+      # The Nix the farm runs (ConnorBaker/nix integration, nixos-configs'
+      # `nix` input): it carries Nix pull request 16433, so building against it
+      # takes the other branch of meson.build's queryMissing check
+      # (plugin-nix_16433). Drop it once #16433 is in master.
+      nix16433Pin = lib.importJSON ./nix-16433.json;
+      nixFor =
+        pin: pkgs:
         (
           (pkgs.nixVersions.nixComponents_git.overrideSource (
             pkgs.fetchFromGitHub {
-              inherit (nixGitPin)
+              inherit (pin)
                 owner
                 repo
                 rev
@@ -39,7 +44,7 @@
           )).overrideScope
             (
               _final: prev: {
-                inherit (nixGitPin) version;
+                inherit (pin) version;
                 # The eval cache moved into libexpr. nixpkgs' packaging lags.
                 nix-expr = prev.nix-expr.overrideAttrs (old: {
                   buildInputs = old.buildInputs ++ [ pkgs.sqlite ];
@@ -55,6 +60,7 @@
               }
             )
         ).nix-everything;
+      nixGitFor = nixFor nixGitPin;
       nixPackagesFor =
         pkgs:
         let
@@ -100,6 +106,18 @@
           nix = nixGitFor nixpkgs.legacyPackages.${system};
         }
         // scope.versionPlugins
+        // (
+          let
+            nix16433 = nixFor nix16433Pin nixpkgs.legacyPackages.${system};
+          in
+          {
+            plugin-nix_16433 = scope.pluginFor nix16433;
+            # The daemon and the tests against it too: only a Nix with #16433
+            # passes queryMissing the evaluation store, so only here do the
+            # tests reach that branch.
+            default-nix_16433 = scope.default.override { inherit (nix16433.libs) nix-store nix-util; };
+          }
+        )
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
           inherit (scope)
             harmonia-gc

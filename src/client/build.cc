@@ -52,6 +52,7 @@
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "retry.hh"
+#include "store-config.hh"
 #include "top-down.hh"
 
 namespace nix {

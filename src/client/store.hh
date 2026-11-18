@@ -1,7 +1,8 @@
 #pragma once
 // The grpc:// Store: class layout. Definitions live in store.cc (setup,
 // errors, tunnel), build.cc (BuildDerivation, farm fan-out) and transfer.cc
-// (path info, NAR upload).
+// (path info, NAR upload), all in nix-grpc-store-impl, which the plugin loads
+// when a store is opened. Its configuration is in store-config.hh.
 
 #include <algorithm>
 #include <cstddef>
@@ -34,9 +35,6 @@
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
-#include <nix/store/store-reference.hh>
-#include <nix/util/configuration.hh>
-#include <nix/util/environment-variables.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/fmt.hh>
@@ -70,17 +68,16 @@
 #include <nix/store/build-result.hh>
 #include <nix/store/remote-store-connection.hh>
 #include <nix/store/remote-store.hh>
-#include <nix/store/store-registration.hh>
 #include <nix/store/worker-protocol.hh>
 // Generic definitions for the std::vector serialiser wrappers, which
 // libnixstore does not instantiate explicitly.
 #include <nix/store/worker-protocol-impl.hh> // IWYU pragma: keep
 #include <nix/util/callback.hh>
 #include <nix/util/file-descriptor.hh>
-#include <nix/util/url.hh>
 #include <utility>
 
 #include "channel.hh"
+#include "store-config.hh"
 #include "executor.hh"
 #include "nix-compat.hh"
 #include "nar-fetcher.hh"
@@ -92,145 +89,7 @@
 
 using GrpcStream = grpc::ClientReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 
-namespace nixgrpc {
-// The `grpc-linger` setting (store.cc): seconds every Want asks the scheduler
-// to keep its build once this client leaves (Want.linger_s).
-auto lingerSeconds() -> unsigned;
-// The `grpc-lease` setting (store.cc): whose promise that is (Want.lease_id).
-auto leaseId() -> std::string;
-// How much of a lease id a notice shows: whoever knows the id can end that
-// lease, and a notice ends up in logs others read (the scheduler's journal
-// shows as much, dispatcher.cc's leaseIdLogged).
-constexpr size_t leaseIdShown = 8;
-} // namespace nixgrpc
-
 namespace nix {
-
-// Follows Nix's own StoreConfig pattern (e.g. DummyStoreConfig).
-// NOLINTNEXTLINE(misc-multiple-inheritance,misc-use-internal-linkage)
-struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual RemoteStoreConfig
-{
-private:
-    friend struct GrpcStore;
-
-    ParsedURL::Authority authority;
-
-    Setting<bool> insecure{this, false, "insecure", "Use plaintext instead of TLS. Only for local testing."};
-
-    static constexpr unsigned defaultConnectTimeout = 30;
-    Setting<unsigned int> connectTimeout{this, defaultConnectTimeout, "connect-timeout",
-        "Seconds the first call waits for the server to become reachable before failing."};
-
-    static constexpr unsigned defaultRestartGrace = 120;
-    Setting<unsigned int> restartGrace{this, defaultRestartGrace, "restart-grace",
-        "Seconds to keep retrying once the server has answered before: across a worker or "
-        "scheduler restart, and while the scheduler says no worker can take a build."};
-
-    Setting<std::string> routeSystem{this, "", "system",
-        "Send `x-nix-system: VALUE` on every call, not only on builds. Use one "
-        "`nix.buildMachines` entry per system behind a balancer so input uploads "
-        "and substitution land on a worker of that system."};
-
-    Setting<bool> debug{this, nix::getEnv("NIX_GRPC_DEBUG").value_or("") == "1", "debug",
-        "Log TLS setup and enable gRPC handshake tracing on stderr. Also `NIX_GRPC_DEBUG=1`."};
-
-    Setting<std::string> caCert{
-        this,
-        "",
-        "ca-cert",
-        "Path to a PEM file with the CA certificate used to verify the server. "
-        "Defaults to `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE` or the system CA bundle."};
-
-    Setting<std::string> clientCert{
-        this,
-        "",
-        "client-cert",
-        "Path to a PEM client certificate chain to present for mTLS. Defaults to "
-        "`$NIX_GRPC_CLIENT_CERT`, then `client.crt` in `$XDG_DATA_HOME/nix-grpc-store`, "
-        "`/run/nix-grpc-store` or `/var/lib/nix-grpc-store`."};
-
-    Setting<std::string> clientKey{
-        this,
-        "",
-        "client-key",
-        "Path to the PEM private key for `client-cert`. Defaults to "
-        "`$NIX_GRPC_CLIENT_KEY`, then `client.key` next to the default `client-cert`."};
-
-    Setting<std::string> tokenFile{
-        this,
-        "",
-        "token-file",
-        "File holding an OIDC bearer token, re-read for every call so it may be "
-        "rotated in place. Defaults to `$NIX_GRPC_TOKEN_FILE`, then `token` next to "
-        "the default `client-cert`. Requires TLS."};
-
-    static constexpr unsigned defaultMaxBuilds = 64;
-
-    static constexpr unsigned defaultRescheduleRetries = 8;
-    Setting<unsigned> rescheduleRetries{this, defaultRescheduleRetries, "reschedule-retries",
-        "How often a derivation bounced by its assigned worker is handed back to the scheduler."};
-    Setting<unsigned> maxBuilds{
-        this,
-        defaultMaxBuilds,
-        "max-builds",
-        "Number of concurrent BuildDerivation streams."};
-
-    Setting<unsigned> narConnections{
-        this,
-        4,
-        "nar-connections",
-        "Number of parallel TCP connections used for NAR downloads."};
-
-    Setting<bool> releaseLease{this, false, "release-lease",
-        "End the lease the `grpc-lease` setting names on the scheduler when the store connects, as "
-        "`nix store info` does: builds kept only for it are let go. Fails unless `grpc-lease` is set "
-        "and the scheduler answers."};
-
-public:
-    explicit GrpcStoreConfig(const Params & params)
-        : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
-        , RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
-    {
-    }
-
-#if !NIX_COMPAT_AT_LEAST(2, 34)
-    // Nix < 2.34 constructs store configs from the raw scheme and authority
-    // strings instead of a pre-parsed ParsedURL::Authority.
-    GrpcStoreConfig(std::string_view /*scheme*/, std::string_view authority, const Params &params)
-        : StoreConfig(params),
-          RemoteStoreConfig(params),
-          authority(ParsedURL::Authority::parse(authority)) {}
-#endif
-
-    GrpcStoreConfig(ParsedURL::Authority authority, const Params &params)
-        : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
-          RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
-          authority(std::move(authority)) {}
-
-    // NOLINTNEXTLINE(modernize-use-string-view): nix::StoreConfig's signature
-    static auto name() -> std::string { return "gRPC Store"; }
-
-    static auto uriSchemes() -> StringSet { return {"grpc"}; }
-
-    // NOLINTNEXTLINE(modernize-use-string-view)
-    static auto doc() -> std::string {
-      return "Connects to a `nix-grpc-daemon`: native RPCs for queries, copies and "
-             "scheduled builds, the tunnelled worker protocol for the rest.";
-    }
-
-    auto getReference() const -> StoreReference override {
-      return {
-          .variant =
-              StoreReference::Specified{
-                  .scheme = *uriSchemes().begin(),
-                  .authority = authority.to_string(),
-              },
-          .params = getQueryParams(),
-      };
-    }
-
-    auto openStore() const -> ref<Store> override;
-};
 
 // A failed RPC. Keeps the status, so that a caller can tell a worker that
 // left from a real error.
@@ -308,29 +167,39 @@ private:
                                const Metadata & headers) -> StorePathSet;
 
 public:
+    // While queryMissing runs Nix's walk, answers it from the validity
+    // asked ahead (walkMissingAskedAhead).
     auto queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
-        -> StorePathSet override {
-      return queryValidPathsRouted(paths, maybeSubstitute, {});
-    }
+        -> StorePathSet override;
 
-    // RemoteStore would tunnel this. One RPC, with a fallback to the
-    // client-side walk for servers without QueryMissing.
-    auto queryMissing(const std::vector<DerivedPath> & targets)
+    // RemoteStore would tunnel this. One RPC; with an evaluation store,
+    // Nix's walk (walkMissingAskedAhead).
+#if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE
+    auto queryMissing(const std::vector<DerivedPath> & targets, Store * evalStore = nullptr)
         -> MissingPaths override;
+#else
+    auto queryMissing(const std::vector<DerivedPath> & targets) -> MissingPaths override;
+#endif
 
     // RemoteStore would tunnel this, which only trusted callers may. Nothing
     // reads more than membership from it, so QueryMissing answers it.
     void querySubstitutablePathInfos(const StorePathCAMap & paths,
                                      SubstitutablePathInfos & infos) override;
 
-    // Same: keep read-only clients off the tunnel.
-    // RemoteStore would tunnel this even with an eval store at hand.
+    // Same: keep read-only clients off the tunnel. A trusted one asks the
+    // daemon over it, as Nix asks a remote store; anyone else, and anyone
+    // with an eval store, gets Store's answer, which reads the derivation
+    // (the eval store's copy, or this store's over NAR fetches) and names
+    // every output with the path its realisation gives or none: a local eval
+    // store's static map leaves out floating ones, and Nix's queryMissing
+    // takes a derivation with no outputs named for one it need not build.
     auto queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore)
         -> std::map<std::string, std::optional<StorePath>> override {
-      if (evalStore != nullptr && evalStore != this) {
-        return evalStore->queryStaticPartialDerivationOutputMap(path);
+      if ((evalStore == nullptr || evalStore == this) && isTrustedClient() == Trusted) {
+        return RemoteStore::queryPartialDerivationOutputMap(path, nullptr);
       }
-      return RemoteStore::queryPartialDerivationOutputMap(path, nullptr);
+      // NOLINTNEXTLINE(bugprone-parent-virtual-call)
+      return Store::queryPartialDerivationOutputMap(path, evalStore);
     }
 
     auto isValidPathUncached(const StorePath & path) -> bool override {
@@ -380,7 +249,6 @@ public:
     [[nodiscard]] auto retryBudget() const -> std::chrono::milliseconds {
       return everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get());
     }
-    static constexpr int minReconnectBackoffMs = 2000;
     template<typename F>
     void retrying(const char * what, const F & attempt) {
       retryingWithProgress(what, [&](bool & /*progressed*/) -> grpc::Status { return attempt(); });
@@ -616,6 +484,21 @@ private:
        instead of one round trip per path. */
     std::mutex prefetchMutex;
     PathInfoMap prefetchedInfos;
+
+    /* Validity asked in batches while queryMissing() runs Nix's walk, at
+       the walk's first question to this store, and read by
+       queryValidPaths() so the walk needs no round trip of its own per
+       path or per level. Nix's walk runs on the thread that calls it, so
+       the answers are this thread's, for this store, and only while that
+       queryMissing() runs: no other caller or walk sees them. */
+    struct AskedAhead {
+      const GrpcStore * store;
+      const std::map<StorePath, bool> * valid;
+      std::function<void()> * ask;
+    };
+    static inline thread_local AskedAhead askedAhead{};
+    void askAhead(const std::vector<DerivedPath> & targets, Store & evalStore, std::map<StorePath, bool> & valid);
+    auto walkMissingAskedAhead(const std::vector<DerivedPath> & targets, Store & evalStore) -> MissingPaths;
 
     auto queryPathInfosNative(const StorePathSet &paths) -> PathInfoMap;
 
