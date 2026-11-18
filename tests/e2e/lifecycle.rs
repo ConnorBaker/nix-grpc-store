@@ -87,9 +87,15 @@ fn a_failed_connection_while_nix_daemon_is_down_does_not_poison_the_worker() {
     retry_with_clients(MACHINE, &[down], "the RPC reached the unavailable daemon", || {
         journal_count(MACHINE, down, lost) > 0
     });
+    // Still running, or ended by itself with a failure: a stopped unit
+    // would read as a success.
+    let ended = unit_state(down) != "active";
+    assert!(
+        !ended || unit_result(MACHINE, down) != "success",
+        "build succeeded with the daemon down"
+    );
     run(&["systemctl", "stop", down]);
     succeed(&["systemctl", "start", "nix-daemon.socket"]);
-    assert_ne!(unit_result(MACHINE, down), "success", "build succeeded with the daemon down");
 
     wait_until_succeeds(&["nix", "store", "info", "--store", "daemon"]);
     wait_until_succeeds(&build_argv(&store, "/tmp/reconnect.nix"));
