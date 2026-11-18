@@ -43,8 +43,9 @@ endif
 # See src/macro-compat.hh: gRPC has to be parsed before nix/util/error.hh.
 add_project_arguments('-include', meson.current_source_dir() / 'src' / 'macro-compat.hh', language : 'cpp')
 
-nix_store_dep = dependency('nix-store')
-nix_util_dep  = dependency('nix-util')
+# Nix 2.34 or newer: nix/packages/default.nix.
+nix_store_dep = dependency('nix-store', version : '>=2.34')
+nix_util_dep  = dependency('nix-util', version : '>=2.34')
 
 if build_server
   # glibc malloc stalls the scheduler for 5-40 ms consolidating its heap after

@@ -25,13 +25,14 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
       "aarch64-linux"
     ];
     # Nix releases from nixpkgs that ship split component libraries.
-    # 2.31 is the oldest release with ParsedURL::Authority and
-    # StoreConfig::getReference(), which the plugin relies on.
+    # 2.34 is the oldest supported release (meson.build requires it): the
+    # plugin uses its typed WorkerProto::Version, Signature and
+    # UnkeyedRealisation, and the BuildResult variant from 2.32.
     supportedNixVersions = builtins.filter (
       name:
       builtins.match "nix_[0-9]+_[0-9]+" name != null
       && (builtins.tryEval (
-        lib.versionAtLeast nixVersions.${name}.version "2.31" && (nixVersions.${name}.libs or { }) ? nix-store
+        lib.versionAtLeast nixVersions.${name}.version "2.34" && (nixVersions.${name}.libs or { }) ? nix-store
       )).value or false
     ) (builtins.attrNames nixVersions);
   in
