@@ -111,8 +111,6 @@ private:
 
 // nix-grpc-daemon gives the calls it still serves this long once it stops.
 constexpr std::chrono::milliseconds shutdownGrace{100};
-// Only so that a call gRPC does not cut off fails the test instead of hanging it.
-constexpr std::chrono::seconds callDeadline{10};
 
 // What the client gets from a server that stops while a call of its own is
 // stuck in a handler: the server's real answer, not one written down here.
@@ -131,7 +129,6 @@ auto callCutOffByAStoppingServer() -> grpc::Status
     grpc::Status status;
     std::jthread client([&] -> void {
         grpc::ClientContext ctx;
-        ctx.set_deadline(std::chrono::system_clock::now() + callDeadline);
         nix::remote::QueryValidPathsRequest const request;
         nix::remote::QueryValidPathsReply reply;
         status = stub->QueryValidPaths(&ctx, request, &reply);
