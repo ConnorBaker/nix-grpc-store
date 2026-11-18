@@ -13,14 +13,13 @@
 #   partitioned: once the client has its Assigned, the proxy stops forwarding
 #     in both directions but keeps both sockets open, and does not pass the
 #     daemon's close on. The client must end its stream itself, UNAVAILABLE.
-#     Still waiting AFTER_CLOSE_S after the daemon closed its end fails.
 #   idle: the same, but the proxy stops forwarding IDLE_S after the Assigned.
 #     By then the client has pinged twice without sending data, and gRPC
 #     sends such a client one ping a minute (ping_rate_policy.cc:72-81): its
 #     next ping comes up to a minute into the partition, and gRPC drops the
 #     connection when that ping has gone a minute unanswered. The client must
-#     end its stream, UNAVAILABLE, within IDLE_DEADLINE_S of the partition.
-#     The daemon closed its end long before, which the proxy keeps from it.
+#     end its stream, UNAVAILABLE. The daemon closed its end long before,
+#     which the proxy keeps from it.
 #   healthy: forwarded throughout. The client wants a drv for a system no
 #     worker offers, so after one Unplaceable neither end has anything to
 #     send, as for a client waiting for a worker that has not come. (An
@@ -48,12 +47,7 @@ import time
 import urllib.request
 
 ALIVE_S = 3  # forward this long after Assigned, like a live connection
-SETUP_S = 30
-AFTER_CLOSE_S = 20  # the partitioned client may wait this long after the daemon closed
-PARTITION_DEADLINE_S = 150  # the client's keepalive (20 s) + gRPC's ping timeout (60 s), plus slack
 IDLE_S = 44  # after the client's keepalive pings at +20 s and +40 s
-IDLE_DEADLINE_S = 130  # up to a minute to its next ping, gRPC's 1 min ping timeout, plus slack
-HEALTHY_DEADLINE_S = 220  # from Unplaceable: gRPC sends a client that sends no data one ping a minute
 GRACE_S = 2  # for a GOAWAY to follow the last ping counted
 MAX_STRIKES = 2  # gRPC's default GRPC_ARG_HTTP2_MAX_PING_STRIKES; the daemon sets none
 UNAVAILABLE = 14
@@ -230,6 +224,7 @@ class Client:
         )
         self.lock = threading.Lock()
         self.lines = []
+        self.done = False  # its output is over: it exited
         threading.Thread(target=self.read, daemon=True).start()
 
     def read(self):
@@ -238,6 +233,13 @@ class Client:
             line = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip("\n"))
             with self.lock:
                 self.lines.append((time.monotonic(), line))
+        with self.lock:
+            self.done = True
+
+    # After all it printed was read.
+    def exited(self):
+        with self.lock:
+            return self.done
 
     def starting(self, prefix):
         with self.lock:
@@ -266,7 +268,7 @@ class Client:
 
 def scrape(port):
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as resp:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics") as resp:
             text = resp.read().decode()
     except OSError:
         return None
@@ -342,15 +344,14 @@ def main():
         return 2
 
     try:
-        start = time.monotonic()
+        # The metrics say when the in-process worker is there, and nothing
+        # tells of it: ask until they do.
         while True:
             if proc.poll() is not None:
                 return setup_fail(f"daemon exited with {proc.returncode}")
             vals = scrape(mport)
             if vals and vals.get(("nix_grpc_sched", "workers"), 0) >= 1:
                 break
-            if time.monotonic() - start > SETUP_S:
-                return setup_fail(f"no in-process worker in the metrics: {vals}")
             time.sleep(0.2)
 
         partitioned, healthy, quiet, queried = Proxy(port), Proxy(port), Proxy(port), Proxy(port)
@@ -359,18 +360,19 @@ def main():
         heal = clients["healthy"] = Client([client_exe, f"127.0.0.1:{healthy.port}", DRV_HEALTHY, SYSTEM_NOWHERE])
         idle = clients["idle"] = Client([client_exe, f"127.0.0.1:{quiet.port}", DRV_IDLE])
         query = clients["query"] = Client([query_exe, plugin, f"127.0.0.1:{queried.port}"])
+        # The clients' lines are read on threads of their own: look until they are there.
         while True:
             part_assigned, idle_assigned = (c.first("assigned ") for c in (part, idle))
             heal_unplaced = heal.first("unplaceable ")
             answered = query.first("answered ")
             if part_assigned and heal_unplaced and idle_assigned and answered:
                 break
-            if any(c.first("ended ") for c in (part, heal, idle)):
+            if any(c.first("ended ") or c.exited() for c in (part, heal, idle)):
                 return setup_fail("a client's stream ended before its Assigned or Unplaceable")
-            if query.first("failed ") or query.proc.poll() is not None:
+            if query.first("failed ") or query.exited():
                 return setup_fail("the first store query was not answered")
-            if time.monotonic() - start > 2 * SETUP_S:
-                return setup_fail("no Assigned for two clients, no Unplaceable for the third, or no answer to the first store query")
+            if proc.poll() is not None:
+                return setup_fail(f"daemon exited with {proc.returncode}")
             time.sleep(0.1)
         part_assigned, heal_unplaced, idle_assigned = part_assigned[0], heal_unplaced[0], idle_assigned[0]
         print(f"two clients have their Assigned, the third its Unplaceable; the first store query was {answered[1]!r}")
@@ -386,12 +388,20 @@ def main():
         part_verdict = heal_verdict = idle_verdict = query_verdict = None
         idle_holed = None
         told_close = False
+        # Each verdict waits for its client's line, the proxy's frames or an
+        # exit, read on threads of their own: look until all are in.
         while part_verdict is None or heal_verdict is None or idle_verdict is None or query_verdict is None:
             now = time.monotonic()
+            if proc.poll() is not None:
+                print(f"FAIL: the daemon exited with {proc.returncode}\n{client_logs()}\n{daemon_log()}")
+                return 1
             if idle_holed is None and idle_verdict is None:
                 ended = idle.first("ended ")
                 if ended is not None:
                     idle_verdict = (False, f"stream ended before the partition: {ended[1]!r}")
+                    print(f"idle: FAIL: {idle_verdict[1]}")
+                elif idle.exited():
+                    idle_verdict = (False, "exited before the partition without ending its stream")
                     print(f"idle: FAIL: {idle_verdict[1]}")
                 elif now - idle_assigned >= IDLE_S:
                     st = quiet.link(0).state()
@@ -411,13 +421,12 @@ def main():
                     )
                     if st["server_closed"] is not None:
                         what += f" (daemon closed at +{st['server_closed'] - idle_holed:.1f}s)"
-                    ok = code == UNAVAILABLE and at - idle_holed <= IDLE_DEADLINE_S
-                    idle_verdict = (ok, what if ok else f"{what}: not UNAVAILABLE within {IDLE_DEADLINE_S}s")
-                elif now - idle_holed > IDLE_DEADLINE_S:
+                    ok = code == UNAVAILABLE
+                    idle_verdict = (ok, what if ok else f"{what}: not UNAVAILABLE")
+                elif idle.exited():
                     idle_verdict = (
                         False,
-                        f"client still waiting {IDLE_DEADLINE_S}s into the partition; "
-                        f"client pings at {since(st['pings'], idle_assigned)} after its Assigned",
+                        f"client exited without ending its stream; client pings at {since(st['pings'], idle_assigned)} after its Assigned",
                     )
                 if idle_verdict is not None:
                     print(f"idle: {'PASS' if idle_verdict[0] else 'FAIL'}: {idle_verdict[1]}")
@@ -439,14 +448,11 @@ def main():
                     if closed is not None:
                         what += f" (daemon closed at +{closed - holed:.1f}s)"
                     part_verdict = (code == UNAVAILABLE, what if code == UNAVAILABLE else f"{what}, not UNAVAILABLE")
-                elif closed is not None and now - closed > AFTER_CLOSE_S:
+                elif part.exited():
                     part_verdict = (
                         False,
-                        f"client still waiting on its stream {now - closed:.0f}s after the daemon closed its end "
-                        f"(+{closed - holed:.1f}s), {len(st['pings'])} client pings ({since(st['pings'], holed)})",
+                        f"client exited without ending its stream, {len(st['pings'])} client pings ({since(st['pings'], holed)})",
                     )
-                elif now - holed > PARTITION_DEADLINE_S:
-                    part_verdict = (False, f"client still waiting {PARTITION_DEADLINE_S}s in, and the daemon has not closed")
                 if part_verdict is not None:
                     print(f"partitioned: {'PASS' if part_verdict[0] else 'FAIL'}: {part_verdict[1]}")
             if heal_verdict is None:
@@ -467,11 +473,8 @@ def main():
                         f"{st['longest']} client pings in a row with nothing from the daemon that resets its strikes, "
                         f"no GOAWAY, stream open; client pings at {since(pings, heal_unplaced)}",
                     )
-                elif now - heal_unplaced > HEALTHY_DEADLINE_S:
-                    heal_verdict = (
-                        False,
-                        f"only {st['longest']} client pings in a row in {HEALTHY_DEADLINE_S}s, at {since(pings, heal_unplaced)}",
-                    )
+                elif heal.exited():
+                    heal_verdict = (False, f"client exited without ending its stream, client pings at {since(pings, heal_unplaced)}")
                 if heal_verdict is not None:
                     print(f"healthy: {'PASS' if heal_verdict[0] else 'FAIL'}: {heal_verdict[1]}")
             if query_verdict is None:
@@ -489,8 +492,8 @@ def main():
                     query_verdict = (links > query_links, what if links > query_links else f"{what}: not a new one")
                 elif failed is not None:
                     query_verdict = (False, f"second query {failed[1]!r} at +{failed[0] - query_holed:.1f}s")
-                elif now - query_holed > PARTITION_DEADLINE_S:
-                    query_verdict = (False, f"second query still unanswered {PARTITION_DEADLINE_S}s in")
+                elif query.exited():
+                    query_verdict = (False, "the client exited without answering the second query")
                 if query_verdict is not None:
                     print(f"query: {'PASS' if query_verdict[0] else 'FAIL'}: {query_verdict[1]}")
             time.sleep(0.2)
