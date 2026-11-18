@@ -124,6 +124,9 @@ pkgs.testers.runNixOSTest {
             publicKeys = [ "farm-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=" ];
           };
           tunnel.balancers = [ "lb:${toString tunnelPort}" ];
+          # More idle tunnels per balancer thread than its route has retries:
+          # a request must never be offered a tunnel the old process cannot take.
+          tunnel.count = 32;
         };
         programs.nix-grpc-store.enable = true;
         testCerts.neededBy = [ "nix-grpc-daemon.service" ];
@@ -197,6 +200,9 @@ pkgs.testers.runNixOSTest {
         print(f"envoy counters during the takeover's drain: {delta}")
         assert client.execute("systemctl is-active long", timeout=None)[0] == 0, "the builds after the takeover waited for the old process"
         assert calls(old) == old_calls, single.succeed(f"journalctl -o cat _PID={old}")
+        # Once handed over, the old process offers no tunnel and has none taken.
+        since = single.succeed(f"journalctl -o cat _PID={old}").split("event=handed_over", 1)[1]
+        assert "event=tunnels_open" not in since and "event=tunnel_failed" not in since, since
         assert delta["cluster.tunnelled.upstream_rq_total"] >= 4, delta
         assert delta["cluster.tunnelled.upstream_rq_5xx"] == 0, delta
         assert delta["cluster.tunnelled-any.upstream_rq_5xx"] == 0, delta
