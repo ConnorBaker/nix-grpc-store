@@ -237,15 +237,15 @@ if build_server
 
   # --- tests ------------------------------------------------------------------
 
-  # Each test waits for what it checks without a deadline (timeout : 0), as
-  # the Nix build's check phase runs them (--timeout-multiplier=0): one that
-  # hangs shows a failure to diagnose, not to run again.
+  # No deadline, as in the Nix build's check phase: a test waits for what it
+  # checks, and one that hangs shows a failure to diagnose.
+  add_test_setup('nodeadline', timeout_multiplier : 0, is_default : true)
 
   test('plugin-loader', executable('plugin-loader-test',
     sources : ['tests/plugin-loader-test.cc'],
     include_directories : [src_inc],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   farm_client_test = executable('farm-client-test',
     sources : ['tests/farm-client-test.cc'],
@@ -255,7 +255,6 @@ if build_server
   )
   test('farm-client', find_program('tests/farm-client-test.sh'),
     args : [farm_client_test, files('tests/farm-mock.py')],
-    timeout : 0,
   )
 
   oidc_test = executable('oidc-test',
@@ -263,21 +262,20 @@ if build_server
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
   )
-  test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 0)
+  test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test])
 
   test('http', executable('http-test',
     sources : ['tests/http-test.cc'],
     include_directories : [src_inc],
     dependencies : [nix_util_dep, curl_dep, json_dep, threads_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   # A client that vanished without closing its connection must not keep its
   # builds wanted: the daemon ends its Schedule stream, and the build only
   # that client followed ends, revoked or given back, and is not placed again.
   test('keepalive', find_program('python3'),
     args : [files('tests/keepalive-test.py'), daemon_exe],
-    timeout : 0,
   )
 
   # The other side: a client waiting on its Schedule stream must notice by
@@ -297,7 +295,6 @@ if build_server
   )
   test('client-keepalive', find_program('python3'),
     args : [files('tests/client-keepalive-test.py'), daemon_exe, keepalive_client, store_query_client, client_plugin],
-    timeout : 0,
   )
 
   test('scheduler', executable('scheduler-test',
@@ -305,32 +302,32 @@ if build_server
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [nix_util_dep] + absl_dep,
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('lease-invariants', executable('lease-invariants-test',
     sources : ['tests/lease-invariants-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [nix_util_dep] + absl_dep,
-  ), timeout : 0)
+  ))
 
   test('dispatcher', executable('dispatcher-test',
     sources : ['tests/dispatcher-test.cc'],
     include_directories : [include_directories('src/client')],
     dependencies : [dispatcher_dep, jemalloc_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('farm-sim', executable('farm-sim-test',
     sources : ['tests/farm-sim-test.cc'],
     dependencies : [dispatcher_dep, jemalloc_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('builder', executable('builder-test',
     sources : ['tests/builder-test.cc'],
     dependencies : [dispatcher_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   max_jobs_conf = meson.current_build_dir() / 'max-jobs-test-conf'
   test('max-jobs', executable('max-jobs-test',
@@ -342,14 +339,14 @@ if build_server
     'NIX_CONF_DIR' : max_jobs_conf,
     'NIX_USER_CONF_FILES' : max_jobs_conf / 'no-user.conf',
     'NIX_CONFIG' : '',
-  }, timeout : 0)
+  })
 
   test('sbpl', executable('sbpl-test',
     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : common_deps,
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   if host_machine.system() == 'linux'
     test('sandbox', executable('sandbox-test',
@@ -357,14 +354,14 @@ if build_server
       include_directories : [src_inc, include_directories('src/daemon')],
       dependencies : [nix_util_dep],
       cpp_args : ['-UNDEBUG'],
-    ), timeout : 0)
+    ))
 
     test('takeover', executable('takeover-test',
       sources : ['tests/takeover-test.cc', 'src/daemon/takeover.cc'],
       include_directories : [src_inc, include_directories('src/daemon')],
       dependencies : [nix_util_dep, threads_dep],
       cpp_args : ['-UNDEBUG'],
-    ), timeout : 0)
+    ))
   endif
 
   test('acl', executable('acl-test',
@@ -372,68 +369,68 @@ if build_server
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [nix_util_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('build-log', executable('build-log-test',
     sources : ['tests/build-log-test.cc'],
     include_directories : [src_inc],
     cpp_args : nix_compat_args + ['-UNDEBUG'],
     dependencies : [nix_util_dep, nix_store_dep],
-  ), timeout : 0)
+  ))
 
   test('xfcc', executable('xfcc-test',
     sources : ['tests/xfcc-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [grpc_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('log-spill', executable('log-spill-test',
     sources : ['tests/log-spill-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [threads_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('local-store', executable('local-store-test',
     sources : ['tests/local-store-test.cc', gen],
     include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('tunnel', executable('tunnel-test',
     sources : ['tests/tunnel-test.cc', 'src/daemon/tunnel.cc', 'src/daemon/tunnels.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [nix_util_dep, grpc_dep, threads_dep, openssl_dep, ssl_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
   test('daemon-probe', executable('daemon-probe-test',
     sources : ['tests/daemon-probe-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [nix_util_dep, threads_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('upload-spool', executable('upload-spool-test',
     sources : ['tests/upload-spool-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [nix_util_dep, threads_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('nar-fetcher', executable('nar-fetcher-test',
     sources : ['tests/nar-fetcher-test.cc', gen],
     include_directories : [gen_inc, src_inc, include_directories('src/client')],
     cpp_args : nix_compat_args + ['-UNDEBUG'],
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
-  ), timeout : 0)
+  ))
 
   test('executor', executable('executor-test',
     sources : ['tests/executor-test.cc'],
     include_directories : [src_inc, include_directories('src/client')],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   # Also stops a real server under a stuck call.
   test('retry', executable('retry-test',
@@ -441,27 +438,27 @@ if build_server
     include_directories : [gen_inc, src_inc, include_directories('src/client')],
     cpp_args : ['-UNDEBUG'],
     dependencies : common_deps,
-  ), timeout : 0)
+  ))
 
   test('call', executable('call-test',
     sources : ['tests/call-test.cc', gen],
     include_directories : [gen_inc, src_inc, include_directories('src/client')],
     cpp_args : nix_compat_args + ['-UNDEBUG'],
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
-  ), timeout : 0)
+  ))
 
   test('top-down', executable('top-down-test',
     sources : ['tests/top-down-test.cc'],
     include_directories : [src_inc],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 
   test('upload-claims', executable('upload-claims-test',
     sources : ['tests/upload-claims-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [threads_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 0)
+  ))
 endif
 
 # --- fuzzers ----------------------------------------------------------------
