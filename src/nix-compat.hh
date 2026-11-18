@@ -5,7 +5,6 @@
 // `nix-store` pkg-config dependency).
 
 #include <cerrno>
-#include <concepts>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -77,16 +76,8 @@
 
 namespace nixcompat {
 
-// Nix 2.34 turned WorkerProto::Version from a packed unsigned int into a
-// struct; detect the representation instead of checking version numbers.
-template <typename V = nix::WorkerProto::Version>
-constexpr auto makeProtocolVersion(unsigned int major, uint8_t minor) -> V {
-  if constexpr (std::integral<V>) {
-    constexpr unsigned int minorBits = 8; // wire format: (major << 8) | minor
-    return (major << minorBits) | minor;
-  } else {
-    return V{.number = {.major = major, .minor = minor}};
-  }
+constexpr auto makeProtocolVersion(unsigned int major, uint8_t minor) -> nix::WorkerProto::Version {
+  return {.number = {.major = major, .minor = minor}};
 }
 
 // Worker-protocol version 1.16: the ValidPathInfo framing used by the bulk
@@ -101,76 +92,35 @@ inline auto infoProtocolVersion() -> nix::WorkerProto::Version {
 // stream framing used by the native BuildDerivation RPC.
 constexpr uint32_t kBuildProtocolWire = (1U << 8U) | 37U;
 
-template <typename V = nix::WorkerProto::Version>
-constexpr auto protocolWire(const V &version) -> uint32_t {
-  if constexpr (std::integral<V>) {
-    return version;
-  } else {
-    constexpr unsigned int minorBits = 8;
-    return (version.number.major << minorBits) | version.number.minor;
-  }
+constexpr auto protocolWire(const nix::WorkerProto::Version &version) -> uint32_t {
+  constexpr unsigned int minorBits = 8;
+  return (version.number.major << minorBits) | version.number.minor;
 }
 
-// Nix 2.34 folded the feature set into WorkerProto::Version.
 template <typename C>
 inline auto handshakeCompat(C &conn, const nix::WorkerProto::Version &version)
     -> nix::WorkerProto::Version {
-  if constexpr (std::integral<nix::WorkerProto::Version>) {
-    auto [negotiated, features] = C::handshake(conn.to, conn.from, version, {});
-    conn.features = features;
-    return negotiated;
-  } else {
-    return C::handshake(conn.to, conn.from, version);
-  }
+  return C::handshake(conn.to, conn.from, version);
 }
 
-// Late 2.36 turned BuildResult into a success/failure variant.
-// Non-const: the old success() accessor is not const-qualified.
-template <typename R, typename F>
-inline void forBuiltOutputs(R &res, const F &fun) {
-  if constexpr (requires { res.tryGetSuccess(); }) {
-    if (const auto *success = res.tryGetSuccess()) {
-      for (const auto &[name, realisation] : success->builtOutputs) {
-        fun(realisation.outPath);
-      }
-    }
-  } else {
-    if (res.success()) {
-      for (const auto &[name, realisation] : res.builtOutputs) {
-        fun(realisation.outPath);
-      }
+template <typename F>
+inline void forBuiltOutputs(nix::BuildResult &res, const F &fun) {
+  if (const auto *success = res.tryGetSuccess()) {
+    for (const auto &[name, realisation] : success->builtOutputs) {
+      fun(realisation.outPath);
     }
   }
 }
 
-// Same variant split as forBuiltOutputs.
-// Non-const because BuildResult::success() is non-const before Nix 2.32.
-template <typename R>
-inline auto buildFailureMsg(R &res) -> std::optional<std::string> {
-  if constexpr (requires { res.tryGetFailure(); }) {
-    if (const auto *failure = res.tryGetFailure()) {
-      if constexpr (requires { failure->errorMsg; }) {
-        return failure->errorMsg;
-      } else {
-        return std::string(failure->what());
-      }
-    }
-    return std::nullopt;
-  } else {
-    if (res.success()) {
-      return std::nullopt;
-    }
-    return res.errorMsg;
+inline auto buildFailureMsg(nix::BuildResult &res) -> std::optional<std::string> {
+  if (const auto *failure = res.tryGetFailure()) {
+    return std::string(failure->what());
   }
+  return std::nullopt;
 }
 
-// Same variant split as forBuiltOutputs.
-template <typename R> inline void setAlreadyValid(R &res) {
-  if constexpr (requires { res.tryGetSuccess(); }) {
-    res.inner = typename R::Success{.status = R::Success::AlreadyValid};
-  } else {
-    res.status = R::AlreadyValid;
-  }
+inline void setAlreadyValid(nix::BuildResult &res) {
+  res.inner = nix::BuildResult::Success{.status = nix::BuildResult::Success::AlreadyValid};
 }
 
 inline auto buildProtocolVersion() -> nix::WorkerProto::Version {
@@ -221,53 +171,27 @@ auto isImpure(const D & drv) -> bool
     }
 }
 
-// BuildResult: flat struct with `status` before 2.32, variant of
-// Success/Failure(BuildError) since.
-// Non-const because BuildResult::success() is non-const before Nix 2.32.
-template <typename R = nix::BuildResult>
-inline auto succeeded(R &res) -> bool {
-  if constexpr (requires { res.tryGetSuccess(); }) {
-    return res.tryGetSuccess() != nullptr;
-  } else {
-    return res.success();
-  }
+inline auto succeeded(nix::BuildResult &res) -> bool {
+  return res.tryGetSuccess() != nullptr;
 }
 
-// 2.34 typed the signatures.
 inline void addSignatures(nix::Store &store, const nix::StorePath &path,
                           const std::set<std::string> &sigs) {
-#if NIX_COMPAT_AT_LEAST(2, 34)
   std::set<nix::Signature> parsed;
   for (const auto &sig : sigs) {
     parsed.insert(nix::Signature::parse(sig));
   }
   store.addSignatures(path, parsed);
-#else
-  store.addSignatures(path, nix::StringSet(sigs.begin(), sigs.end()));
-#endif
 }
 
-#if NIX_COMPAT_AT_LEAST(2, 32)
 using FailureStatus = nix::BuildResult::Failure::Status;
-#else
-using FailureStatus = nix::BuildResult::Status;
-#endif
 
-#if NIX_COMPAT_AT_LEAST(2, 34)
 using RealisationCallback = nix::Callback<std::shared_ptr<const nix::UnkeyedRealisation>>;
-#else
-using RealisationCallback = nix::Callback<std::shared_ptr<const nix::Realisation>>;
-#endif
 
 inline auto failed(FailureStatus status, const std::string &msg) -> nix::BuildResult {
   nix::BuildResult res;
-#if NIX_COMPAT_AT_LEAST(2, 32)
   nix::BuildResult::Failure failure(status, "%s", msg);
   res.inner = std::move(failure);
-#else
-  res.status = status;
-  res.errorMsg = msg;
-#endif
   return res;
 }
 
@@ -278,11 +202,7 @@ inline auto alreadyValid(const nix::StorePath &drvPath,
                          std::map<std::string, nix::StorePath> outputs) -> nix::BuildResult {
   nix::BuildResult res;
   setAlreadyValid(res);
-#if NIX_COMPAT_AT_LEAST(2, 32)
   auto &built = res.tryGetSuccess()->builtOutputs;
-#else
-  auto &built = res.builtOutputs;
-#endif
   for (auto &[name, path] : outputs) {
 #if NIX_COMPAT_AT_LEAST(2, 35)
     nix::DrvOutput key{.drvPath = drvPath, .outputName = name};
@@ -290,41 +210,25 @@ inline auto alreadyValid(const nix::StorePath &drvPath,
     (void)drvPath;
     nix::DrvOutput key{.drvHash = nix::Hash(nix::HashAlgorithm::SHA256), .outputName = name};
 #endif
-#if NIX_COMPAT_AT_LEAST(2, 34)
     built.emplace(name, nix::Realisation{{.outPath = std::move(path)}, std::move(key)});
-#else
-    built.emplace(name, nix::Realisation{.id = std::move(key), .outPath = std::move(path)});
-#endif
   }
   return res;
 }
 
 // Failure kinds worth telling other workers' waiters about.
 inline auto failureStatus(nix::BuildResult &res) -> std::optional<FailureStatus> {
-#if NIX_COMPAT_AT_LEAST(2, 32)
   if (const auto *failure = res.tryGetFailure()) {
     return failure->status;
   }
-#else
-  if (!succeeded(res)) {
-    return res.status;
-  }
-#endif
   return std::nullopt;
 }
 
 // Metric label: the enum name only, never the message, which is unbounded.
-// Templated so the HashMismatch probe stays dependent; 2.32 added that name,
-// and the older flat enum also carries the success names, which
-// failureStatus() never returns.
-template <typename S = FailureStatus>
-inline auto failureStatusName(S status) -> std::string_view {
-  if constexpr (requires { S::HashMismatch; }) {
-    if (status == S::HashMismatch) {
-      return "HashMismatch";
-    }
-  }
+inline auto failureStatusName(FailureStatus status) -> std::string_view {
+  using S = FailureStatus;
   switch (status) {
+  case S::HashMismatch:
+    return "HashMismatch";
   case S::PermanentFailure:
     return "PermanentFailure";
   case S::InputRejected:
@@ -443,12 +347,7 @@ template <typename F> void forInputOutputs(const nix::Derivation &drv, const F &
 // drv: a BasicDerivation, or a Derivation.
 template <typename Drv> auto derivationOptions(const nix::StoreDirConfig &store, const Drv &drv) {
   const auto *attrs = drv.structuredAttrs ? &*drv.structuredAttrs : nullptr;
-#if NIX_COMPAT_AT_LEAST(2, 34)
   return nix::derivationOptionsFromStructuredAttrs(store, drv.env, attrs, /*shouldWarn=*/false);
-#else
-  (void)store;
-  return nix::DerivationOptions::fromStructuredAttrs(drv.env, attrs, /*shouldWarn=*/false);
-#endif
 }
 
 inline auto requiredSystemFeatures(const nix::StoreDirConfig &store,
@@ -501,71 +400,25 @@ public:
 
 // max-jobs as Nix's configuration says now, not as nix::settings read it at
 // startup: fresh settings filled by Nix's own loader (nix.conf and its
-// includes, the user files, NIX_CONFIG). 2.36 moved max-jobs and friends into
-// a WorkerSettings base; there only that base is instantiated, so no other
-// setting's parser runs (or warns).
+// includes, the user files, NIX_CONFIG). Only the WorkerSettings base is
+// instantiated, so no other setting's parser runs (or warns).
 inline auto configuredMaxBuildJobs() -> unsigned {
-  constexpr auto load = []<typename S>(S &settings) -> unsigned {
-    if constexpr (requires { settings.getWorkerSettings(); }) {
-      using Worker = std::remove_cvref_t<decltype(settings.getWorkerSettings())>;
-      // WorkerSettings' constructor is protected. Its bases are Nix's.
-      struct Fresh : Worker {}; // NOLINT(misc-multiple-inheritance)
-      Fresh fresh;
-      nix::loadConfFile(fresh);
-      return fresh.maxBuildJobs;
-    } else {
-      S fresh;
-      nix::loadConfFile(fresh);
-      return fresh.maxBuildJobs;
-    }
-  };
-  return load(nix::settings);
+  using Worker = std::remove_cvref_t<decltype(nix::settings.getWorkerSettings())>;
+  // WorkerSettings' constructor is protected. Its bases are Nix's.
+  struct Fresh : Worker {}; // NOLINT(misc-multiple-inheritance)
+  Fresh fresh;
+  nix::loadConfFile(fresh);
+  return fresh.maxBuildJobs;
 }
 
-// The worker's own `cores`. 2.36 moved it into LocalSettings.
-inline auto buildCores() -> unsigned {
-  constexpr auto get = []<typename S>(S &settings) -> unsigned {
-    if constexpr (requires { settings.getLocalSettings(); }) {
-      return settings.getLocalSettings().buildCores;
-    } else {
-      return settings.buildCores;
-    }
-  };
-  return get(nix::settings);
-}
+// The worker's own `cores`.
+inline auto buildCores() -> unsigned { return nix::settings.getLocalSettings().buildCores; }
 
-inline auto keepGoing() -> bool {
-  constexpr auto get = []<typename S>(S &settings) -> bool {
-    if constexpr (requires { settings.getWorkerSettings(); }) {
-      return settings.getWorkerSettings().keepGoing;
-    } else {
-      return settings.keepGoing;
-    }
-  };
-  return get(nix::settings);
-}
+inline auto keepGoing() -> bool { return nix::settings.getWorkerSettings().keepGoing; }
 
-inline auto buildTimeout() -> time_t {
-  constexpr auto get = []<typename S>(S &settings) -> time_t {
-    if constexpr (requires { settings.getWorkerSettings(); }) {
-      return settings.getWorkerSettings().buildTimeout;
-    } else {
-      return settings.buildTimeout;
-    }
-  };
-  return get(nix::settings);
-}
+inline auto buildTimeout() -> time_t { return nix::settings.getWorkerSettings().buildTimeout; }
 
-inline auto maxSilentTime() -> time_t {
-  constexpr auto get = []<typename S>(S &settings) -> time_t {
-    if constexpr (requires { settings.getWorkerSettings(); }) {
-      return settings.getWorkerSettings().maxSilentTime;
-    } else {
-      return settings.maxSilentTime;
-    }
-  };
-  return get(nix::settings);
-}
+inline auto maxSilentTime() -> time_t { return nix::settings.getWorkerSettings().maxSilentTime; }
 
 // Late 2.36 made openFileReadonly() return a Result. Before, a failure
 // was an invalid fd with errno set, which is what this keeps.
