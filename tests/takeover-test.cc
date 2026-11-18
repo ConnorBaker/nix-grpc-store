@@ -19,6 +19,7 @@
 #include <sys/poll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -73,9 +74,11 @@ auto exitStatus(pid_t pid) -> int
 auto next(Offer & offer, pid_t peer) -> Event
 {
     for (;;) {
-        siginfo_t info{};
-        bool const exited = ::waitid(P_PID, static_cast<id_t>(peer), &info, WEXITED | WNOHANG | WNOWAIT) == 0
-                            && info.si_pid == peer;
+        // <signal.h> and <sys/wait.h> provide these, through glibc's private
+        // headers, which include-cleaner does not map.
+        siginfo_t info{}; // NOLINT(misc-include-cleaner)
+        bool const exited = ::waitid(P_PID, static_cast<id_t>(peer), &info, WEXITED | WNOHANG | WNOWAIT) == 0 // NOLINT(misc-include-cleaner)
+                            && info.si_pid == peer; // NOLINT(misc-include-cleaner)
         if (auto const event = offer.wait(kStep); event != Event::none) {
             return event;
         }
