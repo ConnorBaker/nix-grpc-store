@@ -2,6 +2,7 @@
 
 #include "options.hh"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>

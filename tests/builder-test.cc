@@ -112,15 +112,16 @@ auto quietClaimIsGivenBack() -> bool
     builder.claim("a.drv");
     builder.callEnded("a.drv"); // say NOT_FOUND: the client was to upload and retry
     builder.claim("b.drv");     // still in its call
-    quiet.now += std::chrono::seconds(30);
+    constexpr auto halfway = std::chrono::seconds(30);
+    quiet.now += halfway;
     builder.tick();
     if (!quiet.dones.empty() || builder.holding() != 2) {
         return false;
     }
     quiet.now += past;
     builder.tick();
-    if (quiet.dones.size() != 1 || quiet.dones[0].drv_path() != "a.drv" || quiet.dones[0].assign_id() != 1
-        || quiet.dones[0].outcome() != Done::GIVEN_BACK || quiet.dones[0].reason() != Done::UNREACHABLE
+    if (quiet.dones.size() != 1 || quiet.dones.at(0).drv_path() != "a.drv" || quiet.dones.at(0).assign_id() != 1
+        || quiet.dones.at(0).outcome() != Done::GIVEN_BACK || quiet.dones.at(0).reason() != Done::UNREACHABLE
         || builder.holding() != 1) {
         return false;
     }
@@ -146,7 +147,7 @@ auto drainingGivesBackAQuietClaim() -> bool
     }
     quiet.now += past;
     builder.tick();
-    return quiet.dones.size() == 1 && quiet.dones[0].reason() == Done::DRAINING && builder.holding() == 0;
+    return quiet.dones.size() == 1 && quiet.dones.at(0).reason() == Done::DRAINING && builder.holding() == 0;
 }
 
 // A client claimed the drv (NOT_FOUND) and uploads its inputs to this builder
