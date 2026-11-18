@@ -219,6 +219,16 @@ def main():
         if ports is None:
             return setup_fail(f"no startup line with the bound ports; daemon exit {proc.poll()}")
         port, mport = ports
+        # The port is this daemon's alone: a second one asked for it must not
+        # start (gRPC's default SO_REUSEPORT let it, and share the clients).
+        second, second_log = testdaemon.start(daemon, tempfile.mkdtemp(), "--listen", f"127.0.0.1:{port}")
+        try:
+            code = second.wait(timeout=SETUP_S)
+        except subprocess.TimeoutExpired:
+            second.kill()
+            return fail(f"a second daemon on port {port} still runs after {SETUP_S}s")
+        if code == 0 or "failed to start gRPC server" not in open(second_log.name).read():
+            return fail(f"a second daemon on port {port} exited {code}, not for its listener")
         vals = None
         while time.monotonic() - start < SETUP_S:
             if proc.poll() is not None:
