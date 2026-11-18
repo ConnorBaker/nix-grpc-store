@@ -15,7 +15,7 @@ const UNIT: &str = "nix-grpc-daemon-mtls.service";
 
 /// What finds `tag`'s slow build, and no other test's.
 fn slow(tag: &str) -> String {
-    format!("read -t [9]0 {tag} ")
+    format!("[r]ead {tag} < /dev/zero")
 }
 
 fn write_expr() {
@@ -40,8 +40,8 @@ rec {
     builder = "/bin/sh";
     args = [ "-c" "echo dep-${tag} > $out" ];
   };
-  # Inner sh, so pkill lets the build end at once.
-  slow = ca "floating-slow-${tag}" "read x < ${dep}; /bin/sh -c 'read -t 90 ${tag} < /dev/zero'; echo slow-${tag} > $out";
+  # Inner sh, which runs until pkill lets the build end.
+  slow = ca "floating-slow-${tag}" "read x < ${dep}; /bin/sh -c 'read ${tag} < /dev/zero'; echo slow-${tag} > $out";
   nondet = ca "floating-nondet-${tag}" "read u < /proc/sys/kernel/random/uuid; echo $u > $out";
   # Fails, and its log says what nix-daemon says of another derivation's
   # stale build trace.
