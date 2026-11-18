@@ -106,9 +106,18 @@
           nix = nixGitFor nixpkgs.legacyPackages.${system};
         }
         // scope.versionPlugins
-        // {
-          plugin-nix_16433 = scope.pluginFor (nixFor nix16433Pin nixpkgs.legacyPackages.${system});
-        }
+        // (
+          let
+            nix16433 = nixFor nix16433Pin nixpkgs.legacyPackages.${system};
+          in
+          {
+            plugin-nix_16433 = scope.pluginFor nix16433;
+            # The daemon and the tests against it too: only a Nix with #16433
+            # passes queryMissing the evaluation store, so only here do the
+            # tests reach that branch.
+            default-nix_16433 = scope.default.override { inherit (nix16433.libs) nix-store nix-util; };
+          }
+        )
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
           inherit (scope)
             harmonia-gc

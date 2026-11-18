@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -26,9 +28,12 @@
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/worker-protocol.hh>
+#include <nix/util/error.hh>
+#include <nix/util/finally.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
+#include <nix/util/types.hh>
 #include <nix/util/util.hh>
 
 #include "channel.hh"
@@ -37,6 +42,7 @@
 #include "nix_remote.pb.h"
 #include "path-info-wire.hh"
 #include "pump.hh"
+#include "top-down.hh"
 
 namespace nix {
 
@@ -76,6 +82,167 @@ auto GrpcStore::queryValidPathsRouted(const StorePathSet & paths, SubstituteFlag
   return res;
 }
 
+namespace {
+
+// What Nix's queryMissing walk visits: a derivation and the outputs wanted of
+// it. Reads each derivation from the evaluation store once, when asked; one
+// it cannot read has no outputs or inputs here, and is left to the walk.
+class WalkGraph {
+public:
+  using Node = DerivedPath::Built;
+
+  explicit WalkGraph(Store & evalStore) : evalStore(&evalStore) {}
+
+  // The wanted outputs whose paths are known, each with its derivation.
+  auto keys(const Node & node) -> std::vector<StorePath> {
+    std::vector<StorePath> wanted;
+    auto const & drvPath = node.drvPath->getBaseStorePath();
+    for (const auto & [name, path] : outputs(drvPath)) {
+      if (path && node.outputs.contains(name)) {
+        wanted.push_back(*path);
+        derivers.insert_or_assign(*path, drvPath);
+      }
+    }
+    return wanted;
+  }
+
+  // The input derivations, each with the outputs this one uses.
+  auto children(const Node & node) -> std::vector<Node> {
+    std::map<StorePath, StringSet> used;
+    if (const auto * drv = read(node.drvPath->getBaseStorePath())) {
+      nixcompat::forInputOutputs(*drv, [&](const StorePath & input, const std::string & name) -> void {
+        used[input].insert(name);
+      });
+    }
+    std::vector<Node> below;
+    below.reserve(used.size());
+    for (auto & [input, names] : used) {
+      below.push_back(
+          Node{.drvPath = makeConstantStorePathRef(input), .outputs = OutputsSpec::Names{std::move(names)}});
+    }
+    return below;
+  }
+
+  // Of these outputs, those the client's substituters have, asked only for
+  // a derivation that allows substitutes, as Nix's walk asks.
+  auto substitutable(const StorePathSet & paths) -> StorePathSet {
+    StorePathCAMap query;
+    for (const auto & path : paths) {
+      const auto * drv = read(derivers.at(path));
+      if (drv != nullptr && nixcompat::substitutesAllowed(*evalStore, *drv)) {
+        query.emplace(path, std::nullopt);
+      }
+    }
+    SubstitutablePathInfos infos;
+    evalStore->Store::querySubstitutablePathInfos(query, infos);
+    StorePathSet found;
+    for (const auto & [path, _info] : infos) {
+      found.insert(path);
+    }
+    return found;
+  }
+
+private:
+  Store * evalStore;
+  std::map<StorePath, std::map<std::string, std::optional<StorePath>>> outputMaps;
+  std::map<StorePath, std::optional<Derivation>> drvs;
+  std::map<StorePath, StorePath> derivers;
+
+  auto outputs(const StorePath & drvPath) -> const std::map<std::string, std::optional<StorePath>> & {
+    auto found = outputMaps.find(drvPath);
+    if (found == outputMaps.end()) {
+      std::map<std::string, std::optional<StorePath>> known;
+      try {
+        known = evalStore->queryStaticPartialDerivationOutputMap(drvPath);
+      } catch (Error & err) {
+        debug("not asking ahead for '%s': %s", evalStore->printStorePath(drvPath), err.what());
+      }
+      found = outputMaps.emplace(drvPath, std::move(known)).first;
+    }
+    return found->second;
+  }
+
+  auto read(const StorePath & drvPath) -> const Derivation * {
+    auto found = drvs.find(drvPath);
+    if (found == drvs.end()) {
+      std::optional<Derivation> drv;
+      try {
+        drv = evalStore->readDerivation(drvPath);
+      } catch (Error & err) {
+        debug("not asking ahead below '%s': %s", evalStore->printStorePath(drvPath), err.what());
+      }
+      found = drvs.emplace(drvPath, std::move(drv)).first;
+    }
+    return found->second ? &*found->second : nullptr;
+  }
+};
+
+} // namespace
+
+auto GrpcStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute) -> StorePathSet {
+  if (askedAhead.store != this || maybeSubstitute != NoSubstitute) {
+    return queryValidPathsRouted(paths, maybeSubstitute, {});
+  }
+  if (auto * ask = askedAhead.ask; ask != nullptr && *ask) {
+    std::exchange(*ask, nullptr)();
+  }
+  StorePathSet held;
+  StorePathSet unasked;
+  for (const auto & path : paths) {
+    if (auto const known = askedAhead.valid->find(path); known == askedAhead.valid->end()) {
+      unasked.insert(path);
+    } else if (known->second) {
+      held.insert(path);
+    }
+  }
+  if (!unasked.empty()) {
+    held.merge(queryValidPathsRouted(unasked, NoSubstitute, {}));
+  }
+  return held;
+}
+
+// Nix's walk asks about validity one path at a time, or (on a Nix that
+// batches it) one level of the graph at a time, a round trip each. So at its
+// first question, ask ahead in batches, top-down as the walk goes: the
+// targets, then the inputs of the derivations whose wanted outputs the farm
+// lacks and the client's substituters cannot provide, as the walk goes below
+// only those. Each call takes a level and the levels below it that fit in
+// topDownBudget, so it may cover derivations the walk never reaches. Only
+// validity is recorded: the walk still decides everything, and asks what the
+// batches did not reach (a derivation the evaluation store cannot read, a
+// reference of a substitutable output) itself.
+void GrpcStore::askAhead(const std::vector<DerivedPath> & targets, Store & evalStore,
+                         std::map<StorePath, bool> & valid) {
+  WalkGraph graph(evalStore);
+  std::vector<WalkGraph::Node> roots;
+  for (const auto & target : targets) {
+    const auto * built = std::get_if<DerivedPath::Built>(&target.raw());
+    if (built != nullptr && std::holds_alternative<SingleDerivedPath::Opaque>(built->drvPath->raw())) {
+      roots.push_back(*built);
+    }
+  }
+  nixgrpc::missingTopDown(
+      std::move(roots), [&](const WalkGraph::Node & node) -> std::vector<StorePath> { return graph.keys(node); },
+      [&](const WalkGraph::Node & node) -> std::vector<WalkGraph::Node> { return graph.children(node); },
+      [&](const StorePathSet & paths) -> StorePathSet {
+        auto held = queryValidPathsRouted(paths, NoSubstitute, {});
+        for (const auto & path : paths) {
+          valid.insert_or_assign(path, held.contains(path));
+        }
+        return held;
+      },
+      nixgrpc::topDownBudget, [&](const StorePathSet & paths) -> StorePathSet { return graph.substitutable(paths); });
+}
+
+auto GrpcStore::walkMissingAskedAhead(const std::vector<DerivedPath> & targets, Store & evalStore)
+    -> MissingPaths {
+  std::map<StorePath, bool> valid;
+  std::function<void()> ask = [&] -> void { askAhead(targets, evalStore, valid); };
+  auto const outer = std::exchange(askedAhead, {.store = this, .valid = &valid, .ask = &ask});
+  Finally const restore([&] -> void { askedAhead = outer; });
+  return walkMissing(*this, targets, &evalStore);
+}
+
 #if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE
 auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets, Store * evalStore)
     -> MissingPaths {
@@ -86,7 +253,7 @@ auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets) -> Missin
   if (evalStore != nullptr && evalStore != this) {
     // The remote daemon cannot read the caller's evaluation store. Walk the
     // graph client-side, using native RPCs for build-store path queries.
-    return walkMissing(*this, targets, evalStore);
+    return walkMissingAskedAhead(targets, *evalStore);
   }
 
   remote::QueryMissingRequest request;

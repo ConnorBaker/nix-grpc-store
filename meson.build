@@ -305,6 +305,20 @@ if build_server
     timeout : 300,
   )
 
+  # queryMissing with an evaluation store, through the plugin as nix loads
+  # it: a QueryValidPaths per batch of derivations, not per output, and
+  # Nix's own answer. Skips (77) without NixOS/nix#16433.
+  query_missing_client = executable('query-missing-client',
+    sources : ['tests/query-missing-client.cc'],
+    include_directories : [src_inc],
+    cpp_args : nix_compat_args,
+    dependencies : common_deps + [nix_store_dep, nix_util_dep, dependency('dl')],
+  )
+  test('query-missing', find_program('python3'),
+    args : [files('tests/query-missing-test.py'), daemon_exe, query_missing_client, client_plugin],
+    timeout : 300,
+  )
+
   test('scheduler', executable('scheduler-test',
     sources : ['tests/scheduler-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],

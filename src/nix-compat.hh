@@ -440,16 +440,26 @@ template <typename F> void forInputOutputs(const nix::Derivation &drv, const F &
 #endif
 }
 
-inline auto requiredSystemFeatures(const nix::StoreDirConfig &store,
-                                   const nix::BasicDerivation &drv) -> nix::StringSet {
+// drv: a BasicDerivation, or a Derivation.
+template <typename Drv> auto derivationOptions(const nix::StoreDirConfig &store, const Drv &drv) {
   const auto *attrs = drv.structuredAttrs ? &*drv.structuredAttrs : nullptr;
 #if NIX_COMPAT_AT_LEAST(2, 34)
-  auto const options = nix::derivationOptionsFromStructuredAttrs(store, drv.env, attrs, /*shouldWarn=*/false);
+  return nix::derivationOptionsFromStructuredAttrs(store, drv.env, attrs, /*shouldWarn=*/false);
 #else
   (void)store;
-  auto options = nix::DerivationOptions::fromStructuredAttrs(drv.env, attrs, /*shouldWarn=*/false);
+  return nix::DerivationOptions::fromStructuredAttrs(drv.env, attrs, /*shouldWarn=*/false);
 #endif
-  return options.getRequiredSystemFeatures(drv);
+}
+
+inline auto requiredSystemFeatures(const nix::StoreDirConfig &store,
+                                   const nix::BasicDerivation &drv) -> nix::StringSet {
+  return derivationOptions(store, drv).getRequiredSystemFeatures(drv);
+}
+
+// Whether Nix may substitute drv's outputs: its allowSubstitutes, or
+// always-allow-substitutes.
+template <typename Drv> auto substitutesAllowed(const nix::StoreDirConfig &store, const Drv &drv) -> bool {
+  return derivationOptions(store, drv).substitutesAllowed(nix::settings.getWorkerSettings());
 }
 
 // Substitute `path` if it is not valid.
