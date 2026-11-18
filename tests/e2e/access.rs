@@ -404,7 +404,7 @@ fn access_log_attributes_clients_by_certificate_cn() {
     succeed(&["nix", "store", "info", "--store", STORE]);
     succeed(&["nix", "path-info", "--store", STORE, p]);
     let connect = "event=rpc method=Connect cn=localhost .*bytes_out=";
-    wait_journal_above(MTLS, connect, 0, 20);
+    wait_journal_above(MTLS, connect, 0);
     assert_journal("nix-grpc-daemon.service", "event=rpc method=Connect cn=- ");
     assert_journal(
         "nix-grpc-daemon.service",

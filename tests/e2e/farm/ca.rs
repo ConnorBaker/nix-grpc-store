@@ -22,7 +22,7 @@ fn ca_build(prefix: &[&str], tag: &str, attr: &str) -> Vec<String> {
 
 /// The output of `ca_build` through the client's nix-daemon.
 fn build_ca(tag: &str, attr: &str) -> String {
-    let built = run_t(CLIENT, &strs(&ca_build(&["env", "NIX_REMOTE=daemon"], tag, attr)), 300);
+    let built = run(CLIENT, &strs(&ca_build(&["env", "NIX_REMOTE=daemon"], tag, attr)));
     assert_eq!(built.code, 0, "building {attr} failed: {}", built.combined());
     built.stdout.trim().to_string()
 }
@@ -31,7 +31,7 @@ fn build_ca(tag: &str, attr: &str) -> String {
 /// for `tag`. Nothing is built for this: a missing one fails.
 fn realised(store: &str, tag: &str, attr: &str) -> String {
     let ca = expr("CA");
-    let info = run_t(
+    let info = run(
         CLIENT,
         &[
             "nix",
@@ -47,7 +47,6 @@ fn realised(store: &str, tag: &str, attr: &str) -> String {
             "tag",
             tag,
         ],
-        60,
     );
     assert_eq!(
         info.code,
@@ -73,7 +72,7 @@ fn content(store: &str, path: &str) -> String {
 fn a_floating_derivation_on_another_is_resolved_by_the_client() {
     farm_ready();
     // Unchanged: the farm's own planner needs output paths before the build.
-    let planned = run_t(
+    let planned = run(
         CLIENT,
         &[
             "nix",
@@ -89,7 +88,6 @@ fn a_floating_derivation_on_another_is_resolved_by_the_client() {
             "tag",
             "planned",
         ],
-        120,
     );
     assert_ne!(planned.code, 0, "{}", planned.combined());
     assert!(
@@ -156,14 +154,14 @@ fn a_second_client_attaches_to_a_floating_build() {
         let spawn = ["systemd-run", "--unit", unit, "--setenv", &remote];
         succeed(CLIENT, &strs(&ca_build(&spawn, "share", "slow")));
         if unit == "ca-share1" {
-            wait_building();
+            wait_building(unit);
         }
     }
-    retry(120, "the second client attached", || {
+    retry_with_clients(CLIENT, &["ca-share2"], "the second client attached", || {
         attached() - before == 1
     });
     release_slow();
-    wait_unit_done("ca-share1 ca-share2", 120);
+    wait_unit_done("ca-share1 ca-share2");
     for unit in ["ca-share1", "ca-share2"] {
         assert_unit_success(unit);
     }
@@ -194,7 +192,7 @@ fn build_info_shows_the_features_a_builder_offers() {
 #[test]
 fn an_impure_derivation_finds_no_builder() {
     farm_ready();
-    let o = run_t(CLIENT, &strs(&ca_build(&["env", "NIX_REMOTE=daemon"], "impure", "impure")), 300);
+    let o = run(CLIENT, &strs(&ca_build(&["env", "NIX_REMOTE=daemon"], "impure", "impure")));
     let out = o.combined();
     assert_ne!(o.code, 0, "{out}");
     assert!(out.contains("offers features {ca-derivations,impure-derivations}"), "{out}");

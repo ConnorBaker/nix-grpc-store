@@ -14,16 +14,17 @@
 }:
 
 let
-  # Runs `secs` seconds and says when it starts, so the test knows the build
-  # is under way and how often it ran.
+  # Says when it starts, so the test knows the build is under way and how
+  # often it ran, and if `hold`, runs until the test writes a line to the
+  # fifo `release` in its build directory (tests/e2e/handover.rs release).
   slowExpr = pkgs.writeText "slow.nix" ''
-    { tag, secs ? "75" }:
+    { tag, hold ? true }:
     derivation {
       name = "slow-''${tag}";
       system = builtins.currentSystem;
       builder = "/bin/sh";
       PATH = builtins.storePath "${pkgs.coreutils}" + "/bin";
-      args = [ "-c" "echo SLOW-STARTED-''${tag} >&2; sleep ''${secs}; echo ''${tag} > $out" ];
+      args = [ "-c" "mkfifo release; echo SLOW-STARTED-''${tag} >&2; ''${if hold then "read x < release" else ":"}; echo ''${tag} > $out" ];
     }
   '';
 in
