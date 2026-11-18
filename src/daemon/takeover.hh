@@ -67,10 +67,10 @@ public:
 
     void send(const std::vector<int> & fds, std::string_view env);
     // After `ready`: asks systemd to make the successor the unit's main
-    // process and waits up to `timeout` until systemd has read that. True if
-    // the successor lives then, so it lived when systemd checked it. False if
-    // it is gone, which systemd refuses, so this one is still the main
-    // process: reject() and serve on.
+    // process and waits up to `timeout` (negative: no limit) until systemd
+    // has read that. True if the successor lives then, so it lived when
+    // systemd checked it. False if it is gone, which systemd refuses, so this
+    // one is still the main process: reject() and serve on.
     auto makeMain(std::chrono::milliseconds timeout) -> bool;
     // Confirms to the successor that it is the main process now. The
     // connection stays open until this process exits.

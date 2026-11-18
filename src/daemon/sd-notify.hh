@@ -58,7 +58,8 @@ inline void sdNotify(std::string_view state, int passFd = -1)
 }
 
 // Returns once systemd has processed everything sent before, or after
-// `timeout`. False on timeout or if there is no systemd.
+// `timeout` (negative: no limit, as for poll). False on timeout or if there
+// is no systemd.
 inline auto sdNotifyBarrier(std::chrono::milliseconds timeout) -> bool
 {
     if (!nix::getEnv("NOTIFY_SOCKET")) {
