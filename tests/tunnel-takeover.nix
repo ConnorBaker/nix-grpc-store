@@ -184,9 +184,10 @@ pkgs.testers.runNixOSTest {
         client.succeed(f"systemd-run --unit long --setenv=PATH=/run/current-system/sw/bin sh -c \"{build('long', 1)} > /root/long.out\"")
         wait_succeeds(client, "journalctl -u long | grep -q STARTED-long", clients=[(client, "long")])
         old = main_pid()
-        handed = int(single.succeed(f"journalctl -u {unit} | grep -c event=handed_over || true"))
+        # "event=handed_over pid=": not the old process's handed_over_exit
+        handed = int(single.succeed(f"journalctl -u {unit} | grep -c 'event=handed_over pid=' || true"))
         single.succeed("/run/current-system/specialisation/next/bin/switch-to-configuration test")
-        wait_journal(single, unit, "event=handed_over", more_than=handed)
+        wait_journal(single, unit, "event=handed_over pid=", more_than=handed)
         new = main_pid()
         assert new != old, f"no new main process: {new}"
         before, old_calls = stats(), calls(old)
@@ -201,7 +202,7 @@ pkgs.testers.runNixOSTest {
         assert client.execute("systemctl is-active long", timeout=None)[0] == 0, "the builds after the takeover waited for the old process"
         assert calls(old) == old_calls, single.succeed(f"journalctl -o cat _PID={old}")
         # Once handed over, the old process offers no tunnel and has none taken.
-        since = single.succeed(f"journalctl -o cat _PID={old}").split("event=handed_over", 1)[1]
+        since = single.succeed(f"journalctl -o cat _PID={old}").split("event=handed_over pid=", 1)[1]
         assert "event=tunnels_open" not in since and "event=tunnel_failed" not in since, since
         assert delta["cluster.tunnelled.upstream_rq_total"] >= 4, delta
         assert delta["cluster.tunnelled.upstream_rq_5xx"] == 0, delta
@@ -216,7 +217,7 @@ pkgs.testers.runNixOSTest {
         # The successor says so once its connection to the old process ends,
         # which may come before or after the old pid is reaped: both are
         # waited for, each irreversible.
-        wait_journal(single, unit, f"event=predecessor_exited pid={old}")
+        wait_journal(single, unit, f"event=predecessor_exited pid={old}( |$)")
         wait_succeeds(single, f"! test -d /proc/{old}")
         client.succeed(build("later", 0))
   '';
