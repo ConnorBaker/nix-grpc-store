@@ -1922,6 +1922,9 @@ try {
     std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> acceptor;
     int port = 0;
     if (listenFds.empty()) {
+        // The port is ours alone: with gRPC's default SO_REUSEPORT a second
+        // daemon on it would start too and get half the connections.
+        builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
         builder.AddListeningPort(options.listen, creds, &port);
     } else {
         options.listen = "systemd";
