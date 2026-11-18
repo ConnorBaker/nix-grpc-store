@@ -150,7 +150,7 @@ else
   module_suffix = 'so'
 endif
 
-shared_module('nix-grpc-store',
+client_plugin = shared_module('nix-grpc-store',
   sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
   include_directories : [gen_inc, src_inc],
   cpp_pch : do_pch ? ['pch/client_pch.hh'] : [],
@@ -211,7 +211,7 @@ if build_server
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
 
-  executable('nix-grpc-daemon',
+  daemon_exe = executable('nix-grpc-daemon',
     sources : daemon_sources + [gen, eds_gen],
     include_directories : [gen_inc, src_inc],
     cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
@@ -267,6 +267,34 @@ if build_server
     dependencies : [nix_util_dep, curl_dep, json_dep, threads_dep],
     cpp_args : ['-UNDEBUG'],
   ))
+
+  # A client that vanished without closing its connection must not keep its
+  # builds wanted: the daemon ends its Schedule stream, and the build only
+  # that client followed ends, revoked or given back, and is not placed again.
+  test('keepalive', find_program('python3'),
+    args : [files('tests/keepalive-test.py'), daemon_exe],
+    timeout : 180,
+  )
+
+  # The other side: a client waiting on its Schedule stream must notice by
+  # itself that the daemon is gone when no FIN reaches it, and the pings
+  # that tell it must not get it GOAWAY too_many_pings.
+  keepalive_client = executable('keepalive-client',
+    sources : ['tests/keepalive-client.cc', 'src/client/channel.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/client')],
+    cpp_args : nix_compat_args,
+    dependencies : common_deps + [nix_store_dep, nix_util_dep, openssl_dep],
+  )
+  # A store query through the plugin as nix loads it, to see that one cut
+  # off by those pings is asked again.
+  store_query_client = executable('store-query-client',
+    sources : ['tests/store-query-client.cc'],
+    dependencies : common_deps + [nix_store_dep, nix_util_dep, dependency('dl')],
+  )
+  test('client-keepalive', find_program('python3'),
+    args : [files('tests/client-keepalive-test.py'), daemon_exe, keepalive_client, store_query_client, client_plugin],
+    timeout : 300,
+  )
 
   test('scheduler', executable('scheduler-test',
     sources : ['tests/scheduler-test.cc'],

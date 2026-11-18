@@ -58,6 +58,11 @@ stdenv.mkDerivation {
         ../../fuzz
         ../../tests/.clang-tidy
         ../../tests/farm-mock.py
+        ../../tests/keepalive-test.py
+        ../../tests/testdaemon.py
+        ../../tests/client-keepalive-test.py
+        ../../tests/keepalive-client.cc
+        ../../tests/store-query-client.cc
         ../../tests/farm-client-test.cc
         ../../tests/farm-sim-test.cc
         ../../tests/farm-client-test.sh
