@@ -1,4 +1,5 @@
-// grpc:// Store: channel setup, error mapping, trust probe, worker-protocol tunnel, registration.
+// grpc:// Store: channel setup, error mapping, trust probe, worker-protocol tunnel, and the
+// entry GrpcStoreConfig::openStore (store-config.cc) loads this library for.
 
 #include "store.hh"
 
@@ -22,14 +23,10 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/derivations.hh>
-#include <nix/store/globals.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/remote-store.hh>
 #include <nix/store/store-api.hh>
-#include <nix/store/store-registration.hh>
 #include <nix/store/worker-protocol.hh>
-#include <nix/util/configuration.hh>
-#include <nix/util/environment-variables.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/logging.hh>
@@ -40,7 +37,6 @@
 #include "channel.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
-#include "parse-int.hh"
 #include "pump.hh"
 #include "retry.hh"
 
@@ -234,112 +230,14 @@ auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
   return conn;
 }
 
-auto GrpcStoreConfig::openStore() const -> ref<Store> {
+} // namespace nix
+
+// Declared in store-config.hh.
+extern "C" void nix_grpc_store_open(const nix::GrpcStoreConfig & config, std::shared_ptr<nix::Store> & store) {
   // gRPC reads its trace settings in grpc_init().
-  if (debug) {
+  if (config.debug) {
     nixgrpc::enableGrpcTracing();
   }
   nixgrpc::retainGrpcRuntime();
-  return make_ref<GrpcStore>(ref{shared_from_this()});
-}
-
-} // namespace nix
-
-namespace nixgrpc {
-
-namespace {
-
-constexpr auto lingerEnv = "NIX_GRPC_LINGER";
-constexpr auto leaseEnv = "NIX_GRPC_LEASE";
-
-// `grpc-linger`: seconds the scheduler is asked to keep a build of this
-// client's once the client leaves, because it will ask for it again
-// (Want.linger_s): a chain of time-bounded `nix build`s, say. It lives in
-// nix::settings, not in the store URL, which `builders` shares with every
-// build on the machine: it is set per invocation (`--option grpc-linger
-// 600`), sent to the daemon with the other settings, and applied there for
-// a trusted user. The build hook the daemon starts reads its parent's
-// settings before it loads plugins (`nix __build-remote`) and so drops this
-// one; the value also goes to the environment, which the hook inherits and
-// takes the default from.
-struct LingerSetting : nix::Setting<unsigned> {
-  using nix::Setting<unsigned>::Setting;
-
-protected:
-  void appendOrSet(unsigned value, bool append) override {
-    nix::Setting<unsigned>::appendOrSet(value, append);
-    nix::setEnv(lingerEnv, std::to_string(get()).c_str());
-  }
-};
-
-auto lingerSetting() -> LingerSetting & {
-  // Never destroyed: nix::settings keeps a pointer to it until the process
-  // exits, and may outlive a static of this plugin's.
-  static auto * const setting = new LingerSetting{ // NOLINT(cppcoreguidelines-owning-memory): never freed, see above
-      &nix::settings, parseInt<unsigned>(nix::getEnv(lingerEnv).value_or("")).value_or(0), "grpc-linger",
-      "Seconds a `grpc://` scheduler is asked to keep a build once this client leaves, because it will "
-      "ask for it again (a chain of time-bounded clients). The scheduler caps it (`--max-linger`). "
-      "Reaches the build hook only from a trusted user."};
-  return *setting;
-}
-
-// `grpc-lease`: the name of this client's chain, so that the scheduler keeps
-// a build while any chain's lease on it is live, and Release ends one chain's
-// alone (Want.lease_id). It travels as grpc-linger does.
-struct LeaseSetting : nix::Setting<std::string> {
-  using nix::Setting<std::string>::Setting;
-
-protected:
-  void appendOrSet(std::string value, bool append) override {
-    nix::Setting<std::string>::appendOrSet(std::move(value), append);
-    nix::setEnv(leaseEnv, get().c_str());
-  }
-};
-
-auto leaseSetting() -> LeaseSetting & {
-  // Never destroyed, as lingerSetting.
-  static auto * const setting = new LeaseSetting{ // NOLINT(cppcoreguidelines-owning-memory): never freed, see above
-      &nix::settings, nix::getEnv(leaseEnv).value_or(""), "grpc-lease",
-      "A name for this client's chain of time-bounded clients, the same for each of them: the "
-      "`grpc-linger` they declare is its lease, which keeps a build until it is over or ended "
-      "(the store's `release-lease`). Reaches the build hook only from a trusted user."};
-  return *setting;
-}
-
-} // namespace
-
-auto lingerSeconds() -> unsigned { return lingerSetting().get(); }
-
-auto leaseId() -> std::string { return leaseSetting().get(); }
-
-} // namespace nixgrpc
-
-namespace {
-
-// "2.31.5" / "2.35pre20260619_f8bb823a" -> "2.31" / "2.35"
-auto majorMinor(std::string_view version) -> std::string_view {
-  auto const firstDot = version.find('.');
-  auto const end = version.find_first_not_of("0123456789", firstDot + 1);
-  return version.substr(0, end);
-}
-
-} // namespace
-
-// Called by Nix right after dlopen(). Registering here instead of in a static
-// initializer lets a version mismatch degrade to a warning.
-extern "C" void nix_plugin_entry() {
-  auto const running = majorMinor(nix::nixVersion);
-  auto const builtAgainst = majorMinor(NIX_GRPC_BUILT_AGAINST_NIX);
-  if (running != builtAgainst) {
-    nix::warn(
-        "nix-grpc-store plugin was built against Nix %s but is being loaded by Nix %s. "
-        "grpc:// stores are unavailable",
-        std::string(builtAgainst), std::string(running));
-    return;
-  }
-  static const nix::RegisterStoreImplementation<nix::GrpcStoreConfig> regGrpcStore;
-  // Registers grpc-linger and grpc-lease before Nix applies the nix.conf and
-  // --option values it did not know yet (initPlugins).
-  static_cast<void>(nixgrpc::lingerSeconds());
-  static_cast<void>(nixgrpc::leaseId());
+  store = std::make_shared<nix::GrpcStore>(nix::ref{config.shared_from_this()});
 }
