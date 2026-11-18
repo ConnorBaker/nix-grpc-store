@@ -724,6 +724,22 @@ fn a_finished_build_is_published_after_its_client_left() {
     wait_until_succeeds(CLIENT, &query, 120);
 }
 
+/// Uploads a new path straight to `w`, so that it publishes. Bounded below
+/// run_t's limit: it runs from guards, where a panic would abort.
+fn republish(w: Node) {
+    let _ = run_t(
+        CLIENT,
+        &[
+            "sh",
+            "-c",
+            r#"date +%s%N > /tmp/republish && timeout 100 nix copy --no-check-sigs --to "$1" "$(nix-store --add /tmp/republish)""#,
+            "sh",
+            &direct(w),
+        ],
+        120,
+    );
+}
+
 /// When niks3 can't take a build's outputs, the build fails with the upload
 /// error instead of being rebuilt on the other worker.
 #[test]
@@ -748,6 +764,11 @@ fn a_failed_upload_fails_the_build_instead_of_rebuilding_it() {
     impl Drop for Unblock {
         fn drop(&mut self) {
             block("-D");
+            // A worker whose publish failed is kept out of the way until
+            // one works there again.
+            for w in WORKERS {
+                republish(w);
+            }
         }
     }
     spawn_build("pubdown", "pubdown");
@@ -763,6 +784,137 @@ fn a_failed_upload_fails_the_build_instead_of_rebuilding_it() {
     assert!(log.contains("publish failed"), "{log}");
     assert_eq!(built() - before, 1, "{log}");
     assert_eq!(failed() - failed_before, 1, "{log}");
+}
+
+/// Empties `broken`'s niks3 token, as a CI builder's came out empty, and
+/// fails an upload there, until the scheduler and the balancer keep it out
+/// of the way. Dropping the result restores the token and republishes.
+fn stop_publishing(broken: Node) -> Restore {
+    let sys = system();
+    let token = succeed(broken, &["sh", "-c", "ls /nix/store/*-niks3-token"])
+        .trim()
+        .to_string();
+    succeed(
+        broken,
+        &[
+            "sh",
+            "-c",
+            // The next push starts afresh and reads it. pushFlags come
+            // between `push` and `--stdin`; the daemon's own command line
+            // names `niks3 push` but not `--stdin`.
+            r#": > /tmp/empty-token && mount --bind /tmp/empty-token "$1" && { pkill -f 'push .*--[s]tdin' || true; }"#,
+            "sh",
+            &token,
+        ],
+    );
+    // Later tests need the token and the builder back, also when this one
+    // fails: an upload that publishes brings it back.
+    let mounted = Restore(broken, token);
+    let path = succeed(CLIENT, &["sh", "-c", "echo nopub > /tmp/nopub && nix-store --add /tmp/nopub"])
+        .trim()
+        .to_string();
+    let failing = || journal_count(leader(), UNIT, "event=publish_failing");
+    let before = failing();
+    // The client retries a failed publish for as long as it is let.
+    let o = run_t(
+        CLIENT,
+        &["timeout", "30", "nix", "copy", "--no-check-sigs", "--to", &direct(broken), &path],
+        60,
+    );
+    assert_ne!(o.code, 0, "{}", o.combined());
+    retry(60, "the scheduler hears that the builder cannot publish", || failing() > before);
+    retry(60, "the balancer sends the builder nothing", || !members(&sys).contains(&broken));
+    mounted
+}
+
+struct Restore(Node, String);
+
+impl Restore {
+    /// Gives the builder its token back, telling it nothing.
+    fn unmount(&self) {
+        succeed(self.0, &["umount", &self.1]);
+    }
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = run_t(self.0, &["sh", "-c", r#"! mountpoint -q "$1" || umount "$1""#, "sh", &self.1], 30);
+        republish(self.0);
+    }
+}
+
+fn build_job(tag: &str) -> Out {
+    run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "--impure",
+            "--expr",
+            &format!("import {} {{ tag = \"{tag}\"; }}", expr("JOB")),
+        ],
+        300,
+    )
+}
+
+/// A builder whose publishes fail, like a CI builder whose niks3 token file
+/// came out empty, gets builds only while no other has a slot, and nothing
+/// else from the balancer, until a publish works there again.
+#[test]
+fn a_builder_that_cannot_publish_gets_no_work_while_another_can_take_it() {
+    farm_ready();
+    let sys = system();
+    let broken = standby();
+    let mounted = stop_publishing(broken);
+    let built = || events(broken, "built");
+    let built_before = built();
+    let o = build_job("nopub");
+    drop(mounted);
+    assert_eq!(o.code, 0, "{}", o.combined());
+    assert_eq!(built() - built_before, 0, "{}", o.combined());
+    wait_members(&sys, &WORKERS);
+    retry(60, "scheduler settled", settled);
+}
+
+/// Only a publish tells a builder that publishing works again, and it gets
+/// no build while the other one has a slot: under low load it stays out of
+/// the way, however long. Once the other is full, the next build goes to it,
+/// and its publish brings it back.
+#[test]
+fn a_builder_that_can_publish_again_gets_a_build_once_the_other_is_full() {
+    farm_ready();
+    let sys = system();
+    let broken = standby();
+    let other = leader();
+    let mounted = stop_publishing(broken);
+    mounted.unmount();
+    let built = || events(broken, "built");
+    let built_before = built();
+    for i in 0..3 {
+        let o = build_job(&format!("idle{i}"));
+        assert_eq!(o.code, 0, "{}", o.combined());
+    }
+    assert_eq!(built() - built_before, 0, "a build went to the builder while the other had a slot");
+    assert!(!members(&sys).contains(&broken), "the builder is back without a publish");
+    let slots = gauge(other, "nix_grpc_build_slots");
+    let tags = (0..=slots).map(|i| format!("\"full{i}\"")).collect::<Vec<_>>().join(" ");
+    let burst = format!("map (tag: import {} {{ inherit tag; }}) [ {tags} ]", expr("SLOW"));
+    succeed(
+        CLIENT,
+        &["systemd-run", "--unit", "full", "nix", "build", "--store", &envoy(), "--eval-store", "auto", "--impure", "--expr", &burst],
+    );
+    retry(90, "the builder takes the build the other has no slot for", || building().contains(&broken));
+    release_slow();
+    wait_unit_done("full", 120);
+    assert_unit_success("full");
+    assert_eq!(built() - built_before, 1);
+    retry(60, "its publish brings the builder back", || members(&sys).contains(&broken));
+    drop(mounted);
+    retry(60, "scheduler settled", settled);
 }
 
 #[test]
