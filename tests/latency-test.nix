@@ -63,7 +63,7 @@ pkgs.testers.runNixOSTest {
     ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
     ${import ./lib/waits.nix}
     wait_unit(machine, "nix-grpc-daemon.socket")
-    wait_port(machine, 50051)
+    wait_succeeds(machine, "nc -z localhost 50051")
     env = {"NGS_CHAIN_EXPR": "${chainNix}", "NGS_SYSTEM": "${system}"}
     run_e2e({"machine": machine}, env, "latency::", "--test-threads=1")
   '';

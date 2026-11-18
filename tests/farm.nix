@@ -425,9 +425,8 @@ pkgs.testers.runNixOSTest {
         wait_unit(n, "network-addresses-eth1.service")
         n.succeed(f"ip -4 addr show | grep -qF {a}/ || {{ ip -4 addr >&2; false; }}")
     wait_unit(lb, "niks3.service")
-    wait_port(lb, 5751)
     wait_unit(lb, "envoy.service")
-    wait_port(lb, 50051)
+    wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")
     for w in [worker1, worker2]:
         w.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 

@@ -148,8 +148,7 @@ pkgs.testers.runNixOSTest {
     ${import ./lib/waits.nix}
     start_all()
     wait_unit(lb, "niks3.service")
-    wait_port(lb, 5751)
-    wait_port(lb, 50051)
+    wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")
     # The tunnels come from the daemon, not from its socket.
     single.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 
@@ -217,7 +216,7 @@ pkgs.testers.runNixOSTest {
         # The successor says so once its connection to the old process ends,
         # which may come before or after the old pid is reaped: both are
         # waited for, each irreversible.
-        wait_journal(single, unit, f"event=predecessor_exited pid={old}( |$)")
+        wait_journal(single, unit, f"event=predecessor_exited pid={old}( |$)", clients=[(single, unit)])
         wait_succeeds(single, f"! test -d /proc/{old}")
         client.succeed(build("later", 0))
   '';
