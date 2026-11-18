@@ -341,6 +341,14 @@ pkgs.testers.runNixOSTest {
 
     def kubectl(args: str) -> str:
         return machine.succeed("kubectl -n farm " + args)
+    def release(tag: str, in_pods: list[str], unit: str) -> None:
+        # Kills the held build's inner sh in whichever of in_pods runs it
+        # (pgrep and the shell's kill: the image need not have pkill), until
+        # one does; unit, the client, ending first fails the wait.
+        kill = shlex.quote(f"kill $(pgrep -f '{tag}-holdin[g]$')")
+        def released() -> bool:
+            return any(machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- sh -c {kill}", timeout=None)[0] == 0 for p in in_pods)
+        wait_until(f"the held build {tag} released", released, clients=[(machine, unit)])
     def pod_ip(selector: str) -> str:
         return kubectl(f"get pod {selector} -o jsonpath='{{.items[0].status.podIP}}{{.status.podIP}}'").strip()
     def rollout(deployment: str) -> None:
@@ -452,8 +460,7 @@ pkgs.testers.runNixOSTest {
         # the balancer gone and back while the build runs; then it may end
         wait_succeeds(machine, f"! kubectl -n farm get pod {lb_pod}")
         rollout("nix-grpc-farm-lb")
-        released = [p for p in pods if machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- pkill -f 'slow-lb1-holdin[g]$'", timeout=None)[0] == 0]
-        assert released, "no worker pod ran the build through the balancer's loss"
+        release("lb1", pods, "vialb")
         wait_succeeds(machine, "! systemctl is-active vialb")
         machine.succeed("systemctl show -p Result --value vialb | grep -qx success || { journalctl -u vialb >&2; false; }")
 
@@ -464,10 +471,11 @@ pkgs.testers.runNixOSTest {
             return next((p for p in pods if machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- pgrep -f 'slow-s1-holdin[g]$'", timeout=None)[0] == 0), None)
         wait_until("a worker pod to run the slow build", lambda: holder() is not None, clients=[(machine, "slow")])
         busy = holder()
+        assert busy is not None
         kubectl(f"delete pod {busy} --wait=false")
         machine.sleep(duration=sec(5))
         assert holder() == busy, "pod delete killed the build instead of draining"
-        kubectl(f"exec {busy} -c nix-daemon -- pkill -f 'slow-s1-holdin[g]$'")
+        release("s1", [busy], "slow")
         wait_succeeds(machine, "! systemctl is-active slow")
         machine.succeed("systemctl show -p Result --value slow | grep -qx success || { journalctl -u slow >&2; false; }")
         machine.fail("journalctl -u slow | grep -q 'asking the scheduler again'")
