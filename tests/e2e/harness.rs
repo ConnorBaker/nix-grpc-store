@@ -229,6 +229,7 @@ pub fn fail(node: Node, argv: &[&str]) -> String {
 /// Re-runs `argv` until it succeeds, with no deadline: for a state the node
 /// gives no event of. One that never comes hangs the test.
 pub fn wait_until_succeeds(node: Node, argv: &[&str]) {
+    println!("[e2e] waiting: [{}] {}", node.0, shell_join(argv));
     while run_ssh(node, argv, true).code != 0 {
         thread::sleep(Duration::from_millis(500));
     }
@@ -237,6 +238,7 @@ pub fn wait_until_succeeds(node: Node, argv: &[&str]) {
 /// Waits for `unit` to be active. A unit that failed never gets there by
 /// itself, so that ends the wait too, showing its journal.
 pub fn wait_for_unit(node: Node, unit: &str) {
+    println!("[e2e] waiting: [{}] {unit} active", node.0);
     loop {
         match unit_state(node, unit).as_str() {
             "active" => return,
@@ -361,6 +363,7 @@ p=$J_PID
 awk -v n="$3" 'NR > n { f = 1; exit } END { exit !f }' <&"${J[0]}" && r=0 || r=$?
 kill "$p" 2>/dev/null || true
 exit $r"#;
+    println!("[e2e] waiting: [{}] {unit} line {} matching {pattern}", node.0, before + 1);
     let (regex, n) = (grep_pattern(pattern), before.to_string());
     query(node, &["bash", "-c", script, "follow", unit, &regex, &n]);
 }
