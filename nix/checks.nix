@@ -203,6 +203,12 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     module = nixosModule;
   };
 
+  tunnel-takeover = import ../tests/tunnel-takeover.nix {
+    inherit pkgs niks3;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+  };
+
   farm-scheduling = farm "scheduling";
   farm-restarts = farm "restarts";
   farm-cutoffs = farm "cutoffs";
