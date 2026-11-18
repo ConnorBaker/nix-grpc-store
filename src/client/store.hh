@@ -327,14 +327,20 @@ public:
     void querySubstitutablePathInfos(const StorePathCAMap & paths,
                                      SubstitutablePathInfos & infos) override;
 
-    // Same: keep read-only clients off the tunnel.
-    // RemoteStore would tunnel this even with an eval store at hand.
+    // Same: keep read-only clients off the tunnel. A trusted one asks the
+    // daemon over it, as Nix asks a remote store; anyone else, and anyone
+    // with an eval store, gets Store's answer, which reads the derivation
+    // (the eval store's copy, or this store's over NAR fetches) and names
+    // every output with the path its realisation gives or none: a local eval
+    // store's static map leaves out floating ones, and Nix's queryMissing
+    // takes a derivation with no outputs named for one it need not build.
     auto queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore)
         -> std::map<std::string, std::optional<StorePath>> override {
-      if (evalStore != nullptr && evalStore != this) {
-        return evalStore->queryStaticPartialDerivationOutputMap(path);
+      if ((evalStore == nullptr || evalStore == this) && isTrustedClient() == Trusted) {
+        return RemoteStore::queryPartialDerivationOutputMap(path, nullptr);
       }
-      return RemoteStore::queryPartialDerivationOutputMap(path, nullptr);
+      // NOLINTNEXTLINE(bugprone-parent-virtual-call)
+      return Store::queryPartialDerivationOutputMap(path, evalStore);
     }
 
     auto isValidPathUncached(const StorePath & path) -> bool override {
