@@ -620,6 +620,7 @@ void testLingerCappedThenRevoked()
         .send = [&revokes](const SchedCmd & cmd) -> bool {
             if (cmd.has_revoke()) {
                 revokes++;
+                revokes.notify_all();
             }
             return true;
         },
@@ -671,7 +672,7 @@ void testReleaseAndTheStatsSeries()
 {
     constexpr uint32_t lingerS = 600;
     constexpr double capMs = 600e3;
-    constexpr auto patience = std::chrono::seconds(10);
+    // The stats thread exports a round at a time: nothing to wait on but the series.
     constexpr auto poll = std::chrono::milliseconds(100);
     Metrics metrics{""};
     Dispatcher disp(
@@ -710,8 +711,7 @@ void testReleaseAndTheStatsSeries()
     disp.clientGone(link);
     // Exported within a round of the stats thread (Dispatcher::exportStats).
     auto const settle = [&](const char * kind, double want) -> void {
-        auto const since = std::chrono::steady_clock::now();
-        while (series(kind) != want && std::chrono::steady_clock::now() - since < patience) {
+        while (series(kind) != want) {
             std::this_thread::sleep_for(poll);
         }
     };
@@ -743,14 +743,11 @@ void testReleaseAndTheStatsSeries()
     disp.clientGone(releaser);
 
     disp.workerGone(worker);
-    auto const gone = std::chrono::steady_clock::now();
-    while (series("slots") && std::chrono::steady_clock::now() - gone < patience) {
-        std::this_thread::sleep_for(poll);
-    }
     // A gone worker's system keeps its series, at 0 (running counts per
     // worker since upstream's "count running builds per worker").
-    for (const auto * kind : {"queued", "unplaceable", "running", "slots", "free", "lingering"}) {
-        assert(series(kind).value_or(0) == 0);
+    auto const kinds = {"queued", "unplaceable", "running", "slots", "free", "lingering"};
+    while (!std::ranges::all_of(kinds, [&](const char * kind) -> bool { return series(kind).value_or(0) == 0; })) {
+        std::this_thread::sleep_for(poll);
     }
 }
 
@@ -761,7 +758,7 @@ void testKeptQueuedExpiryExported()
 {
     constexpr uint32_t lingerS = 600;
     constexpr double capMs = 3000;
-    constexpr auto patience = std::chrono::seconds(10);
+    // The stats thread exports a round at a time: nothing to wait on but the series.
     constexpr auto poll = std::chrono::milliseconds(100);
     Metrics metrics{""};
     Dispatcher disp(
@@ -794,11 +791,11 @@ void testKeptQueuedExpiryExported()
     auto const left = std::chrono::steady_clock::now();
     disp.clientGone(chain);
     // Exported within a round of the stats thread, before the cap is over.
-    while (series("lingering") != 1.0 && std::chrono::steady_clock::now() - left < patience) {
+    while (series("lingering") != 1.0) {
         std::this_thread::sleep_for(poll);
     }
     assert(series("lingering") == 1.0 && series("queued") == 0.0 && series("running") == 1.0);
-    while (series("lingering") != 0.0 && std::chrono::steady_clock::now() - left < patience) {
+    while (series("lingering") != 0.0) {
         std::this_thread::sleep_for(poll);
     }
     assert(series("lingering") == 0.0 && series("queued") == 0.0);
@@ -820,8 +817,6 @@ void testExpiryRevokeReachesAWorker()
 {
     constexpr double capMs = 1000;
     constexpr uint32_t lingerS = 600;
-    constexpr auto patience = std::chrono::milliseconds(static_cast<int64_t>(nixgrpc::sched::Core::holdMs)) + std::chrono::seconds(10);
-    constexpr auto poll = std::chrono::milliseconds(100);
     Metrics metrics{""};
     Dispatcher disp(
         Dispatcher::Config{.defaultSystem = "x86_64-linux", .present = {}, .lookupThreads = 0, .maxLingerMs = capMs},
@@ -830,7 +825,10 @@ void testExpiryRevokeReachesAWorker()
     Dispatcher::Worker worker{
         .send = [&disp, &written](const SchedCmd & cmd) ABSL_EXCLUSIVE_LOCKS_REQUIRED(disp.sendLock()) -> bool {
             if (cmd.has_revoke()) {
-                disp.afterUnlock([&written] -> void { written++; });
+                disp.afterUnlock([&written] -> void {
+                    written++;
+                    written.notify_all();
+                });
             }
             return true;
         },
@@ -851,10 +849,7 @@ void testExpiryRevokeReachesAWorker()
     disp.clientMsgs(chain, want);
     disp.clientGone(chain);
     assert(written == 0);
-    auto const left = std::chrono::steady_clock::now();
-    while (written < 1 && std::chrono::steady_clock::now() - left < patience) {
-        std::this_thread::sleep_for(poll);
-    }
+    written.wait(0);
     assert(written == 1);
     disp.workerGone(worker);
 }
