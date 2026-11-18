@@ -1996,7 +1996,9 @@ try {
     coord.start(*server);
     if (tunnelled && coord.builder) {
         startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);
-        gen.tunnels = &*tunnels;
+        if (tunnels) {
+            gen.tunnels = &*tunnels;
+        }
     }
     if (!detached) {
         // A successor is not the main process yet, whose messages alone
