@@ -198,6 +198,7 @@ auto Builder::hello() -> WorkerMsg
         hel->add_features(feat);
     }
     hel->set_max_jobs(maxJobs_);
+    hel->set_publish_failing(publishFailing_);
     auto lck = state.lock();
     lck->newestExpect = 0; // a new session, maybe of a new scheduler, counts anew
     // A slot nobody claimed is dropped, not reported: the scheduler would
@@ -226,7 +227,20 @@ auto Builder::load() const -> WorkerMsg
     WorkerMsg msg;
     msg.mutable_load()->set_draining(draining());
     msg.mutable_load()->set_max_jobs(maxJobs_);
+    msg.mutable_load()->set_publish_failing(publishFailing_);
     return msg;
+}
+
+void Builder::published(bool works)
+{
+    std::scoped_lock const lock(unavailableMutex);
+    if (publishFailing_.exchange(!works) == !works) {
+        return;
+    }
+    logLine(LogLevel::info, {{"event", works ? "publishing" : "publish_failing"}});
+    if (greeted_) {
+        send(load());
+    }
 }
 
 void Builder::setMaxJobs(uint32_t maxJobs)
