@@ -136,15 +136,6 @@ public:
     {
     }
 
-#if !NIX_COMPAT_AT_LEAST(2, 34)
-    // Nix < 2.34 constructs store configs from the raw scheme and authority
-    // strings instead of a pre-parsed ParsedURL::Authority.
-    GrpcStoreConfig(std::string_view /*scheme*/, std::string_view authority, const Params &params)
-        : StoreConfig(params),
-          RemoteStoreConfig(params),
-          authority(ParsedURL::Authority::parse(authority)) {}
-#endif
-
     GrpcStoreConfig(ParsedURL::Authority authority, const Params &params)
         : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
           RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
