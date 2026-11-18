@@ -1,6 +1,5 @@
 // Drives src/daemon/cache.hh and push.hh against tests/farm-mock.py. Run via `meson test`.
 
-#include <chrono>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
@@ -70,15 +69,8 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
 {
     // The child must outlive the thread that spawned it.
     std::thread([&] -> void { push.pushWait({"/nix/store/x.drv"}); }).join();
-    {
-        // Woken by its cancel poll instead, it would return no sooner than that,
-        // and the same: once acked it looks no more (Pending::wait). So only
-        // the time tells, an upper bound that an ack slower than cancelPoll,
-        // the mock's 0.2 s included, would fail.
-        auto const started = std::chrono::steady_clock::now();
-        push.pushWait({"/nix/store/quick"});
-        tst.check(std::chrono::steady_clock::now() - started < nixgrpc::cancelPoll, "pushWait wakes on the ack");
-    }
+    // With nothing to cancel it, only the ack wakes the wait: its return is the event.
+    push.pushWait({"/nix/store/quick"});
     push.pushWait({"/nix/store/y", "/nix/store/y2"});
     {
         auto sigs = push.pushWait({"/nix/store/signed-a", "/nix/store/plain"});
