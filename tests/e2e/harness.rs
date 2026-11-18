@@ -269,11 +269,20 @@ pub fn journal(node: Node, unit: &str) -> String {
     query(node, &["journalctl", "-u", unit, "--no-pager"])
 }
 
-/// Whether `line` matches `pattern`, where `.*` stands for any text. That is
-/// all the patterns in these tests use of a regular expression.
+/// Whether `line` matches `pattern`, where `.*` stands for any text and a
+/// trailing `$` for the line's end. That is all the patterns in these tests
+/// use of a regular expression.
 fn line_matches(line: &str, pattern: &str) -> bool {
-    let mut rest = line;
-    for part in pattern.split(".*") {
+    let (pattern, anchored) = match pattern.strip_suffix('$') {
+        Some(p) => (p, true),
+        None => (pattern, false),
+    };
+    let parts: Vec<&str> = pattern.split(".*").collect();
+    let mut rest = if anchored { line.trim_end() } else { line };
+    for (i, part) in parts.iter().enumerate() {
+        if anchored && i + 1 == parts.len() {
+            return rest.ends_with(part);
+        }
         match rest.find(part) {
             Some(at) => rest = &rest[at + part.len()..],
             None => return false,
@@ -282,9 +291,14 @@ fn line_matches(line: &str, pattern: &str) -> bool {
     true
 }
 
-/// `pattern` as a regular expression for `journalctl --grep`.
+/// `pattern` as a regular expression for `journalctl --grep`. A trailing `$`
+/// anchors it at the end of the line, as in `line_matches`.
 fn grep_pattern(pattern: &str) -> String {
-    pattern
+    let (pattern, anchor) = match pattern.strip_suffix('$') {
+        Some(p) => (p, "$"),
+        None => (pattern, ""),
+    };
+    let body = pattern
         .split(".*")
         .map(|part| {
             part.chars()
@@ -298,7 +312,8 @@ fn grep_pattern(pattern: &str) -> String {
                 .collect::<String>()
         })
         .collect::<Vec<_>>()
-        .join(".*")
+        .join(".*");
+    format!("{body}{anchor}")
 }
 
 /// Filters on the node: long journals over the vsock ssh sometimes stall.
@@ -486,5 +501,15 @@ mod tests {
         assert!(line_matches(line, "cn=stranger"));
         assert!(!line_matches(line, "cn=stranger.*event=denied"));
         assert!(!line_matches(line, "role=read-only"));
+    }
+
+    #[test]
+    fn a_trailing_dollar_anchors_a_pattern_at_the_line_end() {
+        let line = "level=info event=predecessor_exited pid=1234";
+        assert!(line_matches(line, "event=predecessor_exited pid=1234$"));
+        assert!(!line_matches(line, "event=predecessor_exited pid=123$"));
+        assert!(line_matches(line, "event=.* pid=1234$"));
+        assert!(!line_matches("event=handed_over_exit", "event=handed_over pid="));
+        assert_eq!(grep_pattern("pid=1.2$"), r"pid=1\.2$");
     }
 }
