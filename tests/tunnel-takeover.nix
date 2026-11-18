@@ -101,6 +101,8 @@ pkgs.testers.runNixOSTest {
           common
           module
         ];
+        # Two slots: the old process's build keeps one until it ends.
+        virtualisation.cores = 2;
         testCerts.certs.node = cert "worker-1" "DNS:single,IP:${singleIp}";
         services.nix-grpc-daemon = {
           enable = true;
@@ -187,9 +189,11 @@ pkgs.testers.runNixOSTest {
             client.succeed(build(f"after{i}", 0))
             client.succeed(f"nix path-info --store '{store}' {warm}")
         after = stats()
-        delta = {key: after[key] - before[key] for key in after}
+        # Envoy creates some counters, such as rq_5xx, only when they first count.
+        keys = [f"cluster.{c}.upstream_{s}" for c in ["tunnelled", "tunnelled-any"] for s in ["rq_total", "rq_5xx", "rq_retry", "cx_total", "cx_destroy_remote_with_active_rq"]]
+        delta = {key: after.get(key, 0) - before.get(key, 0) for key in keys}
         print(f"envoy counters during the takeover's drain: {delta}")
-        client.succeed("systemctl is-active long")
+        assert client.execute("systemctl is-active long")[0] == 0, "the builds after the takeover waited for the old process"
         assert calls(old) == old_calls, single.succeed(f"journalctl -o cat _PID={old}")
         assert delta["cluster.tunnelled.upstream_rq_total"] >= 4, delta
         assert delta["cluster.tunnelled.upstream_rq_5xx"] == 0, delta
@@ -197,7 +201,9 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the old process finishes its build and leaves"):
         client.wait_until_succeeds("! systemctl is-active long", timeout=180)
-        assert client.succeed("systemctl show -P Result long").strip() == "success", client.succeed("journalctl -u long")
+        journal = client.succeed("journalctl -u long")
+        assert client.succeed("systemctl show -P Result long").strip() == "success", journal
+        assert journal.count("STARTED-long") == 1, journal
         single.wait_until_succeeds(f"! test -d /proc/{old}", timeout=60)
         single.succeed(f"journalctl -u {unit} | grep -q 'event=predecessor_exited pid={old}'")
         client.succeed(build("later", 0))
