@@ -1957,7 +1957,9 @@ try {
     coord.start(*server);
     if (tunnelled && coord.builder) {
         startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);
-        gen.tunnels = &*tunnels;
+        if (tunnels) {
+            gen.tunnels = &*tunnels;
+        }
     }
     announceReady(detached, gen);
 
