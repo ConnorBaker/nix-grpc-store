@@ -61,7 +61,10 @@ auto earlyCallWaits() -> bool
 }
 
 // The worker read a later assignment already, so this one is not on its way:
-// the call is refused without waiting expectLag for it.
+// the call is refused without waiting expectLag for it. Only the time tells:
+// a call that waits answers false too, after expectLag on the real clock
+// (claim() has no other). So the check is an upper bound a stall of
+// expectLag on this thread would fail.
 auto staleCallIsRefusedAtOnce() -> bool
 {
     nixgrpc::Metrics metrics{""};
