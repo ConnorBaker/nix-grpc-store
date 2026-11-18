@@ -64,7 +64,8 @@ public:
     auto operator=(Tunnels &&) -> Tunnels & = delete;
 
     void setTakesWork(bool takes);
-    // Opens no more tunnels. Those in use stay until their owner closes them.
+    // Opens no more tunnels and hands none over once it returns. Those in use
+    // stay until their owner closes them.
     void stop();
 
 private:
@@ -103,7 +104,8 @@ private:
     std::atomic<bool> stopping{false};
     std::atomic<bool> cutting{false};
     Wake pause;
-    std::mutex mutex; // guards `groups`
+    std::mutex mutex;    // guards `groups`
+    std::mutex adopting; // held while a tunnel is handed over, and to set `stopping`
     std::map<std::pair<size_t, std::string>, std::unique_ptr<Group>> groups;
     std::jthread supervisor;
 };

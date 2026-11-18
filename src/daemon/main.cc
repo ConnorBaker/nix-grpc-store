@@ -1690,12 +1690,14 @@ void takeOverStep(
             resume(next, metrics);
             return;
         }
-        // New calls on our connections go to new ones, which the successor
-        // accepts. Calls in flight here go on.
-        gen.goaway = std::thread([&server] -> void { server.Shutdown(); });
+        // First, so that the server, still running, took every tunnel it
+        // was handed.
         if (gen.tunnels != nullptr) {
             gen.tunnels->stop();
         }
+        // New calls on our connections go to new ones, which the successor
+        // accepts. Calls in flight here go on.
+        gen.goaway = std::thread([&server] -> void { server.Shutdown(); });
         // Our scheduler's clients reconnect, to the successor's.
         coord.restarting();
         next.paused.reset();
