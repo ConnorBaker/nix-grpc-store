@@ -12,13 +12,14 @@
   driver.race_timer.cancel()
   log.info("the test's global timeout is cancelled: its waits have no deadline")
 
-  def wait_until(what, cond, clients=()):
+  def wait_until(what, cond, clients=(), last=None):
       # For states with no event to wait on: cond() polled. clients are
-      # (machine, unit) pairs that bring the state about.
+      # (machine, unit) pairs that bring the state about; once one is gone,
+      # last() (cond() unless given) has the last look.
       with log.nested(f"waiting for {what}"):
           while not cond():
               for m, unit in clients:
-                  if m.execute(f"systemctl is-active -q {unit}", timeout=None)[0] != 0 and not cond():
+                  if m.execute(f"systemctl is-active -q {unit}", timeout=None)[0] != 0 and not (last or cond)():
                       journal = m.execute(f"journalctl -a --no-pager -u {unit}", timeout=None)[1]
                       raise RequestedAssertionFailed(f"{unit} on {m.name} ended while waiting for {what}:\n{journal}")
               time.sleep(1)
@@ -32,9 +33,6 @@
 
       wait_until(f"{cmd} on {m.name}", ok, clients)
       return out[0]
-
-  def wait_port(m, port, addr="localhost"):
-      wait_succeeds(m, f"nc -z {addr} {port}")
 
   def wait_unit(m, unit):
       # wait_for_unit's: failed, or inactive with no job to start it, ends it.
@@ -52,23 +50,39 @@
 
       wait_until(f"unit {unit} on {m.name}", active)
 
-  def wait_stream(m, cmd, *patterns, more_than=0):
+  streams = iter(range(1 << 62))
+
+  def wait_stream(m, cmd, *patterns, more_than=0, clients=(), now=None):
       # The (more_than + 1)th line of cmd's output that matches every pattern
       # (awk EREs; colour escapes dropped), read as cmd hands it over: an
-      # event. cmd follows a log from its start, as journalctl -f --no-tail;
-      # its end first fails the wait.
+      # event. cmd follows a log from its start, as journalctl -f --no-tail,
+      # in the background; its end first fails the wait. So does a client
+      # (see wait_until) gone with the line not in `now`, the log so far.
       awk = (
           "BEGIN { m = ARGC - 1; for (i = 1; i <= m; i++) p[i] = ARGV[i]; ARGC = 1 }"
           ' { gsub(/\\033\\[[0-9;]*m/, ""); for (i = 1; i <= m; i++) if ($0 !~ p[i]) next; if (++c >= k) exit }'
           " END { exit (c < k) }"
       )
-      with log.nested(f"waiting for line {more_than + 1} with {patterns} from {cmd} on {m.name}"):
-          m.succeed(
-              f"coproc S {{ exec {cmd} 2>/dev/null </dev/null; }}; p=$S_PID; r=0; "
-              + f"awk -v k={more_than + 1} {shlex.quote(awk)} {' '.join(shlex.quote(x) for x in patterns)}"
-              + ' <&"''${S[0]}" || r=$?; kill "$p" 2>/dev/null || true; exit "$r"'
-          )
+      match = f"awk -v k={more_than + 1} {shlex.quote(awk)} {' '.join(shlex.quote(x) for x in patterns)}"
+      done = f"/tmp/wait-stream-{next(streams)}"
+      m.succeed(
+          f"{{ coproc S {{ exec {cmd} 2>/dev/null </dev/null; }}; p=$S_PID; {match}"
+          + ' <&"''${S[0]}"; echo $? > '
+          + f'{done}.new; mv {done}.new {done}; kill "$p"; }} >/dev/null 2>&1 &'
+      )
 
-  def wait_journal(m, unit, *patterns, more_than=0):
-      wait_stream(m, f"journalctl -a -f --no-tail -o cat -u {unit}", *patterns, more_than=more_than)
+      def seen():
+          status, out = m.execute(f"cat {done}", timeout=None)
+          if status == 0 and out.strip() != "0":
+              raise RequestedAssertionFailed(f"{cmd} on {m.name} ended before line {more_than + 1} with {patterns}")
+          return status == 0
+
+      def seen_now():
+          return seen() or m.execute(f"{now} | {match}", timeout=None)[0] == 0
+
+      wait_until(f"line {more_than + 1} with {patterns} from {cmd} on {m.name}", seen, clients, seen_now if now else None)
+
+  def wait_journal(m, unit, *patterns, more_than=0, clients=()):
+      journal = f"journalctl -a -o cat -u {unit}"
+      wait_stream(m, f"{journal} -f --no-tail", *patterns, more_than=more_than, clients=clients, now=journal)
 ''
