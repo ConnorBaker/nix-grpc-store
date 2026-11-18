@@ -54,6 +54,11 @@
 #include <nix/store/substituter.hh> // IWYU pragma: export
 #endif
 
+// Newer Nix declares DerivationOutput in a header of its own.
+#if __has_include(<nix/store/derivation/output.hh>)
+#include <nix/store/derivation/output.hh> // IWYU pragma: export
+#endif
+
 #if __has_include(<nix/store/derivation/aterm.hh>)
 #include <nix/store/derivation/aterm.hh>
 #define NIX_COMPAT_HAS_DERIVATION_ATERM 1
@@ -203,6 +208,16 @@ auto isSandboxed(const D & drv) -> bool
         return drv.type().isSandboxed();
     } else {
         return type(drv).isSandboxed();
+    }
+}
+
+template<typename D>
+auto isImpure(const D & drv) -> bool
+{
+    if constexpr (requires { drv.type(); }) {
+        return drv.type().isImpure();
+    } else {
+        return type(drv).isImpure();
     }
 }
 

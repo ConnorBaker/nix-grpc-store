@@ -187,7 +187,18 @@ services.nix-grpc-daemon = {
 Repeat for every node. Builders for different systems use the same
 config. `nix.settings.system-features` decides which
 `requiredSystemFeatures` a builder accepts: a derivation that needs
-`kvm` only goes to builders that list it. A builder with
+`kvm` only goes to builders that list it. As for nix-daemon, its
+enabled experimental features add to them: `ca-derivations` adds
+`ca-derivations`, `recursive-nix` adds `recursive-nix`, and
+`dynamic-derivations` adds `builder-rpc-v0` (with Nix master; 2.35
+and earlier add only the first two), so a build that requires
+one of these goes to builders that enable it. Impure derivations
+require `ca-derivations` too, but builders turn them down, so they
+stay unplaceable: keep `impure-derivations` out of `system-features`,
+or the scheduler hands them to a builder that turns them down.
+nix-grpc-daemon goes by the Nix it is built with, so
+run nix-daemon from the same Nix: an older one may not know
+`builder-rpc-v0`. A builder with
 `nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
 too, and so do the systems in `extraSystems` (e.g. ones the
 nix-daemon hands to `external-builders`). Add each of them to the
@@ -289,7 +300,7 @@ nix.buildMachines = map (system: {
   hostName = "grpc://farm.example.com:50051?system=${system}&client-cert=/run/keys/ci.crt&client-key=/run/keys/ci.key";
   protocol = null;
   inherit system;
-  supportedFeatures = [ "big-parallel" "kvm" "nixos-test" ];
+  supportedFeatures = [ "big-parallel" "kvm" "nixos-test" "ca-derivations" ];
   maxJobs = 64;
 }) [ "x86_64-linux" "aarch64-linux" ];
 ```
@@ -301,6 +312,73 @@ downloads.
 
 The CI certificate needs the `trusted` role, since the hook uploads
 locally built, unsigned store paths.
+
+Floating content-addressed derivations, and dynamic derivations, build
+on the farm too, through the build hook only: `nix build --store
+grpc://…` (Step 4) turns them down. The CI host's nix-daemon and the
+builders need the `ca-derivations` experimental feature, and
+`dynamic-derivations` for dynamic derivations. Each `buildMachines`
+entry must list `ca-derivations` in `supportedFeatures`: nix requires
+it of every floating derivation, and the hook only hands a build to a
+machine that lists all it requires. Impure derivations require it too,
+and the farm does not build them: leave it out on a CI host that
+builds impure derivations itself. The CI host resolves each one,
+hands it to the farm, and records the realisations of what the farm
+built. The cache holds no realisations, so a CI host without one hands
+the derivation to the farm again, and the builder's nix-daemon builds
+it unless its own build trace names an output it still has or can
+substitute.
+Without niks3, on a single node, the CI host copies the outputs from
+that node, which holds them for the CI host's session.
+
+Three known limitations need fixes in nix:
+
+* **`--store daemon` cannot record what the farm built.** A trusted
+  user's `nix build --store daemon` (or `--store unix://…`) passes that
+  store to the nix-daemon's build hook, which then records each
+  realisation through the nix-daemon. A nix-daemon built from Nix
+  master since 2.35 (4ee62770a8, in no release yet) checks its
+  signature even for a trusted client, so the build fails
+  after the farm built and copied it: `cannot register realisation …
+  lacks a signature by a trusted key`. Signing keys on the builders do
+  not help, since the build results the farm passes on (worker protocol
+  1.37) carry no signatures. A plain `nix build`, with
+  `NIX_REMOTE=daemon` or no store set, and untrusted users are not
+  affected. Otherwise only `require-sigs = false` on the CI host
+  avoids it.
+* **A builder's GC leaves the build trace of a floating output**, with
+  a nix-daemon 2.35 through current master; 2.34's drops it along with
+  the output.
+  When a builder collects garbage (nix's `min-free`, `nix.gc`, the
+  chart's harmonia-gc) and takes a floating output, the build trace
+  that names the output stays in its store. The next build of that
+  derivation there substitutes that path from the cache if it can.
+  Once the cache dropped it too, the builder builds it again, and its
+  nix-daemon refuses a rebuild that is not reproducible: `Trying to
+  register a realisation of '…^out', but we already have another one
+  locally`. The builder then gives the build back, and the scheduler
+  places it on another builder if one can run it; with none, the CI
+  host gives up after its `reschedule-retries`.
+  Nix master has `nix store build-trace delete '/nix/store/…drv^out'`
+  (in no release yet), which run as root on the builder clears the
+  trace: on the local store, not through the nix-daemon, and with
+  `ca-derivations` enabled. The error names the derivation without its
+  `/nix/store/` prefix. The GC can also take an output in the moment
+  between its build and the builder rooting it: the builder gives the
+  build back with `was garbage-collected before it was rooted`, and the
+  trace it leaves is as above. Without a cache, a CI host attached to
+  another's build can find the output gone before the node holds it
+  for its session (`before it was held`), and asks the scheduler again.
+* **Upstream Nix can mix two builds from a binary cache that holds build
+  traces.** With a multi-output floating derivation that does not
+  reproduce, a cache holding build traces from two builds can give a
+  client outputs of both (seen with upstream master 8c54b0f; known
+  upstream: RFC 62 lists caching of non-deterministic paths as
+  unresolved, see also upstream issue 15914). The farm is not exposed:
+  it publishes store paths only, niks3 uploads no build traces for them,
+  and the farm store answers no build-trace queries, so the farm gives a
+  client floating outputs only from farm builds, which return all
+  outputs of one build.
 
 If `nix.firewall` restricts what `nix-daemon.service` may connect to,
 port 50051 is already allowed. For a balancer on another port set
@@ -346,11 +424,19 @@ connected.
 **Autoscale builders.** `nix_grpc_sched_system` has one series per
 system and feature set. `queued` and `unplaceable` are labelled with
 what the derivations require (`features=""` for none, otherwise sorted
-and comma-joined like `features="big-parallel,kvm"`). `running`,
+and comma-joined like `features="big-parallel,kvm"`), where an impure
+derivation counts as requiring `impure-derivations` too, which no
+builder offers (Step 1). `running`,
 `slots` and `free` are labelled with what the builders offer, under
 their native system. So a plain x86_64 group scales on
 `{system="x86_64-linux",features=""}` and a kvm group on
-`{system="x86_64-linux",features="kvm"}` independently. `unplaceable`
+`{system="x86_64-linux",features="kvm"}` independently. What a builder
+offers includes the features its experimental features add (Step 1),
+in these labels and in `nix_grpc_build_info`'s `features`: a kvm group
+with `ca-derivations` enabled is `{features="ca-derivations,kvm"}`.
+Builders that enabled one of these experimental features before
+nix-grpc-store offered them change their label when they update, and
+queries that name the old one no longer match. `unplaceable`
 counts queued builds that no connected builder could take at all, so a
 group does not grow for builds it cannot run. The number to scale a
 group on is therefore `queued - unplaceable` for its label set.

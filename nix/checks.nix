@@ -165,6 +165,15 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     phase = "upload";
   };
 
+  vm-floating = import ../tests/nixos-test.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    mockOidc = niks3.packages.${pkgs.stdenv.hostPlatform.system}.mock-oidc-server;
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+    phase = "floating";
+  };
+
   handover-upgrade = import ../tests/handover.nix {
     e2eTests = pkgs.callPackage ../tests/e2e { };
     inherit pkgs;
@@ -197,6 +206,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   farm-scheduling = farm "scheduling";
   farm-restarts = farm "restarts";
   farm-cutoffs = farm "cutoffs";
+  farm-ca = farm "ca";
 }
 // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") (
   let

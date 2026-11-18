@@ -833,6 +833,31 @@ fn has_vip_build_info(line: &str) -> bool {
 #[test]
 fn required_system_features_are_placed_or_refused() {
     farm_ready();
+    // A builder offers and shows its `system-features`, and what its
+    // experimental features add to them (docs/farm.md). The workers enable
+    // ca-derivations for the recovery test.
+    let mut offered = Vec::new();
+    for w in WORKERS {
+        let mut set = succeed(w, &["nix", "config", "show", "system-features"])
+            .split_whitespace()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>();
+        let xp = succeed(w, &["nix", "config", "show", "experimental-features"]);
+        for (feature, adds) in [
+            ("ca-derivations", "ca-derivations"),
+            ("recursive-nix", "recursive-nix"),
+            ("dynamic-derivations", "builder-rpc-v0"),
+        ] {
+            if xp.split_whitespace().any(|f| f == feature) {
+                set.insert(adds.to_string());
+            }
+        }
+        let set = set.into_iter().collect::<Vec<_>>().join(",");
+        assert_eq!(features_label(&build_info(w)), Some(set.as_str()));
+        offered.extend(set.split(',').map(String::from));
+    }
+    offered.sort();
+    offered.dedup();
     let job = expr("JOB");
     let vip = format!(
         r#"map (tag: import {job} {{ inherit tag; features = ["vip"]; }}) ["f1" "f2" "f3"]"#
@@ -902,7 +927,8 @@ fn required_system_features_are_placed_or_refused() {
         unit_result(CLIENT, "gpu") == "exit-code"
     });
     let out = query(CLIENT, &["journalctl", "-u", "gpu", "-o", "cat"]);
-    assert!(out.contains("features {gpu}"), "{out}");
+    let why = format!("features {{gpu}}, the workers offer {{{}}}", offered.join(","));
+    assert!(out.contains(&why), "{out}");
     retry(30, "no unplaceable build", || {
         gauge(leader(), &unplaceable) == 0
     });
