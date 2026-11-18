@@ -104,15 +104,20 @@ fn start_build(tag: &str) {
 // fifo in its build directory. Nix starts a builder with its base name as
 // argv[0], so the command line is `sh -c mkfifo ...`. The ssh shell's own
 // command line does not start as the builder's does, so pgrep finds the
-// builder alone.
-fn try_release(tag: &str) -> crate::harness::Out {
-    let script = r#"p=$(pgrep -f "^sh -c mkfifo release; echo SLOW-STARTED-$1 ") && echo > "/proc/$p/cwd/release""#;
-    run(&["sh", "-c", script, "sh", tag])
+// builder alone. The fifo is opened without blocking: with no reader (the
+// builder not there yet, or gone) the open fails, ENXIO, instead of
+// waiting for a reader that may never come.
+fn try_release(tag: &str) -> bool {
+    let script = r#"p=$(pgrep -f "^sh -c mkfifo release; echo SLOW-STARTED-$1 ") && python3 -c '
+import os, sys
+os.write(os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK), b"\n")' "/proc/$p/cwd/release""#;
+    run(&["sh", "-c", script, "sh", tag]).code == 0
 }
 
+// Releases the build of `tag` once its builder reads the fifo; its client
+// ending first fails the wait.
 fn release(tag: &str) {
-    let o = try_release(tag);
-    assert_eq!(o.code, 0, "no build {tag} to release: {}", o.combined());
+    retry_with_clients(MACHINE, &[tag], &format!("{tag} released"), || try_release(tag));
 }
 
 fn starts(tag: &str) -> usize {
@@ -183,10 +188,11 @@ fn switch_to(name: &str) -> crate::harness::Out {
 // main process after it.
 fn take_over_into(name: &str) -> String {
     let old = main_pid();
-    let handed = journal_count(MACHINE, UNIT, "event=handed_over");
+    // " pid=": not handed_over_exit, the old process's last line.
+    let handed = journal_count(MACHINE, UNIT, "event=handed_over pid=");
     let out = switch_to(name);
     assert_eq!(out.code, 0, "switch to {name}:\n{}", out.combined());
-    wait_journal_above(UNIT, "event=handed_over", handed);
+    wait_journal_above(UNIT, "event=handed_over pid=", handed);
     let new = main_pid();
     assert_ne!(new, old, "no new main process after the switch to {name}");
     new
@@ -238,10 +244,10 @@ pub mod upgrade {
         if target == "next" {
             assert!(new_exe.contains("nix-grpc-daemon-next"), "{new_exe}");
         }
-        assert_journal(UNIT, &format!("event=handed_over pid={new}"));
+        assert_journal(UNIT, &format!("event=handed_over pid={new}$"));
         // Written once the successor has seen its predecessor go, which can
         // come after the pid is gone: the line is the event.
-        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={old}"), 0);
+        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={old}$"), 0);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("later");
     }
@@ -310,7 +316,7 @@ pub mod upgrade {
             !alive(&first) && !alive(&second)
         });
         assert_eq!(main_pid(), third);
-        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={second}"), 0);
+        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={second}$"), 0);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("chain-later");
     }
@@ -331,7 +337,7 @@ pub mod upgrade {
         let log = query(MACHINE, &["journalctl", "-u", UNIT, "--no-pager"]);
         let at = |what: &str| {
             log.lines()
-                .position(|l| l.contains(&format!("nix-grpc-daemon[{new}]:")) && l.contains(what))
+                .position(|l| l.contains(&format!("nix-grpc-daemon[{new}]:")) && l.trim_end().ends_with(what))
                 .unwrap_or_else(|| panic!("no {what} from {new}:\n{log}"))
         };
         assert!(
