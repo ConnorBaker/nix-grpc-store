@@ -1562,6 +1562,17 @@ void becomeMain(takeover::Detached & detached, takeover::Predecessor & pred)
     logLine(LogLevel::info, {{"event", "took_over"}, {"pid", std::to_string(pred.pid())}});
 }
 
+// Serving. A successor is not the main process yet, whose messages alone
+// systemd reads, and the unit runs already: it becomes the main one instead.
+void announceReady(std::optional<takeover::Detached> & detached, Generation & gen)
+{
+    if (!detached) {
+        nixgrpc::sdNotify("READY=1");
+    } else if (gen.predecessor) {
+        becomeMain(*detached, *gen.predecessor);
+    }
+}
+
 // A successor asked to take over and did not: serve on.
 void resume(Succession & next, nixgrpc::Metrics & metrics)
 {
@@ -1942,14 +1953,7 @@ try {
     if (tunnelled && coord.builder) {
         startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);
     }
-    if (!detached) {
-        // A successor is not the main process yet, whose messages alone
-        // systemd reads, and the unit runs already.
-        nixgrpc::sdNotify("READY=1");
-    }
-    if (detached && gen.predecessor) {
-        becomeMain(*detached, *gen.predecessor);
-    }
+    announceReady(detached, gen);
 
     serve(*server, service, options, idle, coord, metrics, gen);
     nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", exitEvent()}});
