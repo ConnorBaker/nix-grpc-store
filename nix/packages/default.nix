@@ -170,8 +170,10 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
         self.default
       ]
       ++ map (version: self.versionPlugins."plugin-${version}") supportedNixVersions;
-      # Copy the loader: dladdr() resolves symlinks, so a symlinked loader
-      # would find version plugins in self.default, not this dispatcher.
+      # Copy the loader: it looks for the version plugins next to the path
+      # dladdr() reports for it. glibc reports the path it was opened by,
+      # which is in this dispatcher either way; whether Darwin's dyld reports
+      # a symlink's target instead is not checked, and a copy is right in both.
       postBuild = ''
         rm -f "$out"/lib/nix/plugins/nix-grpc-store-loader.*
         cp -L ${self.default}/lib/nix/plugins/nix-grpc-store-loader.* "$out"/lib/nix/plugins/
