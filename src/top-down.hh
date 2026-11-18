@@ -55,19 +55,33 @@ auto nextBatch(const std::vector<Node> & level, Children & children, std::set<No
     return batch;
 }
 
-// keys(n):     what the store must hold for node n
-// children(n): the nodes below n
-// query(keys): the subset of keys that the store holds
+// What a store gets without building: nothing.
+struct NothingObtainable
+{
+    template <class Key> auto operator()(const std::set<Key> & /*keys*/) const -> std::set<Key>
+    {
+        return {};
+    }
+};
+
+// keys(n):       what the store must hold for node n
+// children(n):   the nodes below n
+// query(keys):   the subset of keys that the store holds
+// obtain(keys):  the subset of keys the store lacks but would get without
+//                building, e.g. by substituting; a node with all its keys
+//                held or obtainable counts as held. Asked once per level,
+//                for the keys of the level's nodes the store lacks.
 //
 // Returns the reached nodes that the store lacks. A node without keys counts
 // as lacking.
-template <class Node, class Keys, class Children, class Query> class TopDownWalk
+template <class Node, class Keys, class Children, class Query, class Obtain = NothingObtainable> class TopDownWalk
 {
     using Key = decltype(std::declval<Keys &>()(std::declval<Node>()))::value_type;
 
     Keys keys;
     Children children;
     Query query;
+    Obtain obtain;
     std::size_t budget;
     std::set<Key> valid;
     std::set<Node> queried;
@@ -87,6 +101,21 @@ template <class Node, class Keys, class Children, class Query> class TopDownWalk
         }
     }
 
+    void obtainLacking(const std::vector<Node> & level)
+    {
+        std::set<Key> lacking;
+        for (const auto & node : level) {
+            for (auto & key : keys(node)) {
+                if (!valid.contains(key)) {
+                    lacking.insert(std::move(key));
+                }
+            }
+        }
+        if (!lacking.empty()) {
+            valid.merge(obtain(lacking));
+        }
+    }
+
     auto isHeld(const Node & node) -> bool
     {
         auto const wanted = keys(node);
@@ -95,10 +124,11 @@ template <class Node, class Keys, class Children, class Query> class TopDownWalk
     }
 
 public:
-    TopDownWalk(Keys keys, Children children, Query query, std::size_t budget)
+    TopDownWalk(Keys keys, Children children, Query query, Obtain obtain, std::size_t budget)
         : keys(std::move(keys))
         , children(std::move(children))
         , query(std::move(query))
+        , obtain(std::move(obtain))
         , budget(budget)
     {}
 
@@ -110,6 +140,7 @@ public:
                 return std::move(missing);
             }
             queryBatch(nextBatch(level, children, queried, budget));
+            obtainLacking(level);
             std::vector<Node> next;
             for (const auto & node : level) {
                 if (!isHeld(node)) {
@@ -124,12 +155,12 @@ public:
     }
 };
 
-template <class Node, class Keys, class Children, class Query>
+template <class Node, class Keys, class Children, class Query, class Obtain = NothingObtainable>
 auto missingTopDown(std::vector<Node> roots, Keys keys, Children children, Query query,
-                    std::size_t budget = topDownBudget) -> std::set<Node>
+                    std::size_t budget = topDownBudget, Obtain obtain = {}) -> std::set<Node>
 {
-    return TopDownWalk<Node, Keys, Children, Query>(
-               std::move(keys), std::move(children), std::move(query), budget)
+    return TopDownWalk<Node, Keys, Children, Query, Obtain>(
+               std::move(keys), std::move(children), std::move(query), std::move(obtain), budget)
         .run(std::move(roots));
 }
 

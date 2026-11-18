@@ -308,13 +308,13 @@ private:
                                const Metadata & headers) -> StorePathSet;
 
 public:
+    // While queryMissing runs Nix's walk, answers it from the validity
+    // asked ahead (walkMissingAskedAhead).
     auto queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
-        -> StorePathSet override {
-      return queryValidPathsRouted(paths, maybeSubstitute, {});
-    }
+        -> StorePathSet override;
 
-    // RemoteStore would tunnel this. One RPC, with a fallback to the
-    // client-side walk for servers without QueryMissing.
+    // RemoteStore would tunnel this. One RPC; with an evaluation store,
+    // Nix's walk (walkMissingAskedAhead).
 #if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE
     auto queryMissing(const std::vector<DerivedPath> & targets, Store * evalStore = nullptr)
         -> MissingPaths override;
@@ -327,14 +327,20 @@ public:
     void querySubstitutablePathInfos(const StorePathCAMap & paths,
                                      SubstitutablePathInfos & infos) override;
 
-    // Same: keep read-only clients off the tunnel.
-    // RemoteStore would tunnel this even with an eval store at hand.
+    // Same: keep read-only clients off the tunnel. A trusted one asks the
+    // daemon over it, as Nix asks a remote store; anyone else, and anyone
+    // with an eval store, gets Store's answer, which reads the derivation
+    // (the eval store's copy, or this store's over NAR fetches) and names
+    // every output with the path its realisation gives or none: a local eval
+    // store's static map leaves out floating ones, and Nix's queryMissing
+    // takes a derivation with no outputs named for one it need not build.
     auto queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore)
         -> std::map<std::string, std::optional<StorePath>> override {
-      if (evalStore != nullptr && evalStore != this) {
-        return evalStore->queryStaticPartialDerivationOutputMap(path);
+      if ((evalStore == nullptr || evalStore == this) && isTrustedClient() == Trusted) {
+        return RemoteStore::queryPartialDerivationOutputMap(path, nullptr);
       }
-      return RemoteStore::queryPartialDerivationOutputMap(path, nullptr);
+      // NOLINTNEXTLINE(bugprone-parent-virtual-call)
+      return Store::queryPartialDerivationOutputMap(path, evalStore);
     }
 
     auto isValidPathUncached(const StorePath & path) -> bool override {
@@ -619,6 +625,21 @@ private:
        instead of one round trip per path. */
     std::mutex prefetchMutex;
     PathInfoMap prefetchedInfos;
+
+    /* Validity asked in batches while queryMissing() runs Nix's walk, at
+       the walk's first question to this store, and read by
+       queryValidPaths() so the walk needs no round trip of its own per
+       path or per level. Nix's walk runs on the thread that calls it, so
+       the answers are this thread's, for this store, and only while that
+       queryMissing() runs: no other caller or walk sees them. */
+    struct AskedAhead {
+      const GrpcStore * store;
+      const std::map<StorePath, bool> * valid;
+      std::function<void()> * ask;
+    };
+    static inline thread_local AskedAhead askedAhead{};
+    void askAhead(const std::vector<DerivedPath> & targets, Store & evalStore, std::map<StorePath, bool> & valid);
+    auto walkMissingAskedAhead(const std::vector<DerivedPath> & targets, Store & evalStore) -> MissingPaths;
 
     auto queryPathInfosNative(const StorePathSet &paths) -> PathInfoMap;
 

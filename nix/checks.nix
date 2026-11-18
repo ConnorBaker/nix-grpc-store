@@ -36,6 +36,7 @@ in
 # Every per-version plugin package doubles as a compile check.
 lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
 // {
+  inherit (packages) default-nix_16433;
   # contrib/build-client.sh against a fake nix and clock.
   build-client =
     pkgs.runCommand "build-client-self-test"
