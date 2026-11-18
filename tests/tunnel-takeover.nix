@@ -186,9 +186,13 @@ pkgs.testers.runNixOSTest {
         # "event=handed_over pid=": not the old process's handed_over_exit
         handed = int(single.succeed(f"journalctl -u {unit} | grep -c 'event=handed_over pid=' || true"))
         single.succeed("/run/current-system/specialisation/next/bin/switch-to-configuration test")
-        wait_journal(single, unit, "event=handed_over pid=", more_than=handed)
+        wait_journal(single, unit, "event=handed_over pid=", more_than=handed, clients=[(single, unit)])
         new = main_pid()
         assert new != old, f"no new main process: {new}"
+        # The successor says ready before its tunnels are open: the builds
+        # below go once they are.
+        tunnels = f"journalctl -a -o cat _PID={new}"
+        wait_stream(single, f"{tunnels} -f --no-tail", "event=tunnels_open ", clients=[(single, unit)], now=tunnels)
         before, old_calls = stats(), calls(old)
         for i in range(4):
             client.succeed(build(f"after{i}", 0))
