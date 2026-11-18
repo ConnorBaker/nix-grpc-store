@@ -171,8 +171,6 @@ public:
 private:
     static constexpr std::size_t kHeader = 1 + sizeof(std::uint32_t);
 
-    using Opened = std::expected<UniqueFd, std::error_code>;
-
     [[nodiscard]] auto writeAt(std::span<const std::byte> data, std::size_t offset) const -> bool
     {
         while (!data.empty()) {

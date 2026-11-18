@@ -1,8 +1,6 @@
 #pragma once
 // Blocking libcurl wrapper for the niks3 and OIDC JSON APIs.
 
-#include <algorithm>
-#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -32,8 +30,6 @@
 #include "logfmt.hh"
 
 namespace nixgrpc::http {
-
-constexpr long conflict = 409;
 
 inline auto ok(long status) -> bool
 {
@@ -171,13 +167,6 @@ public:
     [[nodiscard]] auto body() const -> const std::string &
     {
         return body_;
-    }
-
-    [[nodiscard]] auto retryAfter() const -> std::chrono::seconds
-    {
-        curl_off_t wait = 0;
-        curl_easy_getinfo(curl.get(), CURLINFO_RETRY_AFTER, &wait);
-        return std::chrono::seconds(std::max<curl_off_t>(wait, 0));
     }
 };
 // NOLINTEND(cppcoreguidelines-pro-type-vararg)
