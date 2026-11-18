@@ -186,9 +186,10 @@ pkgs.testers.runNixOSTest {
         }.items())
         request = f"GET /reverse_connections/request HTTP/1.1\\r\\nhost: lb\\r\\n{headers}x-nix-instance: client\\r\\ncontent-length: 0\\r\\n\\r\\n"
         tls = f"-cert {certs}/node.pem -key {certs}/node.key -CAfile {certs}/ca.pem"
-        # openssl ends with an error once the balancer closes the connection.
+        # openssl ends with an error once the balancer closes the connection;
+        # the end of its input does not end it (-quiet implies -ign_eof).
         answer = client.execute(
-            f"(printf '{request}'; sleep 3) | openssl s_client -quiet -connect lb:${toString tunnelPort} -alpn nix-tunnel-any {tls} 2>/dev/null | head -n 1",
+            f"printf '{request}' | openssl s_client -quiet -connect lb:${toString tunnelPort} -alpn nix-tunnel-any {tls} 2>/dev/null | head -n 1",
             timeout=None,
         )[1]
         assert "403" in answer, f"the balancer answered a client's certificate with: {answer!r}"
