@@ -213,10 +213,11 @@ pkgs.testers.runNixOSTest {
         journal = client.succeed("journalctl -u long")
         assert client.succeed("systemctl show -P Result long").strip() == "success", journal
         assert journal.count("STARTED-long") == 1, journal
-        # The successor says so once it has seen the old process go, which
-        # may be after its pid is gone: the line is the event.
+        # The successor says so once its connection to the old process ends,
+        # which may come before or after the old pid is reaped: both are
+        # waited for, each irreversible.
         wait_journal(single, unit, f"event=predecessor_exited pid={old}")
-        single.succeed(f"! test -d /proc/{old}")
+        wait_succeeds(single, f"! test -d /proc/{old}")
         client.succeed(build("later", 0))
   '';
 }
