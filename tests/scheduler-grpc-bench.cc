@@ -38,6 +38,8 @@
 #include <grpcpp/security/server_credentials.h>
 #include <grpcpp/server_builder.h>
 
+#include <nix/util/file-system.hh>
+
 #include "dispatcher.hh"
 #include "sched-reactor.hh"
 #include "metrics.hh"
@@ -77,22 +79,6 @@ struct Creds
     grpc::ChannelArguments args;
 };
 
-auto readFile(const std::string & path) -> std::string
-{
-    std::FILE * f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
-        std::perror(path.c_str());
-        std::exit(1);
-    }
-    std::string out;
-    char buf[4096];
-    while (auto n = std::fread(buf, 1, sizeof buf, f)) {
-        out.append(buf, n);
-    }
-    std::fclose(f);
-    return out;
-}
-
 auto makeTls() -> Creds
 {
     char dir[] = "/tmp/sched-bench-XXXXXX";
@@ -108,8 +94,8 @@ auto makeTls() -> Creds
         std::cerr << "openssl req failed (tls=1 needs openssl in PATH)\n";
         std::exit(1);
     }
-    auto cert = readFile(d + "/cert.pem");
-    auto key = readFile(d + "/key.pem");
+    auto cert = nix::readFile(d + "/cert.pem");
+    auto key = nix::readFile(d + "/key.pem");
     grpc::SslServerCredentialsOptions sopts;
     sopts.pem_key_cert_pairs.push_back({key, cert});
     Creds creds;
