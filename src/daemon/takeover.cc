@@ -374,7 +374,10 @@ Detached::Detached()
         }
     }
     // The child between them: forks the daemon and leaves, so the kernel gives
-    // the daemon to the manager.
+    // the daemon to the manager. Only the control process may hold the write
+    // side of `reload`: the daemon must see it hang up as soon as that process
+    // is gone, whenever this one gets to exit.
+    reloadPipe.writeSide.close();
     middle = ::getpid();
     if (auto const daemon = ::fork(); daemon != 0) {
         ::_exit(daemon > 0 ? EXIT_SUCCESS : EXIT_FAILURE);
