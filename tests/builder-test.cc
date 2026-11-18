@@ -8,7 +8,6 @@
 #include <future>
 #include <print>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "builder.hh"
@@ -36,10 +35,6 @@ auto greetsFirst() -> bool
     return hellos == std::vector<bool>{true, false};
 }
 
-// Builder's expectLag: how long a call waits for an assignment that may still arrive.
-constexpr std::chrono::seconds expectLag{5};
-constexpr std::chrono::milliseconds headStart{100};
-
 auto expectOf(uint64_t assignId, const std::string & drv = "a.drv") -> nix::remote::Expect
 {
     nix::remote::Expect exp;
@@ -55,23 +50,26 @@ auto earlyCallWaits() -> bool
     nixgrpc::Metrics metrics{""};
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     auto call = std::async(std::launch::async, [&] -> bool { return builder.claim("a.drv", 2); });
-    std::this_thread::sleep_for(headStart);
+    // Until the call waits; one that ended first did not.
+    while (metrics.eventCounter("expect_wait").Value() < 1) {
+        if (call.wait_for(std::chrono::milliseconds(1)) == std::future_status::ready) {
+            return false;
+        }
+    }
+    // The call waits Builder::expectLag on the real clock, the product's own
+    // bound: only a stall that long between these two lines fails here.
     builder.onExpect(expectOf(2));
-    return call.get();
+    return call.get() && metrics.eventCounter("expect_late").Value() == 1;
 }
 
 // The worker read a later assignment already, so this one is not on its way:
-// the call is refused without waiting expectLag for it. Only the time tells:
-// a call that waits answers false too, after expectLag on the real clock
-// (claim() has no other). So the check is an upper bound a stall of
-// expectLag on this thread would fail.
+// the call is refused without waiting for it.
 auto staleCallIsRefusedAtOnce() -> bool
 {
     nixgrpc::Metrics metrics{""};
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     builder.onExpect(expectOf(2));
-    auto const asked = Clock::now();
-    return !builder.claim("b.drv", 1) && Clock::now() - asked < expectLag;
+    return !builder.claim("b.drv", 1) && metrics.eventCounter("expect_wait").Value() == 0;
 }
 
 constexpr auto past = std::chrono::seconds(61); // Builder's expectTimeout is 60 s

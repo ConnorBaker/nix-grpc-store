@@ -72,7 +72,11 @@ auto Builder::claim(const std::string & drvPath, uint64_t assignId) -> bool
         }
         // The scheduler numbers its assignments in the order it sends them,
         // so only a newer one than the last we read can still arrive.
-        if (assignId <= lck->newestExpect || lck.wait_until(expectArrived, deadline) == std::cv_status::timeout) {
+        if (assignId <= lck->newestExpect) {
+            return false;
+        }
+        metrics.event("expect_wait");
+        if (lck.wait_until(expectArrived, deadline) == std::cv_status::timeout) {
             return false;
         }
     }
