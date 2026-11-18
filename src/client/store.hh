@@ -277,12 +277,13 @@ private:
                                const Metadata & headers) -> StorePathSet;
 
 public:
+    // While queryMissing runs Nix's walk, answers it from the validity
+    // asked ahead (walkMissingAskedAhead).
     auto queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
-        -> StorePathSet override {
-      return queryValidPathsRouted(paths, maybeSubstitute, {});
-    }
+        -> StorePathSet override;
 
-    // RemoteStore would tunnel this. One RPC.
+    // RemoteStore would tunnel this. One RPC; with an evaluation store,
+    // Nix's walk (walkMissingAskedAhead).
 #if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE
     auto queryMissing(const std::vector<DerivedPath> & targets, Store * evalStore = nullptr)
         -> MissingPaths override;
@@ -561,6 +562,21 @@ private:
        instead of one round trip per path. */
     std::mutex prefetchMutex;
     PathInfoMap prefetchedInfos;
+
+    /* Validity asked in batches while queryMissing() runs Nix's walk, at
+       the walk's first question to this store, and read by
+       queryValidPaths() so the walk needs no round trip of its own per
+       path or per level. Nix's walk runs on the thread that calls it, so
+       the answers are this thread's, for this store, and only while that
+       queryMissing() runs: no other caller or walk sees them. */
+    struct AskedAhead {
+      const GrpcStore * store;
+      const std::map<StorePath, bool> * valid;
+      std::function<void()> * ask;
+    };
+    static inline thread_local AskedAhead askedAhead{};
+    void askAhead(const std::vector<DerivedPath> & targets, Store & evalStore, std::map<StorePath, bool> & valid);
+    auto walkMissingAskedAhead(const std::vector<DerivedPath> & targets, Store & evalStore) -> MissingPaths;
 
     auto queryPathInfosNative(const StorePathSet &paths) -> PathInfoMap;
 

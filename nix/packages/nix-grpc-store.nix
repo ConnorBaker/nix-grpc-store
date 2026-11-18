@@ -63,6 +63,8 @@ stdenv.mkDerivation {
         ../../tests/keepalive-client.cc
         ../../tests/load-plugin.hh
         ../../tests/store-query-client.cc
+        ../../tests/query-missing-test.py
+        ../../tests/query-missing-client.cc
         ../../tests/farm-client-test.cc
         ../../tests/farm-sim-test.cc
         ../../tests/farm-client-test.sh

@@ -121,6 +121,31 @@ void aNodeWithoutKeysIsMissingAndItsChildrenAreWalked()
     assert((queried == std::vector<std::string>{"in"}));
 }
 
+// The store holds d and could obtain b; a, root and c it lacks. The walk
+// stops at b, so c below it is neither reached nor obtained.
+void anObtainableNodeStopsTheWalk()
+{
+    Graph const graph{{"root", {"a", "b"}}, {"a", {"d"}}, {"b", {"c"}}, {"c", {}}, {"d", {}}};
+    Calls queried;
+    Calls obtained;
+    auto const missing = nixgrpc::missingTopDown(
+        std::vector<std::string>{"root"},
+        [](const std::string & node) -> std::vector<std::string> { return {node + "-out"}; },
+        [&](const std::string & node) -> std::vector<std::string> { return graph.at(node); },
+        [&](const std::set<std::string> & keys) -> std::set<std::string> {
+            queried.emplace_back(keys.begin(), keys.end());
+            return keys.contains("d-out") ? std::set<std::string>{"d-out"} : std::set<std::string>{};
+        },
+        1,
+        [&](const std::set<std::string> & keys) -> std::set<std::string> {
+            obtained.emplace_back(keys.begin(), keys.end());
+            return keys.contains("b-out") ? std::set<std::string>{"b-out"} : std::set<std::string>{};
+        });
+    assert((missing == Names{"root", "a"}));
+    assert((queried == Calls{{"root-out"}, {"a-out", "b-out"}, {"d-out"}}));
+    assert((obtained == Calls{{"root-out"}, {"a-out", "b-out"}}));
+}
+
 void aNodeWithoutKeysIsMissing()
 {
     auto const missing = nixgrpc::missingTopDown(
@@ -288,6 +313,7 @@ try {
     aHeldNodeBelowAMissingOneIsFoundByAWideCall();
     aNodeWithoutKeysIsMissing();
     aNodeWithoutKeysIsMissingAndItsChildrenAreWalked();
+    anObtainableNodeStopsTheWalk();
     aRootNeedsOnlyTheKeysAskedOfIt();
     aRebuiltRootIsMissingWhatTheStoreHolds();
     anInputNeedsOnlyTheKeysItsDependantsUse();

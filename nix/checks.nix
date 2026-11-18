@@ -25,6 +25,7 @@ in
 # Every per-version plugin package doubles as a compile check.
 lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
 // {
+  inherit (packages) default-nix_16433;
   # A grpc:// URL is only understood when the plugin registered the scheme.
   nix-with-plugin = pkgs.runCommand "nix-with-plugin-check" { } ''
     HOME=$TMPDIR ${packages.nix-with-plugin}/bin/nix --extra-experimental-features nix-command \
