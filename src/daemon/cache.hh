@@ -104,7 +104,7 @@ public:
     // Make locally valid paths visible to other nodes. No-op without niks3.
     // With `verify`, niks3 checks the bucket instead of trusting its database,
     // at one S3 lookup per object in the closure.
-    auto publish(const std::vector<std::string> & paths, const Cancelled & cancelled = never, bool verify = false)
+    auto publish(const std::vector<std::string> & paths, const Cancelled & cancelled = {}, bool verify = false)
         -> PushProcess::Signatures
     {
         if (!remote || paths.empty()) {
