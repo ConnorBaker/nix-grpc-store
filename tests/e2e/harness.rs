@@ -20,9 +20,8 @@ fn ssh_args(node: Node) -> Vec<String> {
         "User=root",
         "StrictHostKeyChecking=no",
         "UserKnownHostsFile=/dev/null",
-        "ConnectTimeout=30",
-        "ServerAliveInterval=30",
-        "ServerAliveCountMax=10",
+        // No ConnectTimeout or ServerAlive: a VM that is gone ends the vsock
+        // connection, an event; one that answers nothing hangs the run.
         "LogLevel=ERROR",
     ] {
         args.push("-o".into());
@@ -132,15 +131,12 @@ fn ensure_ready(node: Node) {
     ready.push(node.0);
 }
 
-/// Runs `attempt` again while ssh fails. A repeatable command is retried even
-/// if it may have started; any other only if ssh could not connect, so it
-/// cannot run twice.
+/// Runs `attempt` again while ssh fails, with no count. A repeatable command
+/// is retried even if it may have started; any other only if ssh could not
+/// connect, so it cannot run twice.
 fn retrying(repeatable: bool, mut attempt: impl FnMut() -> Out) -> Out {
     let mut o = attempt();
-    for _ in 0..4 {
-        if !o.lost || !(repeatable || connect_failed(&o.stderr)) {
-            break;
-        }
+    while o.lost && (repeatable || connect_failed(&o.stderr)) {
         thread::sleep(Duration::from_secs(2));
         o = attempt();
     }
