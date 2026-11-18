@@ -87,7 +87,6 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-tunnel";
-  globalTimeout = 1800;
 
   nodes = {
     dialled = {
@@ -149,14 +148,15 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    ${import ./lib/waits.nix}
     start_all()
-    lb.wait_for_unit("niks3.service")
-    lb.wait_for_open_port(5751)
-    lb.wait_for_open_port(50051)
+    wait_unit(lb, "niks3.service")
+    wait_port(lb, 5751)
+    wait_port(lb, 50051)
     for node in [dialled, tunnelled1, tunnelled2]:
-        node.systemctl("start nix-grpc-daemon.service")
+        node.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 
-    client.wait_for_unit("test-certs.service")
+    wait_unit(client, "test-certs.service")
     certs = "/run/test-certs"
     store = f"grpc://lb:50051?client-cert={certs}/node.pem&client-key={certs}/node.key&ca-cert={certs}/ca.pem"
 
@@ -168,7 +168,7 @@ pkgs.testers.runNixOSTest {
     def build(tag: str, feature: str) -> str:
         args = f"-f ${jobExpr} --argstr tag {tag} --argstr feature {feature}"
         # The builder may still be connecting, so the first builds can find nobody.
-        client.wait_until_succeeds(f"nix build -L --store '{store}' --eval-store auto {args}", timeout=180)
+        wait_succeeds(client, f"nix build -L --store '{store}' --eval-store auto {args}")
         return client.succeed(f"nix eval --raw {args} outPath")
 
     with subtest("a build reaches its tunnelled builder next to a dialled one"):
@@ -189,13 +189,14 @@ pkgs.testers.runNixOSTest {
         tls = f"-cert {certs}/node.pem -key {certs}/node.key -CAfile {certs}/ca.pem"
         # openssl ends with an error once the balancer closes the connection.
         answer = client.execute(
-            f"(printf '{request}'; sleep 3) | openssl s_client -quiet -connect lb:${toString tunnelPort} -alpn nix-tunnel-any {tls} 2>/dev/null | head -n 1"
+            f"(printf '{request}'; sleep 3) | openssl s_client -quiet -connect lb:${toString tunnelPort} -alpn nix-tunnel-any {tls} 2>/dev/null | head -n 1",
+            timeout=None,
         )[1]
         assert "403" in answer, f"the balancer answered a client's certificate with: {answer!r}"
 
     with subtest("a farm of tunnelled builders answers store queries too"):
         lb.succeed("/run/current-system/specialisation/tunnelsOnly/bin/switch-to-configuration test")
-        lb.wait_for_open_port(50051)
+        wait_port(lb, 50051)
         tunnelled2.succeed(f"test -e {build('alone', 'two')}")
         assert requests("tunnelled") > 0, "the build did not go through a tunnel"
         assert requests("tunnelled-any") > 0, "store queries did not go through a tunnel"

@@ -28,7 +28,6 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-bench-latency";
-  globalTimeout = 1200;
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
   # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
@@ -62,8 +61,9 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
-    machine.wait_for_unit("nix-grpc-daemon.socket")
-    machine.wait_for_open_port(50051)
+    ${import ./lib/waits.nix}
+    wait_unit(machine, "nix-grpc-daemon.socket")
+    wait_port(machine, 50051)
     env = {"NGS_CHAIN_EXPR": "${chainNix}", "NGS_SYSTEM": "${system}"}
     run_e2e({"machine": machine}, env, "latency::", "--test-threads=1")
   '';
