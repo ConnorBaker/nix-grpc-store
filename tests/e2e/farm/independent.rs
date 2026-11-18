@@ -1,5 +1,15 @@
+use std::sync::{Mutex, MutexGuard};
+
 use super::helpers::*;
 use crate::harness::*;
+
+/// The balancer counts requests per cluster and host, not per test: a test
+/// that counts what reaches the s390x-linux cluster holds this, and so does
+/// every test that sends requests there, while they run in parallel.
+fn s390x() -> MutexGuard<'static, ()> {
+    static S390X: Mutex<()> = Mutex::new(());
+    S390X.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[test]
 fn outputs_carry_the_cache_signature() {
@@ -34,6 +44,7 @@ fn outputs_carry_the_cache_signature() {
 #[test]
 fn a_system_without_builders_is_served_by_the_default_one() {
     farm_ready();
+    let _cluster = s390x();
     let store = format!("{}&system=s390x-linux", envoy());
     succeed(CLIENT, &["nix", "store", "info", "--store", &store]);
 }
@@ -143,6 +154,7 @@ fn an_input_only_one_worker_has_still_reaches_the_builder() {
 #[test]
 fn x_nix_worker_picks_the_worker_on_every_system() {
     farm_ready();
+    let _cluster = s390x();
     for cluster in ["riscv64-linux", "s390x-linux"] {
         wait_members(cluster, &WORKERS);
         let before = requests(cluster);
