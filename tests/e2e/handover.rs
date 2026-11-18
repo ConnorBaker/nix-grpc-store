@@ -101,10 +101,12 @@ fn start_build(tag: &str) {
 }
 
 // Lets the running build of `tag` end: its builder reads a line from the
-// fifo in its build directory. The ssh shell's own command line does not
-// start as the builder's does, so pgrep finds the builder alone.
+// fifo in its build directory. Nix starts a builder with its base name as
+// argv[0], so the command line is `sh -c mkfifo ...`. The ssh shell's own
+// command line does not start as the builder's does, so pgrep finds the
+// builder alone.
 fn try_release(tag: &str) -> crate::harness::Out {
-    let script = r#"p=$(pgrep -f "^/bin/sh -c mkfifo release; echo SLOW-STARTED-$1 ") && echo > "/proc/$p/cwd/release""#;
+    let script = r#"p=$(pgrep -f "^sh -c mkfifo release; echo SLOW-STARTED-$1 ") && echo > "/proc/$p/cwd/release""#;
     run(&["sh", "-c", script, "sh", tag])
 }
 
