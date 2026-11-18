@@ -912,8 +912,7 @@ fn a_builder_that_can_publish_again_gets_a_build_once_the_other_is_full() {
     retry_with_clients(CLIENT, &["full"], "the builder takes the build the other has no slot for", || {
         building().contains(&broken)
     });
-    release_slow();
-    wait_unit_done("full");
+    release_until_done("full");
     assert_unit_success("full");
     assert_eq!(built() - built_before, 1);
     retry("its publish brings the builder back", || members(&sys).contains(&broken));
@@ -964,10 +963,7 @@ fn queue_gauges_show_a_burst_while_every_build_blocks() {
     // The Wants arrive within a second and nothing else happens until a build
     // ends, so only the trailing export can show the queue.
     retry_with_clients(CLIENT, &["burst"], "two builds queued", || queued() == 2);
-    retry("burst finished", || {
-        release_slow();
-        run(CLIENT, &["systemctl", "is-active", "burst"]).code != 0
-    });
+    release_until_done("burst");
     assert_unit_success("burst");
     retry("queue empty", || queued() == 0);
     let waits = gauge(

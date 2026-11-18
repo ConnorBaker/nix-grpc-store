@@ -284,6 +284,16 @@ pub fn spawn_build(unit: &str, tag: &str) {
     );
 }
 
+/// Releases slow builds until `unit` has ended: for a client whose build
+/// may start again (moved, or rebuilt after its builder died) after a
+/// release, which a slow build no longer ends by itself.
+pub fn release_until_done(unit: &str) {
+    retry(&format!("{unit} ended, its slow builds released"), || {
+        release_slow();
+        run(CLIENT, &["systemctl", "is-active", unit]).code != 0
+    });
+}
+
 pub fn wait_unit_done(units: &str) {
     let mut cmd = vec!["sh", "-c", r#"! systemctl is-active "$@""#, "sh"];
     cmd.extend(units.split_whitespace());
