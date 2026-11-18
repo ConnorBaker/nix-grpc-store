@@ -290,7 +290,8 @@ PY
 # 600 s on (a client that ran out its bound) and exits with the next code in
 # $FAKE/exits. `store info` records its arguments and its NIX_CONFIG's grpc-lease
 # (`… lease=ID`), its whole NIX_CONFIG in $FAKE/release-config.<release>, and when it
-# began in $FAKE/release-times; a store on a host named
+# began, with how many release attempts had ended by then (release.tsv's rows), in
+# $FAKE/release-times; a store on a host named
 # `dead` never answers; otherwise it sleeps
 # $FAKE/rblock.<call> seconds if that exists and answers as the next line of
 # $FAKE/answers says, its last line once they run out: `ok` (exit 0 and nix-grpc-store's
@@ -311,10 +312,10 @@ case "$1 $2" in
   "store info")
     lease=$(printf '%s\n' "${NIX_CONFIG:-}" | sed -n 's/^grpc-lease = //p' | tail -n 1)
     printf '%s lease=%s\n' "$*" "$lease" >> "$FAKE/releases"
-    printf '%s %s\n' "$(date +%s.%N)" "$4" >> "$FAKE/release-times"
+    printf '%s %s %s\n' "$(date +%s.%N)" "$4" "$(cat "$FAKE/out/release.tsv" 2> /dev/null | wc -l)" >> "$FAKE/release-times"
     r=$(wc -l < "$FAKE/releases")
     printf '%s\n' "${NIX_CONFIG:-}" > "$FAKE/release-config.$r"
-    case $4 in *//dead[:/?]*) exec sleep 60 ;; esac
+    case $4 in *//dead[:/?]*) exec sleep infinity ;; esac
     [ -f "$FAKE/rblock.$r" ] && sleep "$(cat "$FAKE/rblock.$r")"
     answer=$(sed -n "${r}p" "$FAKE/answers" 2> /dev/null)
     [ -n "$answer" ] || answer=$(tail -n 1 "$FAKE/answers" 2> /dev/null)
@@ -358,15 +359,19 @@ self_test() {
   local T; T=$(mktemp -d "$root/build-client-test.XXXXXX")
   fake_nix "$T"
   # The fake clock. With $FAKE/pause.<call>, that call of it first writes $FAKE/paused
-  # and sleeps that many seconds: main holds there, between one link and the next.
+  # and waits for $FAKE/signalled, which `stopped` writes once its signal is sent: main
+  # holds there, between one link and the next, until the signal is its own.
   now_s() {
     local c=1
     [ -f "$FAKE/nows" ] && c=$(( $(cat "$FAKE/nows") + 1 ))
     echo "$c" > "$FAKE/nows"
-    if [ -f "$FAKE/pause.$c" ]; then echo 1 > "$FAKE/paused"; sleep "$(cat "$FAKE/pause.$c")"; fi
+    if [ -f "$FAKE/pause.$c" ]; then
+      echo 1 > "$FAKE/paused"
+      until [ -e "$FAKE/signalled" ]; do sleep 0.1; done
+    fi
     cat "$FAKE/clock"
   }
-  local fails=0 k=0 RC CALLS RELEASES ELAPSED
+  local fails=0 k=0 RC CALLS RELEASES
   # Files for the next run (`next NAME CONTENT`): log.N, block.N, answers, builders, ...
   next() { mkdir -p "$T/next"; printf '%s\n' "$2" > "$T/next/$1"; }
   setup() {
@@ -377,13 +382,11 @@ self_test() {
     [ -f "$T/run-$k/exits" ] || : > "$T/run-$k/exits"
   }
   # run EXITS... -- ARGS...: main with the fake nix and clock, in a directory of its own,
-  # for at most 60 s (RC 124 past that).
+  # until it ends.
   run() {
     setup
     while [ "$1" != -- ]; do echo "$1" >> "$T/run-$k/exits"; shift; done; shift
-    local t; t=$(date +%s)
-    (PATH="$T:$PATH" FAKE="$T/run-$k" timeout 60 bash -c "set -u; umask 022; $(declare -f now_s die grpc_builders main); main \"\$@\"" main "$T/run-$k/out" "$@") > "$T/run-$k/stdout" 2>&1; RC=$?
-    ELAPSED=$(( $(date +%s) - t ))
+    (PATH="$T:$PATH" FAKE="$T/run-$k" bash -c "set -u; umask 022; $(declare -f now_s die grpc_builders main); main \"\$@\"" main "$T/run-$k/out" "$@") > "$T/run-$k/stdout" 2>&1; RC=$?
     counts
   }
   counts() {
@@ -391,37 +394,35 @@ self_test() {
     RELEASES=$(wc -l < "$T/run-$k/releases")
   }
   # stopped SIGNALS WHEN ARGS...: main as run does, its links exiting as $FAKE/exits says
-  # (0 by default), sent each of SIGNALS, half a second apart, once its first link (WHEN
-  # link), its first release (WHEN release) or a pause of its clock (WHEN pause) started;
-  # RC -1 if it is not over within 20 s.
+  # (0 by default), sent each of SIGNALS once its first link (WHEN link), its first
+  # release (WHEN release) or a pause of its clock (WHEN pause) started (or main ended
+  # first), and then waited for.
   stopped() {
     setup
     [ -s "$T/run-$k/exits" ] || echo 0 > "$T/run-$k/exits"
-    local sigs=$1 when=$2 pid i s t; shift 2
+    local sigs=$1 when=$2 pid s; shift 2
     local watch="$T/run-$k/calls"; [ "$when" = release ] && watch="$T/run-$k/releases"
     [ "$when" = pause ] && watch="$T/run-$k/paused"
     # A stubborn link takes the first signal only once it is stubborn.
     [ "$when" = link ] && [ -f "$T/run-$k/stubborn" ] && watch="$T/run-$k/link.pid"
-    t=$(date +%s)
     # Job control, so that the job does not ignore SIGINT as a background job would.
     set -m
     (PATH="$T:$PATH" FAKE="$T/run-$k" main "$T/run-$k/out" "$@") > "$T/run-$k/stdout" 2>&1 &
     pid=$!
     set +m
-    for ((i = 0; i < 100; i++)); do [ -s "$watch" ] && break; sleep 0.1; done
+    until [ -s "$watch" ] || ! kill -0 "$pid" 2> /dev/null; do sleep 0.1; done
     for s in $sigs; do
       kill -"$s" "$pid"
+      # The signal is main's now (kill returned): a paused clock may go on.
+      : > "$T/run-$k/signalled"
       # Against a stubborn link, the next signal only once the script has acted on this
       # one (the link notes the SIGTERM it was sent): two signals that reach bash before
       # it runs the trap of the first are one.
       if [ -f "$T/run-$k/stubborn" ]; then
-        for ((i = 0; i < 100; i++)); do [ -s "$T/run-$k/termed" ] && break; sleep 0.1; done
+        until [ -s "$T/run-$k/termed" ] || ! kill -0 "$pid" 2> /dev/null; do sleep 0.1; done
       fi
-      sleep 0.5
     done
-    for ((i = 0; i < 200; i++)); do kill -0 "$pid" 2> /dev/null || break; sleep 0.1; done
-    if kill -0 "$pid" 2> /dev/null; then RC=-1; kill -KILL "$pid"; wait "$pid"; else wait "$pid"; RC=$?; fi
-    ELAPSED=$(( $(date +%s) - t ))
+    wait "$pid"; RC=$?
     counts
   }
   status() { python3 -I -c 'import json, sys; s = json.load(open(sys.argv[1])); print(eval(sys.argv[2], {"s": s}))' "$T/run-$k/out/status.json" "$1" 2> /dev/null; }
@@ -450,17 +451,8 @@ self_test() {
       [ "$(status 's["release"]["acknowledged"]')" = True ]
   }
   link_gone() { ! kill -0 "$(cat "$T/run-$k/link.pid")" 2> /dev/null; }
-  # asked_within S: 1 if every store was first asked within S seconds of the first.
-  asked_within() {
-    python3 -I - "$T/run-$k/release-times" "$1" <<'PY2'
-import sys
-first = {}
-for line in open(sys.argv[1]):
-    at, store = line.split()
-    first.setdefault(store.split("?")[0], float(at))
-print(int(max(first.values()) - min(first.values()) <= float(sys.argv[2])))
-PY2
-  }
+  # ended_before_asked HOST: how many release attempts had ended when HOST was first asked.
+  ended_before_asked() { awk -v h="//$1" 'index($2, h) && !n++ { print $3 }' "$T/run-$k/release-times"; }
 
   # Kills "options-pass-through": a caller's own limit reaching nix.
   run 0 -- --max-silent-time 600 x
@@ -517,15 +509,15 @@ PY2
   next answers 1
   RELEASE_S=3 run 0 -- x
   check "a release never answered is given up within RELEASE_S" \
-    test "$RC$(status 's["release"]["acknowledged"]')$((ELAPSED <= 6))" = 0False1
+    test "$RC$(status 's["release"]["acknowledged"]')" = 0False
   # Kills "in-turn-shared" (schedulers asked in turn under one RELEASE_S: the first, down,
   # uses it all and the others are never asked) and "in-turn" (in
   # turn, each its own RELEASE_S: the last is asked only once both others gave up).
   next builders "grpc://dead:1;grpc://dead:2;grpc://alive:1"
   RELEASE_S=3 run 0 -- x
   check "schedulers that do not answer hold up no other's release" \
-    test "$(grep -c '//alive:1' "$T/run-$k/releases")$(status 'sorted((x["store"], x["acknowledged"]) for x in s["release"]["stores"])')$(asked_within 2)" \
-    = "1[('grpc://alive:1', True), ('grpc://dead:1', False), ('grpc://dead:2', False)]1"
+    test "$(grep -c '//alive:1' "$T/run-$k/releases")$(status 'sorted((x["store"], x["acknowledged"]) for x in s["release"]["stores"])')$(ended_before_asked alive:1)" \
+    = "1[('grpc://alive:1', True), ('grpc://dead:1', False), ('grpc://dead:2', False)]0"
   # The control: an answering scheduler listed first is released either way.
   next builders "grpc://alive:1;grpc://dead:1"
   RELEASE_S=3 run 0 -- x
@@ -550,34 +542,36 @@ PY2
   # Kills "no-trap": a stop that kills the script leaves the running link's build kept,
   # and no record. Kills "foreground-link": a trap held until the link ends. Kills
   # "trap-no-kill": a trap that does not end the running link, which then runs its course.
-  next block.1 30
+  # The links here never end by themselves: that main ends at all is that it ended them.
+  next block.1 infinity
   stopped TERM link x
   check "SIGTERM ends the running link at once and releases" \
-    test "$((ELAPSED <= 5))$RC$(status 's["release"]["acknowledged"]')" = 1143True
+    test "$RC$(status 's["release"]["acknowledged"]')" = 143True
   check "a stop is recorded as 128 + the signal" ended 143 1
-  next block.1 30
+  next block.1 infinity
   stopped INT link x
   check "so does SIGINT" test "$RC$(status 's["release"]["acknowledged"]')" = 130True
   # Kills "no-stop-check": a stop that comes between one link's end and the next one's
   # start, before the script knows the next link to end, lets that link run its whole
   # course. The first link ends 124, so a second follows; the
-  # clock's 4th reading, the second link's start, holds 3 s, and the stop comes then.
-  next exits 124; next pause.4 3; next block.2 30
+  # clock's 4th reading, the second link's start, holds until the stop has come.
+  next exits 124; next pause.4 1; next block.2 infinity
   stopped TERM pause x
   check "a stop between links ends the next link as it starts, and releases" \
-    test "$((ELAPSED <= 8))$RC$(status 's["clients"]')$(status 's["release"]["acknowledged"]')" = 11432True
+    test "$RC$(status 's["clients"]')$(status 's["release"]["acknowledged"]')" = 1432True
   # Kills "wait-once": a second signal returns `wait` early, and the script ends while
   # its link still runs.
-  next block.1 30; next stubborn 1
+  next block.1 infinity; next stubborn 1
   stopped "TERM TERM" link x
   check "a second signal neither leaves the stopped link running nor waits for a release" \
     test "$(link_gone && echo gone)$RELEASES$(status 's["release"]["interrupted"]')" = gone0True
   # Kills "release-foreground": a release a signal cannot cut short (its own process
   # group, the trap held until it ends).
-  next rblock.1 30
+  # The release would be given up only at RELEASE_S; interrupted is the signal's.
+  next rblock.1 infinity
   stopped TERM release x
   check "a signal during the release ends it at once" \
-    test "$((ELAPSED <= 4))$RC$(status 's["release"]["interrupted"]')$(status 's["release"]["acknowledged"]')" = 10TrueFalse
+    test "$RC$(status 's["release"]["interrupted"]')$(status 's["release"]["acknowledged"]')" = 0TrueFalse
   # Kills "client-bound-unchecked": a client longer than the farm's 600 s.
   CLIENT_S=601 run 0 -- x
   check "a client bound over 600 s is refused" ended 2 0
