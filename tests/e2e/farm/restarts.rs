@@ -81,8 +81,8 @@ fn scheduler_restart_mid_build_finishes_without_a_double_build() {
     // starts.
     sleep(5);
     assert!(building().len() <= 1, "{:?}", building());
-    release_slow();
-    wait_unit_done("mid");
+    // A build that died with the leader is built again, maybe after this.
+    release_until_done("mid");
     assert_unit_success("mid");
 }
 
@@ -154,10 +154,7 @@ fn a_builder_killed_mid_build_sends_the_build_elsewhere() {
     );
     // How the stream ends depends on the path to the worker: here a reset,
     // in a farm behind tunnels also CANCELLED. Neither may fail the build.
-    retry("the build finished elsewhere", || {
-        release_slow();
-        run(CLIENT, &["systemctl", "is-active", "killed"]).code != 0
-    });
+    release_until_done("killed");
     assert_unit_success("killed");
     restart_daemon(busy);
 }
