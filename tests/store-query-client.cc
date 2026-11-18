@@ -12,13 +12,13 @@
 #include <span>
 #include <string>
 
-#include <dlfcn.h>
-
 #include <nix/store/globals.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
 #include <nix/util/error.hh>
+
+#include "load-plugin.hh"
 
 namespace {
 
@@ -49,20 +49,7 @@ try {
     // The test reads each line as it comes.
     std::cout << std::unitbuf;
     nix::initLibStore();
-    // Never closed: the store stays registered for the process lifetime.
-    void * handle = dlopen(plugin.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (handle == nullptr) {
-        // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread loads libraries yet
-        std::cerr << "could not load '" << plugin << "': " << dlerror() << "\n";
-        return 1;
-    }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): dlsym returns void*
-    auto entry = reinterpret_cast<void (*)()>(dlsym(handle, "nix_plugin_entry"));
-    if (entry == nullptr) {
-        std::cerr << "no nix_plugin_entry in '" << plugin << "'\n";
-        return 1;
-    }
-    entry();
+    loadPlugin(plugin);
     auto const store = nix::openStore("grpc://" + target + "?insecure=true");
     auto const path = store->parseStorePath("/nix/store/00000000000000000000000000000000-store-query");
     ask(*store, path);
