@@ -52,7 +52,6 @@ pkgs.testers.runNixOSTest {
         listen = "127.0.0.1:50051";
         logLevel = "debug";
         trustClients = true;
-        minFree = "0";
         package = config.programs.nix-grpc-store.package;
         niks3 = {
           package = niks3.packages.${pkgs.stdenv.hostPlatform.system}.niks3;

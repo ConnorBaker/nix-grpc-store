@@ -44,8 +44,6 @@ let
         scheduler = "lb:50051";
         logLevel = "debug";
         idleTimeout = null;
-        # The default wants more free disk than a test VM has.
-        minFree = "200M";
         package = config.programs.nix-grpc-store.package;
         inherit tls;
         trustedProxies = [ "lb-*" ];
