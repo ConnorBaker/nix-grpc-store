@@ -197,20 +197,28 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         using nix::Error::Error;
     };
 
-    // Publishing makes our paths everyone's. Without it the client may not rely on them.
+    // Publishing makes our paths everyone's. Without it the client may not
+    // rely on them. Tells the scheduler whether this worker can.
     void publish(
         nix::Store & localStore,
         const std::vector<std::string> & paths,
         const nixgrpc::Cancelled & cancelled,
         bool verify = false)
     {
+        bool const reports = coord.builder && coord.cache.hasRemote() && !paths.empty();
         nixgrpc::PushProcess::Signatures signed_;
         try {
             signed_ = coord.cache.publish(paths, cancelled, verify);
         } catch (nixgrpc::CancelledWait &) {
             throw;
         } catch (nix::Error & err) {
+            if (reports) {
+                coord.builder->published(false);
+            }
             throw Unavailable("publish failed: %s", err.what());
+        }
+        if (reports) {
+            coord.builder->published(true);
         }
         // Built here the paths are only "ultimate", a client checking
         // signatures would refuse them. Outside the catch: a local nix-daemon
