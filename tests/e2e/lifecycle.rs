@@ -26,12 +26,15 @@ fn nix_daemon_restart_does_not_fail_the_next_rpc() {
         "nix-daemon",
         "accepted connection from pid .*nix-grpc-daemon",
     );
+    let pid = query(MACHINE, &["systemctl", "show", "-P", "MainPID", "nix-daemon.service"])
+        .trim()
+        .to_string();
+    assert_ne!(pid, "0", "nix-daemon is not running");
     // SIGKILL, like a crashed container: no orderly close of the pooled connections.
     succeed(&["systemctl", "kill", "-s", "KILL", "nix-daemon.service"]);
-    wait_until_succeeds(
-        &["sh", "-c", "! systemctl is-active nix-daemon.service"],
-        30,
-    );
+    // Gone is all this waits for: every builder probes nix-daemon every 10 s,
+    // and through its socket the next probe starts a new one, maybe at once.
+    wait_until_succeeds(&["sh", "-c", &format!("! test -d /proc/{pid}")], 30);
     succeed(&["systemctl", "start", "nix-daemon.socket"]);
     succeed(&["nix", "path-info", "--store", STORE, p]);
     write_file("/tmp/warm", "again");
