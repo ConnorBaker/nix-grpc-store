@@ -25,8 +25,6 @@
 
 namespace {
 
-// What Coordinator::askLocalDaemon gives a nix-daemon to greet.
-constexpr std::chrono::seconds patience{5};
 // The late nix-daemon greets only once the probe gave up, so any patience
 // shows that; a short one keeps the test short.
 constexpr std::chrono::milliseconds shortPatience{200};
@@ -81,7 +79,7 @@ auto run() -> int
     auto const dir = std::filesystem::temp_directory_path() / ("daemon-probe-test-" + std::to_string(::getpid()));
     std::filesystem::create_directory(dir);
     int status = EXIT_SUCCESS;
-    auto const expect = [&](std::string_view name, bool answers, std::chrono::milliseconds within = patience) -> void {
+    auto const expect = [&](std::string_view name, bool answers, std::chrono::milliseconds within = nixgrpc::daemonPatience) -> void {
         if (nixgrpc::nixDaemonAnswers(dir / name, within) != answers) {
             std::println("FAIL a nix-daemon that {} {}", name, answers ? "is taken for dead" : "is taken for alive");
             status = EXIT_FAILURE;
