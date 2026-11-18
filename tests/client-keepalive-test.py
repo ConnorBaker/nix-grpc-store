@@ -28,7 +28,8 @@
 #     The proxy counts the client's PINGs since the daemon last sent HEADERS,
 #     DATA or WINDOW_UPDATE, which reset the daemon's ping strikes. Once
 #     there were MAX_STRIKES + 2 of them, enough for a GOAWAY had the daemon
-#     struck them, no GOAWAY may have come and the stream must still be open.
+#     struck them, and one more (by then any GOAWAY came), no GOAWAY may have
+#     come and the stream must still be open.
 #   query: after one answered QueryValidPaths, the proxy stops forwarding the
 #     connections it has and the client asks again. That query must be
 #     answered, over a connection the proxy took after it stopped forwarding.
@@ -50,7 +51,6 @@ import testdaemon
 
 ALIVE_S = 3  # forward this long after Assigned, like a live connection
 IDLE_S = 44  # after the client's keepalive pings at +20 s and +40 s
-GRACE_S = 2  # for a GOAWAY to follow the last ping counted
 MAX_STRIKES = 2  # gRPC's default GRPC_ARG_HTTP2_MAX_PING_STRIKES; the daemon sets none
 UNAVAILABLE = 14
 
@@ -439,7 +439,9 @@ def main():
                     )
                 elif ended is not None:
                     heal_verdict = (False, f"stream ended: {ended[1]!r}, client pings at {since(pings, heal_unplaced)}")
-                elif st["longest"] >= MAX_STRIKES + 2 and now - pings[-1] > GRACE_S:
+                # One ping past the strikes: a GOAWAY for the last of them
+                # would have come before the client's next ping.
+                elif st["longest"] >= MAX_STRIKES + 3:
                     heal_verdict = (
                         True,
                         f"{st['longest']} client pings in a row with nothing from the daemon that resets its strikes, "
