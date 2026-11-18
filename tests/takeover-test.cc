@@ -41,7 +41,8 @@ using Event = Offer::Event;
 namespace {
 
 constexpr std::chrono::milliseconds kStep{100};
-constexpr int kSteps = 100;
+// For Offer::makeMain: until the test's systemd has read MAINPID=.
+constexpr std::chrono::milliseconds noLimit{-1};
 // Longer than any sd_notify message these tests send.
 constexpr size_t kMessage = 256;
 
@@ -442,7 +443,7 @@ void theOldProcessKeepsTheUnitIfTheSuccessorDiesBeforeSystemdTakesIt()
         assert(next(offer, child) == Event::requested);
         offer.send({listening.readSide.get()}, "");
         assert(next(offer, child) == Event::ready);
-        assert(offer.makeMain(kStep * kSteps));
+        assert(offer.makeMain(noLimit));
         assert(manager.got("MAINPID=" + std::to_string(child)));
         offer.accept();
         assert(exitStatus(child) == 0);
@@ -469,7 +470,7 @@ void theOldProcessKeepsTheUnitIfTheSuccessorDiesBeforeSystemdTakesIt()
         assert(next(offer, child) == Event::ready);
         assert(::write(goOn.writeSide.get(), "x", 1) == 1);
         assert(exitStatus(child) == 0);
-        assert(!offer.makeMain(kStep * kSteps));
+        assert(!offer.makeMain(noLimit));
         offer.reject();
     }
 }
