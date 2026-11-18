@@ -26,8 +26,6 @@
 
 namespace {
 
-constexpr std::chrono::milliseconds settle{300};
-
 class Suite
 {
     std::string base;
@@ -72,10 +70,10 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
     // The child must outlive the thread that spawned it.
     std::thread([&] -> void { push.pushWait({"/nix/store/x.drv"}); }).join();
     {
-        constexpr std::chrono::milliseconds wellUnderCancelPoll{800};
+        // Woken by its cancel poll instead, it would return no sooner than that.
         auto const started = std::chrono::steady_clock::now();
         push.pushWait({"/nix/store/quick"});
-        tst.check(std::chrono::steady_clock::now() - started < wellUnderCancelPoll, "pushWait wakes on the ack");
+        tst.check(std::chrono::steady_clock::now() - started < nixgrpc::cancelPoll, "pushWait wakes on the ack");
     }
     push.pushWait({"/nix/store/y", "/nix/store/y2"});
     {
@@ -120,20 +118,16 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
     tst.check(throws("/nix/store/crash") == "error", "dead child fails the waiter");
     tst.check(throws("/nix/store/z") == "ok", "child is respawned");
     {
-        bool stop = false;
-        std::thread canceller([&] -> void {
-            std::this_thread::sleep_for(settle);
-            stop = true;
-        });
+        // Cancelled once the wait for the ack has begun: at its second look.
+        int looks = 0;
         std::string got = "ok";
         try {
-            push.pushWait({"/nix/store/hang"}, [&] -> bool { return stop; });
+            push.pushWait({"/nix/store/hang"}, [&] -> bool { return ++looks > 1; });
         } catch (nixgrpc::CancelledWait &) {
             got = "cancelled";
         } catch (nix::Error &) {
             got = "error";
         }
-        canceller.join();
         tst.check(got == "cancelled", "pushWait returns once cancelled while niks3 never acks");
         tst.check(throws("/nix/store/z2") == "ok", "push usable after a cancelled wait");
     }
