@@ -205,10 +205,10 @@ let
       system = builtins.currentSystem;
       requiredSystemFeatures = features;
       builder = "/bin/sh";
-      # Inner sh so a test can pkill it to let the build succeed early.
+      # Runs until a test pkills the inner sh, which lets the build succeed.
       args = [
         "-c"
-        "/bin/sh -c 'read -t 90 x < /dev/zero'; ''${
+        "/bin/sh -c 'read x < /dev/zero'; ''${
           if unique then "read tag < /proc/sys/kernel/random/uuid" else "tag=''${tag}"
         }; echo $tag > $out"
       ];
@@ -233,7 +233,7 @@ let
     rec {
       a = ca "ca-a-''${tag}" "echo a-''${tag} > $out";
       b = ca "ca-b-''${tag}" "read x < ''${a}; echo b-$x > $out";
-      slow = ca "ca-slow-''${tag}" "/bin/sh -c 'read -t 90 x < /dev/zero'; echo slow-''${tag} > $out";
+      slow = ca "ca-slow-''${tag}" "/bin/sh -c 'read x < /dev/zero'; echo slow-''${tag} > $out";
       inner = ca "ca-inner-''${tag}" "echo inner-''${tag} > $out";
       producer = derivation {
         name = "ca-inner-''${tag}.drv";

@@ -10,7 +10,8 @@ pub const WORKER1: Node = Node("worker1");
 pub const WORKER2: Node = Node("worker2");
 pub const WORKERS: [Node; 2] = [WORKER1, WORKER2];
 
-pub const BUILDER: &[&str] = &["pgrep", "-f", "read -t [9]0 x"];
+/// The slow builds (farm.nix), which run until released.
+pub const BUILDER: &[&str] = &["pgrep", "-f", "[r]ead x < /dev/zero"];
 
 pub fn system() -> String {
     env("NGS_SYSTEM")
