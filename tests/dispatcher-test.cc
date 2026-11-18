@@ -61,13 +61,18 @@ struct Farm
         disp.workerMsgs(session, msgs);
     }
 
-    void want(const std::string & drv, uint64_t refused = 0)
+    // `older`: as a client that names the refused assignment in field 8.
+    void want(const std::string & drv, uint64_t refused = 0, bool older = false)
     {
         nix::remote::ClientMsgs msgs;
         auto * wnt = msgs.add_msgs()->mutable_want();
         wnt->set_drv_path(drv);
         wnt->set_system("x");
-        wnt->set_refused(refused);
+        if (older) {
+            wnt->set_bounced_assign_id(refused);
+        } else {
+            wnt->set_refused(refused);
+        }
         disp.clientMsgs(client, msgs);
     }
 };
@@ -216,8 +221,9 @@ void aFailingWorkerIsRested()
     farm.disp.workerGone(sick.conn);
 }
 
-// A client that cannot reach the worker it was sent to is sent to another.
-void aClientThatCannotReachItsWorkerIsSentElsewhere()
+// A client that cannot reach the worker it was sent to is sent to another,
+// also one that says so the older way.
+void aClientThatCannotReachItsWorkerIsSentElsewhere(bool older)
 {
     Farm farm;
     Session unreachable;
@@ -228,7 +234,7 @@ void aClientThatCannotReachItsWorkerIsSentElsewhere()
     farm.want("a.drv");
     assert(farm.sentTo == std::vector<std::string>{"w:1"});
 
-    farm.want("a.drv", unreachable.lastAssignId);
+    farm.want("a.drv", unreachable.lastAssignId, older);
     assert((farm.sentTo == std::vector<std::string>{"w:1", "w:2"}));
     assert(unreachable.revoked == std::vector<std::string>{"a.drv"});
     assert(other.expected == std::vector<std::string>{"a.drv"});
@@ -855,7 +861,8 @@ try {
     testLateFirstHelloEndsInAReconnect();
     loadRestoresSlotsAfterDrainingHello();
     aSystemWithoutBuildersGetsEveryBuilder();
-    aClientThatCannotReachItsWorkerIsSentElsewhere();
+    aClientThatCannotReachItsWorkerIsSentElsewhere(false);
+    aClientThatCannotReachItsWorkerIsSentElsewhere(true);
     aWorkerThatRestedGetsItsDerivationBack();
     aFailingWorkerIsRested();
     loopbackWorkerMayAnswerACommand();
