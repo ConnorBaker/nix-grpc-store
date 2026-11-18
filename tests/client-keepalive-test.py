@@ -330,14 +330,16 @@ def main():
         query = clients["query"] = Client([query_exe, plugin, f"127.0.0.1:{queried.port}"])
         # The clients' lines are read on threads of their own: look until they are there.
         while True:
+            # Before the lines: a client seen gone has all its lines read.
+            gone = {c: c.exited() for c in clients.values()}
             part_assigned, idle_assigned = (c.first("assigned ") for c in (part, idle))
             heal_unplaced = heal.first("unplaceable ")
             answered = query.first("answered ")
             if part_assigned and heal_unplaced and idle_assigned and answered:
                 break
-            if any(c.first("ended ") or c.exited() for c in (part, heal, idle)):
+            if any(c.first("ended ") or gone[c] for c in (part, heal, idle)):
                 return setup_fail("a client's stream ended before its Assigned or Unplaceable")
-            if query.first("failed ") or query.exited():
+            if query.first("failed ") or gone[query]:
                 return setup_fail("the first store query was not answered")
             if proc.poll() is not None:
                 return setup_fail(f"daemon exited with {proc.returncode}")
@@ -363,12 +365,14 @@ def main():
             if proc.poll() is not None:
                 print(f"FAIL: the daemon exited with {proc.returncode}\n{client_logs()}\n{daemon_log()}")
                 return 1
+            # Before the lines: a client seen gone has all its lines read.
+            gone = {c: c.exited() for c in clients.values()}
             if idle_holed is None and idle_verdict is None:
                 ended = idle.first("ended ")
                 if ended is not None:
                     idle_verdict = (False, f"stream ended before the partition: {ended[1]!r}")
                     print(f"idle: FAIL: {idle_verdict[1]}")
-                elif idle.exited():
+                elif gone[idle]:
                     idle_verdict = (False, "exited before the partition without ending its stream")
                     print(f"idle: FAIL: {idle_verdict[1]}")
                 elif now - idle_assigned >= IDLE_S:
@@ -391,7 +395,7 @@ def main():
                         what += f" (daemon closed at +{st['server_closed'] - idle_holed:.1f}s)"
                     ok = code == UNAVAILABLE
                     idle_verdict = (ok, what if ok else f"{what}: not UNAVAILABLE")
-                elif idle.exited():
+                elif gone[idle]:
                     idle_verdict = (
                         False,
                         f"client exited without ending its stream; client pings at {since(st['pings'], idle_assigned)} after its Assigned",
@@ -416,7 +420,7 @@ def main():
                     if closed is not None:
                         what += f" (daemon closed at +{closed - holed:.1f}s)"
                     part_verdict = (code == UNAVAILABLE, what if code == UNAVAILABLE else f"{what}, not UNAVAILABLE")
-                elif part.exited():
+                elif gone[part]:
                     part_verdict = (
                         False,
                         f"client exited without ending its stream, {len(st['pings'])} client pings ({since(st['pings'], holed)})",
@@ -441,7 +445,7 @@ def main():
                         f"{st['longest']} client pings in a row with nothing from the daemon that resets its strikes, "
                         f"no GOAWAY, stream open; client pings at {since(pings, heal_unplaced)}",
                     )
-                elif heal.exited():
+                elif gone[heal]:
                     heal_verdict = (False, f"client exited without ending its stream, client pings at {since(pings, heal_unplaced)}")
                 if heal_verdict is not None:
                     print(f"healthy: {'PASS' if heal_verdict[0] else 'FAIL'}: {heal_verdict[1]}")
@@ -460,7 +464,7 @@ def main():
                     query_verdict = (links > query_links, what if links > query_links else f"{what}: not a new one")
                 elif failed is not None:
                     query_verdict = (False, f"second query {failed[1]!r} at +{failed[0] - query_holed:.1f}s")
-                elif query.exited():
+                elif gone[query]:
                     query_verdict = (False, "the client exited without answering the second query")
                 if query_verdict is not None:
                     print(f"query: {'PASS' if query_verdict[0] else 'FAIL'}: {query_verdict[1]}")
