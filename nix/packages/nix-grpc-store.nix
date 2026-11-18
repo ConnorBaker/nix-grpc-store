@@ -62,6 +62,7 @@ stdenv.mkDerivation {
         ../../tests/testdaemon.py
         ../../tests/client-keepalive-test.py
         ../../tests/keepalive-client.cc
+        ../../tests/load-plugin.hh
         ../../tests/store-query-client.cc
         ../../tests/farm-client-test.cc
         ../../tests/farm-sim-test.cc
