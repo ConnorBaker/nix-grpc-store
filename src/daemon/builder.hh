@@ -120,8 +120,7 @@ public:
     // Why this worker takes no new builds. It takes none while any holds.
     enum class Unavailable : uint8_t {
         stopping = 1U << 0U,
-        lowDisk = 1U << 1U,
-        localDaemonDown = 1U << 2U,
+        localDaemonDown = 1U << 1U,
     };
     void setUnavailable(Unavailable why, bool holds);
     // `changed` hears whether the worker takes builds, now and on every change.
@@ -132,8 +131,6 @@ public:
         switch (why) {
         case Unavailable::stopping:
             return "stopping";
-        case Unavailable::lowDisk:
-            return "low_disk";
         case Unavailable::localDaemonDown:
             return "local_daemon";
         }

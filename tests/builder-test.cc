@@ -31,7 +31,7 @@ auto greetsFirst() -> bool
         hellos.push_back(msg.has_hello());
         return true;
     });
-    builder.setUnavailable(Builder::Unavailable::lowDisk, true);
+    builder.setUnavailable(Builder::Unavailable::localDaemonDown, true);
     builder.greet();
     return hellos == std::vector<bool>{true, false};
 }
@@ -216,15 +216,14 @@ auto run() -> int
     });
     builder.greet();
 
-    builder.setUnavailable(Builder::Unavailable::lowDisk, true);
+    builder.setUnavailable(Builder::Unavailable::localDaemonDown, true);
     builder.setUnavailable(Builder::Unavailable::stopping, true);
-    builder.setUnavailable(Builder::Unavailable::lowDisk, false);
+    builder.setUnavailable(Builder::Unavailable::localDaemonDown, false);
     if (told != std::vector<bool>{true}) {
-        std::println("FAIL a stopping worker takes builds again once its disk has room");
+        std::println("FAIL a stopping worker takes builds again once its local nix-daemon answers");
         return EXIT_FAILURE;
     }
-    if (metrics.unavailableNow("low_disk") != 0 || metrics.unavailableNow("stopping") != 1
-        || metrics.unavailableNow("local_daemon") != 0) {
+    if (metrics.unavailableNow("stopping") != 1 || metrics.unavailableNow("local_daemon") != 0) {
         std::println("FAIL the metric does not show stopping as the only reason");
         return EXIT_FAILURE;
     }

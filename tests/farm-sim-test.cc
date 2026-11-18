@@ -72,7 +72,7 @@ struct SimWorker
     std::deque<nix::remote::WorkerMsg> up;
     std::set<std::string> building; // a client's call runs the build
     std::set<std::string> stopping; // of those, the ones a Revoke reached
-    bool full = false;              // low on disk: takes no builds
+    bool daemonDown = false;        // local nix-daemon not answering: takes no builds
 
     SimWorker(std::string addr, nixgrpc::Metrics & metrics, const double & nowMs)
         : addr(addr)
@@ -401,16 +401,16 @@ private:
                 add(steps, wkr.addr + " reads", [this, idx] -> void { workerReads(idx); });
             }
         }
-        if (wkr.full) {
-            add(steps, wkr.addr + " has room again", [&wkr] -> void {
-                                 wkr.full = false;
-                                 wkr.builder.setUnavailable(Builder::Unavailable::lowDisk, false);
+        if (wkr.daemonDown) {
+            add(steps, wkr.addr + "'s nix-daemon answers again", [&wkr] -> void {
+                                 wkr.daemonDown = false;
+                                 wkr.builder.setUnavailable(Builder::Unavailable::localDaemonDown, false);
                              });
         } else if (faults < faultsPerSeed) {
-            add(steps, wkr.addr + " runs out of disk", [this, &wkr] -> void {
+            add(steps, wkr.addr + "'s nix-daemon stops answering", [this, &wkr] -> void {
                                  faults++;
-                                 wkr.full = true;
-                                 wkr.builder.setUnavailable(Builder::Unavailable::lowDisk, true);
+                                 wkr.daemonDown = true;
+                                 wkr.builder.setUnavailable(Builder::Unavailable::localDaemonDown, true);
                              }, true);
         }
         for (const auto & drv : wkr.building) {
