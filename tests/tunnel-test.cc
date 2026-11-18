@@ -475,6 +475,8 @@ struct Held
     std::mutex mutex;
     std::condition_variable adoptedMore;
     std::vector<nix::AutoCloseFD> adopted;
+    // Runs inside the hand-over of the next tunnel, once.
+    std::function<void()> during;
     nixgrpc::tunnel::Tunnels tunnels{{
         .balancers = {{.host = "lb.test", .port = lis.port}},
         .tls = {.cert = pki.file("b1.pem"), .key = pki.file("b1.key"), .ca = pki.file("ca.pem")},
@@ -482,7 +484,12 @@ struct Held
         .instance = "pod-7",
         .perSet = 1,
         .adopt = [this](nix::AutoCloseFD sock) -> void {
-            const std::scoped_lock lock(mutex);
+            std::unique_lock lock(mutex);
+            if (auto run = std::exchange(during, nullptr)) {
+                lock.unlock();
+                run();
+                lock.lock();
+            }
             adopted.push_back(std::move(sock));
             adoptedMore.notify_all();
         },
@@ -569,6 +576,32 @@ void a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself()
     check(back && back->protocol == "nix-tunnel-any", "taking work again opens it again");
 }
 
+// A takeover stops the tunnels, then shuts the server down: once stop()
+// returns, no tunnel may be handed over any more, so it waits for one being
+// handed over. That it waits is an absence, seen for `window`: a stall that
+// long can only hide a stop() that does not wait, never fail one that does.
+void stop_waits_for_a_tunnel_being_handed_over()
+{
+    constexpr auto window = 500ms;
+    Held held;
+    std::promise<void> entered;
+    std::promise<void> release;
+    {
+        const std::scoped_lock lock(held.mutex);
+        held.during = [&, released = release.get_future().share()] -> void {
+            entered.set_value();
+            released.wait();
+        };
+    }
+    std::thread balancer([&] -> void { (void) held.next(); });
+    entered.get_future().wait();
+    auto stopped = std::async(std::launch::async, [&] -> void { held.tunnels.stop(); });
+    check(stopped.wait_for(window) == std::future_status::timeout, "stop() waits for the tunnel being handed over");
+    release.set_value();
+    stopped.get();
+    balancer.join();
+}
+
 void a_tunnelled_builder_is_known_by_its_certificates_common_name()
 {
     using nixgrpc::tunnel::certName;
@@ -608,6 +641,7 @@ try {
         builders_sharing_a_certificate_are_told_apart_by_instance();
         a_tunnel_that_ended_is_opened_again();
         a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself();
+        stop_waits_for_a_tunnel_being_handed_over();
     } catch (std::exception & err) {
         std::println(stderr, "FAIL: {}", err.what());
         return 1;
