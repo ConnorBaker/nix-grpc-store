@@ -819,7 +819,8 @@ fn stop_publishing(broken: Node) -> Restore {
     // the scheduler has heard of it, then it is stopped.
     let copy = "nopub-copy";
     let to = direct(broken);
-    let argv = ["systemd-run", "--unit", copy, "nix", "copy", "--no-check-sigs", "--to", &to, &path];
+    // --collect: two tests stop a copy of this name, which then failed.
+    let argv = ["systemd-run", "--collect", "--unit", copy, "nix", "copy", "--no-check-sigs", "--to", &to, &path];
     succeed(CLIENT, &argv);
     retry_with_clients(CLIENT, &[copy], "the scheduler hears that the builder cannot publish", || {
         failing() > before
