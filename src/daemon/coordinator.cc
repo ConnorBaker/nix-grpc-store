@@ -2,6 +2,7 @@
 #include "dispatcher.hh"
 #include "idle.hh"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -19,7 +20,6 @@
 
 #include <sys/statvfs.h>
 
-#include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/client_context.h>
 #include <grpcpp/create_channel.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -34,6 +34,7 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/globals.hh>
+#include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 
 #include "acl.hh"
@@ -43,13 +44,14 @@
 #include "client/channel.hh"
 #include "client/retry-pause.hh"
 #include "daemon-probe.hh"
-#include "keepalive.hh"
 #include "logfmt.hh"
 #include "metrics.hh"
+#include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "options.hh"
 #include "sched-reactor.hh"
+#include "scheduler.hh"
 
 namespace nixgrpc {
 
@@ -61,7 +63,11 @@ using nix::remote::WorkerMsg;
 using nix::remote::WorkerMsgs;
 
 namespace {
-constexpr int minReconnectBackoffMs = 2'000;
+// 0 (nix: no local builds) still takes one.
+auto nixMaxJobs() -> unsigned
+{
+    return std::clamp(nixcompat::configuredMaxBuildJobs(), 1U, static_cast<unsigned>(sched::FreeIndex::maxSlots));
+}
 } // namespace
 
 // ---------------------------------------------------------- SchedulerService
@@ -175,12 +181,16 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
     , metrics(metrics)
 {
     if (options.builder) {
-        Builder::Config self{.advertise = options.advertise, .systems = {nix::settings.thisSystem.get()}, .features = {}, .maxJobs = options.maxJobs};
+        Builder::Config self{
+            .advertise = options.advertise,
+            .systems = {nix::settings.thisSystem.get()},
+            .features = {},
+            .maxJobs = options.maxJobs != 0 ? options.maxJobs : nixMaxJobs()};
         self.systems.append_range(nix::settings.extraPlatforms.get());
         self.systems.append_range(options.extraSystems);
         self.features.append_range(nix::settings.systemFeatures.get());
         builder.emplace(std::move(self), metrics);
-        metrics.buildSlots(options.maxJobs);
+        metrics.buildSlots(builder->maxJobs());
     }
     if (options.scheduler) {
         Dispatcher::PresentFn present;
@@ -273,12 +283,7 @@ void Coordinator::start(grpc::Server & server)
 void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 {
     auto const creds = schedulerCreds(options);
-    grpc::ChannelArguments args;
-    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
-    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
-    args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
-    // A replaced balancer pod blackholes the first SYN; do not sit out gRPC's 20s.
-    args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
+    auto const args = daemonChannelArgs();
     auto const target = options.schedulerAddr.starts_with(plaintextScheme) ? options.schedulerAddr.substr(plaintextScheme.size())
                                                                     : options.schedulerAddr;
     auto const channel = grpc::CreateCustomChannel(target, creds, args);
@@ -380,6 +385,28 @@ void Coordinator::tick()
     if (lastHealthy.exchange(healthy) != healthy) {
         logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", std::string(Builder::name(Builder::Unavailable::lowDisk))}});
         builder->setUnavailable(Builder::Unavailable::lowDisk, !healthy);
+    }
+}
+
+// Whoever rewrites nix's configuration signals us; a Tribuchet hub rewrites
+// max-jobs, in a file nix.conf includes, whenever a worker joins or leaves.
+void Coordinator::reloadNixConfig()
+{
+    if (!builder || options.maxJobs != 0) {
+        return;
+    }
+    unsigned jobs = 0;
+    try {
+        jobs = nixMaxJobs();
+    } catch (nix::Error & err) {
+        logLine(LogLevel::info, {{"event", "max_jobs_unreadable"}, {"error", err.msg()}});
+        return;
+    }
+    auto const was = builder->maxJobs();
+    logLine(LogLevel::info, {{"event", "max_jobs"}, {"from", std::to_string(was)}, {"to", std::to_string(jobs)}});
+    if (was != jobs) {
+        metrics.buildSlots(jobs);
+        builder->setMaxJobs(jobs);
     }
 }
 

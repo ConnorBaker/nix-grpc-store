@@ -117,6 +117,9 @@ volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
 
 namespace {
 using nixgrpc::stopSignal;
+// SIGHUP count: each one asks the builder to read nix's max-jobs anew.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
+volatile std::sig_atomic_t reloadSignal = 0;
 
 static_assert(static_cast<int>(nixgrpc::SpillKind::line) == static_cast<int>(nixgrpc::BuildEvent::Kind::line));
 static_assert(static_cast<int>(nixgrpc::SpillKind::phase) == static_cast<int>(nixgrpc::BuildEvent::Kind::phase));
@@ -1250,10 +1253,15 @@ void serve(
         watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
                               : std::chrono::seconds(1);
     bool draining = false;
+    std::sig_atomic_t reloaded = 0;
     for (;;) {
         if (stopSignal == 0) {
             if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout) {
                 return;
+            }
+            if (reloadSignal != reloaded) {
+                reloaded = reloadSignal;
+                coord.reloadNixConfig();
             }
             coord.tick();
             service.tick();
@@ -1362,6 +1370,9 @@ try {
     for (int const sig : {SIGTERM, SIGINT}) {
         sigaction(sig, &act, nullptr);
     }
+    // Picked up by the main loop too. Unhandled, SIGHUP would kill us mid-build.
+    act.sa_handler = [](int) -> void { reloadSignal = reloadSignal + 1; };
+    sigaction(SIGHUP, &act, nullptr);
     // NOLINTEND(misc-include-cleaner)
 
     // Required before nix::openStore() in the native RPC handlers.
@@ -1410,7 +1421,7 @@ try {
          {"scheduler_addr", options.schedulerAddr},
          {"advertise", options.advertise},
          {"niks3", options.niks3.url},
-         {"max_jobs", std::to_string(options.maxJobs)}});
+         {"max_jobs", std::to_string(coord.builder ? coord.builder->maxJobs() : 0)}});
     NixRemoteService service(
         options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord);
 
@@ -1435,8 +1446,12 @@ try {
     builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, minPingIntervalMs);
     auto const creds = nixgrpc::makeServerCredentials(options);
     std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> acceptor;
+    int port = 0;
     if (listenFds.empty()) {
-        builder.AddListeningPort(options.listen, creds);
+        // The port is ours alone: with gRPC's default SO_REUSEPORT a second
+        // daemon on it would start too and get half the connections.
+        builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
+        builder.AddListeningPort(options.listen, creds, &port);
     } else {
         options.listen = "systemd";
         acceptor = builder.experimental().AddExternalConnectionAcceptor(
@@ -1460,9 +1475,12 @@ try {
         nixgrpc::acceptInto(listenFds, acceptor);
     }
 
+    // The ports as bound, also for port 0: tests ask for it, since a port they
+    // picked and let go of may meanwhile be another test's.
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
-        {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
+        {{"event", "startup"}, {"listen", options.listen}, {"port", listenFds.empty() ? std::to_string(port) : "activated"},
+         {"metrics_port", std::to_string(metrics.port())}, {"proxy_socket", options.socketPath}});
     coord.start(*server);
     if (tunnelled && coord.builder) {
         startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);

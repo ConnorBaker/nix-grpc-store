@@ -332,7 +332,6 @@ public:
     [[nodiscard]] auto retryBudget() const -> std::chrono::milliseconds {
       return everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get());
     }
-    static constexpr int minReconnectBackoffMs = 2000;
     template<typename F>
     void retrying(const char * what, const F & attempt) {
       // From the first failure, not the call's start: a long upload cut

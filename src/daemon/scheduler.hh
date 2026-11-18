@@ -997,6 +997,14 @@ public:
         refreshFree(wid);
     }
 
+    // Capacity changed while connected. Below what runs, free goes negative
+    // and nothing new is placed until enough finish.
+    void setMaxJobs(WorkerId wid, uint32_t maxJobs)
+    {
+        workers.at(wid).maxJobs = static_cast<int32_t>(std::min<uint32_t>(maxJobs, FreeIndex::maxSlots));
+        refreshFree(wid);
+    }
+
     // How long a placed drv waits for a client or worker whose stream broke.
     static constexpr double holdMs = 60'000;
 

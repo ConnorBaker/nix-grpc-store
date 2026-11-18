@@ -140,7 +140,7 @@ services.nix-grpc-daemon = {
 | `roles` | `builder`, `scheduler` or both (the default). Only fixed machines should have `scheduler`. |
 | `scheduler` | Where a builder finds the scheduler: that node's address, or the balancer's when several nodes have the role (see [failover](#managing-the-farm)). Unset on a node that is the only scheduler. |
 | `advertise` | The address the balancer reaches this node at. A builder's must be `IP:port`, since the scheduler passes it to envoy as an endpoint. It routes requests and grants no access: only peers with the `trusted` role can open a session. A scheduler node's must match its entry in the balancer's `scheduler`. |
-| `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`. |
+| `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`, read again on SIGHUP. |
 | `lookupThreads` | Cache lookups a scheduler runs at once for incoming build requests, 32 by default. Raise it when requests wait on a slow cache while the scheduler is idle. |
 | `minFree` | Below this much free disk the node takes no new builds until space returns. |
 | `buildLogRetention` | How long a builder keeps Nix's build logs, `"30d"` by default. `null` keeps them forever, as Nix does. |
@@ -330,6 +330,14 @@ scheduler, and returns once the claimed ones have published. After
 another worker. A second SIGTERM cancels right away. `nixos-rebuild
 switch` only signals the worker and the next connection starts the new
 generation.
+
+**Change a builder's capacity.** Without `maxJobs` a builder takes nix's
+`max-jobs`. After changing it in nix.conf, or in a file nix.conf includes,
+`systemctl kill --kill-whom=main --signal=SIGHUP nix-grpc-daemon` makes the
+builder read it again and tell the scheduler. Running builds carry on; if
+the new value is lower, no new ones arrive until enough have finished.
+Nothing is re-read without the signal. `systemctl reload` starts a new
+generation, see above.
 
 **Restart the scheduler.** Safe at any time, see [How it works](#how-it-works).
 New builds wait until it is back, or until another scheduler node has

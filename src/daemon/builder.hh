@@ -144,6 +144,14 @@ public:
         return unavailable_ != 0;
     }
 
+    // Builds taken at once: Config::maxJobs, then the last setMaxJobs().
+    [[nodiscard]] auto maxJobs() const -> uint32_t
+    {
+        return maxJobs_;
+    }
+    // The capacity changed (nix's max-jobs read anew): tell the scheduler.
+    void setMaxJobs(uint32_t maxJobs);
+
     // Give back unclaimed Expects nobody came for. Called from the serve loop.
     void tick();
 
@@ -164,8 +172,9 @@ private:
     mutable nix::Sync<State> state;
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<uint8_t> unavailable_{0};
-    // Orders the Load messages of concurrent setUnavailable() calls, and
-    // keeps them behind the Hello of their session.
+    std::atomic<uint32_t> maxJobs_;
+    // Orders the Load messages of concurrent setUnavailable() and
+    // setMaxJobs() calls, and keeps them behind the Hello of their session.
     std::mutex unavailableMutex;
     std::function<void(bool)> availability_;
     bool greeted_ = false;
@@ -175,6 +184,8 @@ private:
     static constexpr std::chrono::seconds expectLag{5};
     std::condition_variable expectArrived;
 
+    // Draining and capacity. Under unavailableMutex.
+    [[nodiscard]] auto load() const -> nix::remote::WorkerMsg;
     void sendDone(
         const std::string & drvPath,
         uint64_t assignId,
