@@ -239,7 +239,9 @@ pub mod upgrade {
             assert!(new_exe.contains("nix-grpc-daemon-next"), "{new_exe}");
         }
         assert_journal(UNIT, &format!("event=handed_over pid={new}"));
-        assert_journal(UNIT, &format!("event=predecessor_exited pid={old}"));
+        // Written once the successor has seen its predecessor go, which can
+        // come after the pid is gone: the line is the event.
+        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={old}"), 0);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("later");
     }
@@ -308,7 +310,7 @@ pub mod upgrade {
             !alive(&first) && !alive(&second)
         });
         assert_eq!(main_pid(), third);
-        assert_journal(UNIT, &format!("event=predecessor_exited pid={second}"));
+        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={second}"), 0);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("chain-later");
     }
