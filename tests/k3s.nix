@@ -345,10 +345,15 @@ pkgs.testers.runNixOSTest {
     def pod_ip(selector: str) -> str:
         return kubectl(f"get pod {selector} -o jsonpath='{{.items[0].status.podIP}}{{.status.podIP}}'").strip()
     def rollout(deployment: str) -> None:
-        # The chart's helm-install Job creates it; then rollout status
-        # follows it (a watch) until it is complete or fails.
-        wait_succeeds(machine, f"kubectl -n farm get deployment {deployment}")
-        kubectl(f"rollout status deployment {deployment}")
+        # Complete as `rollout status` judges it (its spec seen, every
+        # replica updated and available, none old), without its progress
+        # deadline. The chart's helm-install Job creates it first.
+        fields = "{.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.replicas} {.status.updatedReplicas} {.status.availableReplicas}"
+        def complete() -> bool:
+            status, out = machine.execute(f"kubectl -n farm get deployment {deployment} -o jsonpath='{fields}'", timeout=None)
+            f = out.split()
+            return status == 0 and len(f) == 6 and f[0] == f[1] and f[2] == f[3] == f[4] == f[5]
+        wait_until(f"deployment {deployment} rolled out", complete)
     def dump() -> None:
         machine.execute(
             "{ kubectl get pods -A; kubectl get events -A --sort-by=.lastTimestamp | tail -40;"
