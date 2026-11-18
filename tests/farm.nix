@@ -294,7 +294,6 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm-${part}";
-  globalTimeout = 540;
 
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
@@ -418,16 +417,17 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/waits.nix}
     start_all()
     for n, a in [(client, "${ip.client}"), (lb, "${ip.lb}"), (worker1, "${ip.worker1}"), (worker2, "${ip.worker2}")]:
-        n.wait_for_unit("network-addresses-eth1.service")
+        wait_unit(n, "network-addresses-eth1.service")
         n.succeed(f"ip -4 addr show | grep -qF {a}/ || {{ ip -4 addr >&2; false; }}")
-    lb.wait_for_unit("niks3.service")
-    lb.wait_for_open_port(5751)
-    lb.wait_for_unit("envoy.service")
-    lb.wait_for_open_port(50051)
+    wait_unit(lb, "niks3.service")
+    wait_port(lb, 5751)
+    wait_unit(lb, "envoy.service")
+    wait_port(lb, 50051)
     for w in [worker1, worker2]:
-        w.systemctl("start nix-grpc-daemon.service")
+        w.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 
     env = {
         "NGS_WORKER1_IP": "${ip.worker1}",
@@ -449,12 +449,12 @@ pkgs.testers.runNixOSTest {
     ${lib.optionalString (part == "scheduling") ''
       with subtest("extraSystems are advertised"):
           # Either worker may hold the scheduler role.
-          def advertised(last_try: bool) -> bool:
+          def advertised() -> bool:
               return any(
-                  w.execute("journalctl -u nix-grpc-daemon -o cat | grep worker_hello | grep '${ip.worker2}' | grep -q riscv64-linux")[0] == 0
+                  w.execute("journalctl -u nix-grpc-daemon -o cat | grep worker_hello | grep '${ip.worker2}' | grep -q riscv64-linux", timeout=None)[0] == 0
                   for w in [worker1, worker2]
               )
-          retry(advertised, timeout_seconds=60)
+          wait_until("worker2's hello with riscv64-linux", advertised)
     ''}
     ${lib.concatMapStringsSep "\n" (s: ''
       with subtest("${s.title}"):
