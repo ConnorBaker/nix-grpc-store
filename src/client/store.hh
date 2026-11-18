@@ -1,7 +1,8 @@
 #pragma once
 // The grpc:// Store: class layout. Definitions live in store.cc (setup,
 // errors, tunnel), build.cc (BuildDerivation, farm fan-out) and transfer.cc
-// (path info, NAR upload).
+// (path info, NAR upload), all in nix-grpc-store-impl, which the plugin loads
+// when a store is opened. Its configuration is in store-config.hh.
 
 #include <algorithm>
 #include <cstddef>
@@ -34,9 +35,6 @@
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
-#include <nix/store/store-reference.hh>
-#include <nix/util/configuration.hh>
-#include <nix/util/environment-variables.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/fmt.hh>
@@ -70,17 +68,16 @@
 #include <nix/store/build-result.hh>
 #include <nix/store/remote-store-connection.hh>
 #include <nix/store/remote-store.hh>
-#include <nix/store/store-registration.hh>
 #include <nix/store/worker-protocol.hh>
 // Generic definitions for the std::vector serialiser wrappers, which
 // libnixstore does not instantiate explicitly.
 #include <nix/store/worker-protocol-impl.hh> // IWYU pragma: keep
 #include <nix/util/callback.hh>
 #include <nix/util/file-descriptor.hh>
-#include <nix/util/url.hh>
 #include <utility>
 
 #include "channel.hh"
+#include "store-config.hh"
 #include "executor.hh"
 #include "nix-compat.hh"
 #include "nar-fetcher.hh"
@@ -94,125 +91,18 @@ using GrpcStream = grpc::ClientReaderWriter<nix::remote::Chunk, nix::remote::Chu
 
 namespace nix {
 
-// Follows Nix's own StoreConfig pattern (e.g. DummyStoreConfig).
-// NOLINTNEXTLINE(misc-multiple-inheritance,misc-use-internal-linkage)
-struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual RemoteStoreConfig
+// A failed RPC. Keeps the status, so that a caller can tell a worker that
+// left from a real error.
+struct GrpcStatusError : Error
 {
-private:
-    friend struct GrpcStore;
+    grpc::Status status;
 
-    ParsedURL::Authority authority;
-
-    Setting<bool> insecure{this, false, "insecure", "Use plaintext instead of TLS. Only for local testing."};
-
-    static constexpr unsigned defaultConnectTimeout = 30;
-    Setting<unsigned int> connectTimeout{this, defaultConnectTimeout, "connect-timeout",
-        "Seconds the first call waits for the server to become reachable before failing."};
-
-    static constexpr unsigned defaultRestartGrace = 120;
-    Setting<unsigned int> restartGrace{this, defaultRestartGrace, "restart-grace",
-        "Seconds to keep retrying once the server has answered before: across a worker or "
-        "scheduler restart, and while the scheduler says no worker can take a build."};
-
-    Setting<std::string> routeSystem{this, "", "system",
-        "Send `x-nix-system: VALUE` on every call, not only on builds. Use one "
-        "`nix.buildMachines` entry per system behind a balancer so input uploads "
-        "and substitution land on a worker of that system."};
-
-    Setting<bool> debug{this, nix::getEnv("NIX_GRPC_DEBUG").value_or("") == "1", "debug",
-        "Log TLS setup and enable gRPC handshake tracing on stderr. Also `NIX_GRPC_DEBUG=1`."};
-
-    Setting<std::string> caCert{
-        this,
-        "",
-        "ca-cert",
-        "Path to a PEM file with the CA certificate used to verify the server. "
-        "Defaults to `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE` or the system CA bundle."};
-
-    Setting<std::string> clientCert{
-        this,
-        "",
-        "client-cert",
-        "Path to a PEM client certificate chain to present for mTLS. Defaults to "
-        "`$NIX_GRPC_CLIENT_CERT`, then `client.crt` in `$XDG_DATA_HOME/nix-grpc-store`, "
-        "`/run/nix-grpc-store` or `/var/lib/nix-grpc-store`."};
-
-    Setting<std::string> clientKey{
-        this,
-        "",
-        "client-key",
-        "Path to the PEM private key for `client-cert`. Defaults to "
-        "`$NIX_GRPC_CLIENT_KEY`, then `client.key` next to the default `client-cert`."};
-
-    Setting<std::string> tokenFile{
-        this,
-        "",
-        "token-file",
-        "File holding an OIDC bearer token, re-read for every call so it may be "
-        "rotated in place. Defaults to `$NIX_GRPC_TOKEN_FILE`, then `token` next to "
-        "the default `client-cert`. Requires TLS."};
-
-    static constexpr unsigned defaultMaxBuilds = 64;
-
-    static constexpr unsigned defaultRescheduleRetries = 8;
-    Setting<unsigned> rescheduleRetries{this, defaultRescheduleRetries, "reschedule-retries",
-        "How often a derivation bounced by its assigned worker is handed back to the scheduler."};
-    Setting<unsigned> maxBuilds{
-        this,
-        defaultMaxBuilds,
-        "max-builds",
-        "Number of concurrent BuildDerivation streams."};
-
-    Setting<unsigned> narConnections{
-        this,
-        4,
-        "nar-connections",
-        "Number of parallel TCP connections used for NAR downloads."};
-
-public:
-    explicit GrpcStoreConfig(const Params & params)
-        : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
-        , RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
+    template<typename... Args>
+    explicit GrpcStatusError(grpc::Status status, const std::string & format, const Args &... args)
+        : Error(format, args...)
+        , status(std::move(status))
     {
     }
-
-#if !NIX_COMPAT_AT_LEAST(2, 34)
-    // Nix < 2.34 constructs store configs from the raw scheme and authority
-    // strings instead of a pre-parsed ParsedURL::Authority.
-    GrpcStoreConfig(std::string_view /*scheme*/, std::string_view authority, const Params &params)
-        : StoreConfig(params),
-          RemoteStoreConfig(params),
-          authority(ParsedURL::Authority::parse(authority)) {}
-#endif
-
-    GrpcStoreConfig(ParsedURL::Authority authority, const Params &params)
-        : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
-          RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
-          authority(std::move(authority)) {}
-
-    // NOLINTNEXTLINE(modernize-use-string-view): nix::StoreConfig's signature
-    static auto name() -> std::string { return "gRPC Store"; }
-
-    static auto uriSchemes() -> StringSet { return {"grpc"}; }
-
-    // NOLINTNEXTLINE(modernize-use-string-view)
-    static auto doc() -> std::string {
-      return "Connects to a `nix-grpc-daemon`: native RPCs for queries, copies and "
-             "scheduled builds, the tunnelled worker protocol for the rest.";
-    }
-
-    auto getReference() const -> StoreReference override {
-      return {
-          .variant =
-              StoreReference::Specified{
-                  .scheme = *uriSchemes().begin(),
-                  .authority = authority.to_string(),
-              },
-          .params = getQueryParams(),
-      };
-    }
-
-    auto openStore() const -> ref<Store> override;
 };
 
 // NOLINTNEXTLINE(misc-multiple-inheritance): inherited from Nix's store hierarchy
@@ -261,7 +151,7 @@ private:
     auto connectHint(const std::string & msg) const -> std::string
 ;
 
-    auto statusError(const grpc::Status & status, const char * opName) const -> Error
+    auto statusError(const grpc::Status & status, const char * opName) const -> GrpcStatusError
 ;
 
     void checkStatus(const grpc::Status & status, const char * opName) const
@@ -320,7 +210,28 @@ public:
     // answers it and caches the trust flag, no tunnel needed. TCP-level
     // failures are retried for connect-timeout so a balancer or worker
     // restart does not fail the build; TLS rejections fail at once.
-    void connect() override { isTrustedClient(); }
+    // With release-lease, `nix store info` ends the grpc-lease setting's
+    // lease first: the id comes from the settings (NIX_CONFIG, say), not
+    // from the store URL on the command line, where any user can read it.
+    void connect() override {
+      if (config->releaseLease.get()) {
+        auto const lease = nixgrpc::leaseId();
+        if (lease.empty()) {
+          throw Error("release-lease: no lease to end, the grpc-lease setting is empty");
+        }
+        auto const builds = releaseLease(lease);
+        notice(
+            "released lease %s on %s: %d builds",
+            lease.substr(0, nixgrpc::leaseIdShown),
+            config->authority.to_string(),
+            builds);
+      }
+      isTrustedClient();
+    }
+
+    // Release (proto/nix_remote.proto) on a Schedule stream of its own: the
+    // number of builds the lease held, once the scheduler answers.
+    auto releaseLease(const std::string & lease) -> uint32_t;
 
     // The tunnel is for trusted callers only, `nix store info` is for all.
     auto getVersion() -> std::optional<std::string> override {
@@ -340,20 +251,30 @@ public:
     }
     template<typename F>
     void retrying(const char * what, const F & attempt) {
-      // From the first failure, not the call's start: a long upload cut
-      // off late still gets the whole budget.
+      retryingWithProgress(what, [&](bool & /*progressed*/) -> grpc::Status { return attempt(); });
+    }
+
+    // `attempt` sets `progressed` once the server took the call. The budget
+    // counts from the first failure, not the call's start, so a long upload
+    // cut off late still gets all of it; and anew after an attempt that
+    // progressed and was then cut off: the server was reachable.
+    template<typename F>
+    void retryingWithProgress(const char * what, const F & attempt) {
       std::optional<nixgrpc::Backoff> backoff;
       for (;;) {
-        auto const status = attempt();
+        bool progressed = false;
+        auto const status = attempt(progressed);
         checkInterrupt();
-        if (status.ok()) {
+        if (status.ok() || progressed) {
           everConnected = true;
         }
-        if (!nixgrpc::goneAway(status)) {
+        // Not when the server answered with an error after all.
+        bool const cut = progressed && nixgrpc::cutOff(status);
+        if (!(nixgrpc::goneAway(status) || cut)) {
           checkStatus(status, what);
           return;
         }
-        if (!backoff) {
+        if (!backoff || cut) {
           backoff.emplace(retryBudget());
         }
         if (backoff->exhausted()) {
@@ -511,6 +432,7 @@ public:
 
         struct Bounced {
       bool refused = false; // the worker answered that it cannot serve builds now, or was not reachable
+      bool left = false;    // it went away or did not take the build: see exec::Bounce
     };
         struct MissingInput {
       StorePath path;
@@ -786,9 +708,10 @@ private:
         PathsSource pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, const Metadata & headers)
 ;
 
+    // `accepted`: a worker took the call, before it imports and publishes.
     auto addMultipleToStoreOnce(
         std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-        CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+        CheckSigsFlag checkSigs, const Metadata & headers, bool & accepted) -> grpc::Status
 ;
 
 public:

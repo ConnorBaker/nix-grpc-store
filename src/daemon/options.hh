@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include <sys/types.h>
+
 #include <grpcpp/security/server_credentials.h>
 
 #include "acl.hh"
@@ -62,10 +64,26 @@ struct Options
     unsigned maxJobs = 0; // 0 = nix's max-jobs, read at start and on SIGHUP (Coordinator::reloadNixConfig)
     unsigned lookupThreads = 0; // scheduler: concurrent cache lookups for Wants, 0 = default
     uint64_t minFree = 0;
+    // The longest a departed client's lease may keep a build, and its slot,
+    // for it (Want.linger_s). 600 s because most revoked builds that were
+    // asked for again were asked for within it: 892 of 1,093 on one farm's
+    // scheduler over 13 days, 2026-10-14..27, from the revoke to the next
+    // BuildDerivation, which includes the wait for the slot the revoke freed.
+    static constexpr std::chrono::seconds defaultMaxLinger{600};
+    std::chrono::seconds maxLinger = defaultMaxLinger;
     std::string storeDir;
+    // --take-over: start as the successor of this main process, see takeover.hh.
+    std::optional<pid_t> takeOverFrom;
     bool sandbox = false;
     // Extra subtrees the sandbox lets the daemon write.
     std::vector<std::string> sandboxWrite;
+
+    // Its own scheduler's only builder: nobody else takes new builds while
+    // it drains, so a successor takes over instead (takeover.hh).
+    [[nodiscard]] auto handsOver() const -> bool
+    {
+        return builder && scheduler && schedulerAddr.empty();
+    }
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options;

@@ -78,6 +78,10 @@
   "--lookup-threads"
   (toString cfg.lookupThreads)
 ]
+++ lib.optionals (cfg.maxLinger != null) [
+  "--max-linger"
+  (toString cfg.maxLinger)
+]
 ++ lib.optionals (cfg.scheduler != null) [
   "--scheduler"
   cfg.scheduler
@@ -102,6 +106,8 @@
   [
     "--niks3"
     cfg.niks3.url
+    "--niks3-cache-url"
+    cfg.niks3.cacheUrl
     "--niks3-push"
     (lib.escapeShellArgs ([ (lib.getExe cfg.niks3.package) "push" ] ++ cfg.niks3.pushFlags))
   ]

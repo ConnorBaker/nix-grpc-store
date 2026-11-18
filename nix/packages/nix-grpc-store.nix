@@ -46,6 +46,7 @@ stdenv.mkDerivation {
         ../../src/keepalive.hh
         ../../src/macro-compat.hh
         ../../src/nix-compat.hh
+        ../../src/parse-int.hh
         ../../src/path-info-wire.hh
         ../../src/pump.hh
         ../../src/top-down.hh
@@ -75,6 +76,7 @@ stdenv.mkDerivation {
         ../../tests/xfcc-test.cc
         ../../tests/sbpl-test.cc
         ../../tests/sandbox-test.cc
+        ../../tests/takeover-test.cc
         ../../tests/log-spill-test.cc
         ../../tests/daemon-probe-test.cc
         ../../tests/tunnel-test.cc
@@ -89,6 +91,7 @@ stdenv.mkDerivation {
         ../../tests/executor-test.cc
         ../../tests/retry-test.cc
         ../../tests/scheduler-test.cc
+        ../../tests/lease-invariants-test.cc
         ../../tests/dispatcher-test.cc
         ../../tests/http-test.cc
         ../../tests/max-jobs-test.cc

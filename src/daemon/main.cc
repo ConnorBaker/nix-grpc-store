@@ -43,6 +43,7 @@
 #include <bzlib.h>
 #include <unistd.h>
 
+#include <grpc/grpc.h>
 #include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/resource_quota.h>
 #include <grpcpp/grpcpp.h>
@@ -104,6 +105,8 @@
 #include "upload-claims.hh"
 #include "parse-int.hh"
 #include "sandbox.hh"
+#include "sd-notify.hh"
+#include "takeover.hh"
 #include "upload-spool.hh"
 
 using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
@@ -117,6 +120,15 @@ volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
 
 namespace {
 using nixgrpc::stopSignal;
+// A successor took the node over (takeover.hh): drain like after a SIGTERM,
+// which a second one still cancels.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): read by the RPC handlers.
+std::atomic<bool> handedOver{false};
+
+auto stopping() -> bool
+{
+    return stopSignal != 0 || handedOver;
+}
 // SIGHUP count: each one asks the builder to read nix's max-jobs anew.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
 volatile std::sig_atomic_t reloadSignal = 0;
@@ -243,7 +255,7 @@ private:
         } catch (Unavailable & err) {
             return {grpc::StatusCode::UNAVAILABLE, err.what()};
         } catch (std::exception & err) {
-            if (stopSignal != 0) {
+            if (stopping()) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("worker shutting down: ") + err.what()};
             }
             if (dynamic_cast<const nixgrpc::ClientGone *>(&err) != nullptr
@@ -502,12 +514,24 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "AddMultipleToStore", nixgrpc::Role::write);
+            // The inputs of a drv this builder expects (x-nix-drv): a call for
+            // it, which keeps its Expect however long the upload takes.
+            std::optional<nixgrpc::Builder::Call> forDrv;
+            if (auto const drv = context->client_metadata().find("x-nix-drv");
+                coord.builder && drv != context->client_metadata().end()) {
+                forDrv.emplace(*coord.builder, std::string(drv->second.data(), drv->second.size()));
+            }
             auto localStore = local.scoped();
 
             nix::remote::AddMultipleChunk first;
             if (!reader->Read(&first)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "empty AddMultipleToStore stream"};
             }
+            // Importing and publishing can take minutes. A client cut off
+            // meanwhile retries without counting that against its window:
+            // it reached the farm.
+            context->AddInitialMetadata("x-nix-accepted", "1");
+            reader->SendInitialMetadata();
             auto repair = first.repair() ? nix::Repair : nix::NoRepair;
             // The nix-daemon downgrades this to CheckSigs if we are not a
             // trusted user, same as for the tunnelled protocol.
@@ -526,7 +550,7 @@ public:
             nixgrpc::Metrics::Held const held(metrics, "AddMultipleToStore");
             nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
             std::vector<std::string> imported;
-            auto const cancelled = [&] -> bool { return context->IsCancelled() || stopSignal != 0; };
+            auto const cancelled = [&] -> bool { return context->IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; };
             auto const stats = importUploads(*localStore, source, repair, checkSigs, cancelled, imported);
             holdForSession(
                 rpc,
@@ -772,7 +796,28 @@ public:
         return targets;
     }
 
-    // Inputs may have been uploaded to, or built on, another worker.
+    // nix found no substitute for `path` (its error `err` says so), and the
+    // cache lost it (Cache::lost). nix's error reads the same whether no
+    // substituter had the path, its NAR was gone or the NAR download failed,
+    // so the cache is asked. An error from a cache that did not answer, or
+    // from our nix-daemon, is not this, nor is a path niks3 does not list.
+    [[nodiscard]] auto cacheLost(const nix::StorePath & path, const nix::Error & err) -> bool
+    {
+        auto const what = std::string_view(err.what());
+        if (!what.contains("there is no substituter that can build it")
+            && !what.contains("does not exist and cannot be created")) {
+            return false;
+        }
+        try {
+            return coord.cache.lost(path.hashPart());
+        } catch (std::exception & lookup) {
+            nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "cache_lookup_failed"}, {"error", lookup.what()}});
+            return false;
+        }
+    }
+
+    // Inputs may have been uploaded to, or built on, another worker. On
+    // failure, `missing` names the input if the cache lost it.
     auto gatherInputs(
         nix::Store & localStore,
         const nix::BasicDerivation & drv,
@@ -780,6 +825,7 @@ public:
         nixgrpc::Metrics::Inputs & counted,
         std::string & missing) -> grpc::Status
     {
+        std::optional<nix::StorePath> fetching;
         try {
             const auto & inputs = nixcompat::drvInputs(drv);
             counted.wanted = inputs.size();
@@ -791,16 +837,30 @@ public:
                 if (local.contains(input)) {
                     continue;
                 }
-                missing = localStore.printStorePath(input);
-                nixcompat::ensurePath(localStore, input);
-                missing.clear();
+                fetching = input;
+                try {
+                    nixcompat::ensurePath(localStore, input);
+                } catch (nix::Error &) {
+                    // nix keeps a narinfo for narinfo-cache-positive-ttl (30 days by
+                    // default), also once the NAR it names is gone and the cache has a
+                    // new narinfo, for an input built again with other bytes.
+                    backends.ensureUncached(localStore, input);
+                }
+                fetching.reset();
                 counted.bytes += localStore.queryPathInfo(input)->narSize;
             }
             counted.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count();
             metrics.inputs(counted);
         } catch (nix::Error & err) {
-            // Another worker may still hold it locally. UNAVAILABLE makes the client retry elsewhere.
             metrics.event("input_not_substitutable");
+            // No worker can get an input the cache lost: named, the client
+            // builds it. Past a cache or nix-daemon that failed, another
+            // worker may: unnamed, the client asks the scheduler for one, up
+            // to its reschedule-retries.
+            if (fetching && cacheLost(*fetching, err)) {
+                metrics.event("input_lost");
+                missing = localStore.printStorePath(*fetching);
+            }
             return {grpc::StatusCode::FAILED_PRECONDITION, workerName + ": input not substitutable: " + err.what()};
         }
         return grpc::Status::OK;
@@ -842,14 +902,12 @@ public:
     {
         const auto & log = caller.log;
         log({.text = "attached to the build already running on this worker"});
-        shared.attached++;
         auto const completed = nixgrpc::followSpill(
             shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
             [&] -> bool { return caller.gone() || stopSignal >= nixgrpc::kCancelBuilds; },
             [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
                 log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
             });
-        shared.attached--;
         if (!completed) {
             return std::nullopt;
         }
@@ -949,8 +1007,9 @@ public:
         auto const drvName = std::string(drvPath.to_string());
         // The client is here: the lease holds through its upload. NOT_FOUND
         // makes it upload the closure and retry, so admit comes after.
+        nixgrpc::Builder::Call const call(builder, drvName, assignId);
         // A client that names no assignment may be ahead of its Expect.
-        if (!builder.claim(drvName, assignId) && assignId != 0) {
+        if (!call.expected() && assignId != 0) {
             metrics.event("unexpected_build");
             return {grpc::StatusCode::FAILED_PRECONDITION, "not scheduled here: " + drvName};
         }
@@ -1041,9 +1100,9 @@ public:
         nix::remote::Done::Outcome & outcome,
         std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
     {
-        auto const cancelled = [&] -> bool {
-            return (caller.gone() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
-        };
+        // Not when our caller's stream breaks: the scheduler sends it back here
+        // to attach. It revokes the build once no client wants it any more.
+        auto const cancelled = [&] -> bool { return shared.revoked || stopSignal >= nixgrpc::kCancelBuilds; };
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto const roots = local.scoped();
@@ -1230,60 +1289,303 @@ public:
 } // namespace
 
 namespace {
-// Claimed leases count too: their clients may still be uploading.
+// Claimed leases count too: their clients may still be uploading. So do
+// uploads in flight: Shutdown() would cut them off, and the client would
+// send them all again elsewhere.
 auto drained(nixgrpc::Coordinator & coord, nixgrpc::Metrics & metrics) -> bool
 {
     return (!coord.builder || coord.builder->holding() == 0)
-           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars") == 0;
+           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars")
+                      + metrics.inflightNow("AddMultipleToStore")
+                  == 0;
 }
 
-// Returns on idle timeout or SIGTERM. A builder's first SIGTERM only stops
-// taking builds and this returns once those in flight have reported. The
-// supervisor's stop timeout or a second signal bounds that.
+using nixgrpc::logLine;
+using nixgrpc::LogLevel;
+namespace takeover = nixgrpc::takeover;
+
+// The main process of a socket-activated node that is its own scheduler's
+// only builder: a successor may take the node over, see takeover.hh.
+struct Succession
+{
+    Succession(nixgrpc::Acceptor & accepting, nixgrpc::Builder & building)
+        : acceptor(&accepting)
+        , builder(&building)
+    {
+    }
+
+    nixgrpc::Acceptor * acceptor;
+    nixgrpc::Builder * builder;
+    // Lives as long as this process: the successor waits for it to close.
+    takeover::Offer offer;
+    // While a successor starts: whether the builder drained before it asked.
+    std::optional<bool> paused;
+};
+
+// This process's place in the succession of generations of such a node.
+struct Generation
+{
+    std::vector<int> listenFds;
+    std::optional<nixgrpc::Acceptor> acceptor;
+    std::optional<Succession> succession;
+    // We took over from it, and it may still be draining.
+    std::optional<takeover::Predecessor> predecessor;
+    // Shutdown() since the takeover: GOAWAY, then it waits for the calls.
+    std::thread goaway;
+
+    // Until it is gone this process may not end: systemd would take that for
+    // the unit's end and kill the predecessor's builds (KillMode=mixed).
+    auto predecessorAlive() -> bool
+    {
+        if (predecessor && !predecessor->alive()) {
+            logLine(LogLevel::info, {{"event", "predecessor_exited"}, {"pid", std::to_string(predecessor->pid())}});
+            predecessor.reset();
+        }
+        return predecessor.has_value();
+    }
+
+    // A successor is starting.
+    [[nodiscard]] auto paused() const -> bool
+    {
+        return succession && succession->paused;
+    }
+};
+
+// The listening sockets, from systemd or from the predecessor we take over
+// from. In that case systemd's reload waits for the parent, and the child,
+// which returns, becomes the daemon.
+auto inherit(Generation & gen, const nixgrpc::Options & options) -> std::optional<takeover::Detached>
+{
+    if (!options.takeOverFrom) {
+        gen.listenFds = nixgrpc::systemdListenFds();
+        return std::nullopt;
+    }
+    std::optional<takeover::Detached> detached;
+    auto const & reload = detached.emplace();
+    auto const & pred = gen.predecessor.emplace(*options.takeOverFrom, &reload);
+    takeover::applyNotifyEnv(pred.env());
+    gen.listenFds = pred.fds();
+    logLine(LogLevel::info, {{"event", "taking_over"}, {"pid", std::to_string(pred.pid())}});
+    return detached;
+}
+
+// From now on a successor may take over, on a node that hands over.
+void offerTakeover(Generation & gen, nixgrpc::Coordinator & coord, const nixgrpc::Options & options)
+{
+    if (!takeover::supported || !gen.acceptor || !coord.builder || !options.handsOver()) {
+        return;
+    }
+    try {
+        gen.succession.emplace(*gen.acceptor, *coord.builder);
+    } catch (std::exception & err) {
+        logLine(LogLevel::info, {{"event", "takeover_unavailable"}, {"error", err.what()}});
+    }
+}
+
+// We serve: once the predecessor has made us the main process, let the reload
+// return.
+void becomeMain(takeover::Detached & detached, takeover::Predecessor & pred)
+{
+    try {
+        // systemd supervises as its main process only a child of its own.
+        detached.adopted();
+        // From here on we may become the main process, and outlive the
+        // reload. Not if systemd gave up on it.
+        detached.ensureReloadWaits();
+        pred.ready();
+    } catch (std::exception & err) {
+        // The predecessor serves on. Leave at once, with the connections
+        // we took: Server's destructor would wait for their calls.
+        logLine(LogLevel::info, {{"event", "takeover_failed"}, {"error", err.what()}});
+        std::_Exit(1);
+    }
+    detached.report(true);
+    logLine(LogLevel::info, {{"event", "took_over"}, {"pid", std::to_string(pred.pid())}});
+}
+
+// A successor asked to take over and did not: serve on.
+void resume(Succession & next, nixgrpc::Metrics & metrics)
+{
+    next.offer.reject();
+    try {
+        metrics.serve(true);
+    } catch (std::exception & err) {
+        logLine(LogLevel::info, {{"event", "metrics_unavailable"}, {"error", err.what()}});
+    }
+    next.acceptor->start();
+    next.paused.reset();
+    // A stop that came meanwhile keeps the builder out for good.
+    if (stopSignal == 0) {
+        next.builder->setUnavailable(nixgrpc::Builder::Unavailable::stopping, false);
+    }
+}
+
+// One step of a successor taking the node over, waiting up to `tick` for it.
+void takeOverStep(
+    Generation & gen,
+    Succession & next,
+    grpc::Server & server,
+    nixgrpc::Coordinator & coord,
+    nixgrpc::Metrics & metrics,
+    std::chrono::milliseconds tick)
+{
+    static constexpr std::chrono::seconds acceptorGrace{2};
+    // The successor waits 30 s for its answer.
+    static constexpr std::chrono::seconds barrierTimeout{10};
+    using Event = takeover::Offer::Event;
+    auto & offer = next.offer;
+    auto event = Event::none;
+    try {
+        event = offer.wait(tick);
+    } catch (std::exception & err) {
+        // Whoever knocked, this process serves on.
+        logLine(LogLevel::info, {{"event", "takeover_failed"}, {"error", err.what()}});
+        event = next.paused ? Event::gone : Event::none;
+        if (!next.paused) {
+            offer.reject();
+        }
+    }
+    auto const peer = std::to_string(offer.peer());
+    switch (event) {
+    case Event::none:
+        return;
+    case Event::requested:
+        try {
+            // No builds get assigned here any more, and new connections wait
+            // in the backlog for the successor, whose scheduler assigns them.
+            next.paused = next.builder->draining();
+            next.builder->setUnavailable(nixgrpc::Builder::Unavailable::stopping, true);
+            if (!next.acceptor->stop(acceptorGrace)) {
+                logLine(LogLevel::info, {{"event", "acceptor_stuck"}});
+            }
+            metrics.serve(false);
+            offer.send(gen.listenFds, takeover::notifyEnv());
+            logLine(LogLevel::info, {{"event", "takeover_started"}, {"pid", peer}});
+        } catch (std::exception & err) {
+            logLine(LogLevel::info, {{"event", "takeover_failed"}, {"pid", peer}, {"error", err.what()}});
+            resume(next, metrics);
+        }
+        return;
+    case Event::ready:
+        // Until systemd has made the successor the main process this one is,
+        // and serves on if that fails. Before the successor lets the reload
+        // return.
+        if (!offer.makeMain(barrierTimeout)) {
+            logLine(LogLevel::info, {{"event", "takeover_failed"}, {"pid", peer}});
+            resume(next, metrics);
+            return;
+        }
+        // New calls on our connections go to new ones, which the successor
+        // accepts. Calls in flight here go on.
+        gen.goaway = std::thread([&server] -> void { server.Shutdown(); });
+        // Our scheduler's clients reconnect, to the successor's.
+        coord.restarting();
+        next.paused.reset();
+        handedOver = true;
+        logLine(LogLevel::info, {{"event", "handed_over"}, {"pid", peer}});
+        try {
+            offer.accept();
+        } catch (std::exception & err) {
+            logLine(LogLevel::info, {{"event", "takeover_unconfirmed"}, {"pid", peer}, {"error", err.what()}});
+        }
+        return;
+    case Event::gone:
+        logLine(LogLevel::info, {{"event", "takeover_failed"}, {"pid", peer}});
+        resume(next, metrics);
+        return;
+    }
+}
+
+// Waits up to `tick`, meanwhile taking the steps of a successor taking over.
+void waitTick(
+    Generation & gen,
+    grpc::Server & server,
+    nixgrpc::Coordinator & coord,
+    nixgrpc::Metrics & metrics,
+    std::chrono::milliseconds tick)
+{
+    if (gen.succession && !handedOver && stopSignal != 0) {
+        // A stop wins over a successor still starting.
+        if (gen.succession->paused) {
+            logLine(
+                LogLevel::info, {{"event", "takeover_failed"}, {"pid", std::to_string(gen.succession->offer.peer())}});
+            resume(*gen.succession, metrics);
+        }
+        gen.succession.reset();
+    }
+    if (gen.succession && !handedOver) {
+        takeOverStep(gen, *gen.succession, server, coord, metrics, tick);
+    } else {
+        std::this_thread::sleep_for(tick);
+    }
+}
+
+// The first SIGTERM, or a successor taking over: no new builds, out of the
+// balancer.
+void startDrain(grpc::Server & server, nixgrpc::Coordinator & coord)
+{
+    nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "draining"}});
+    if (coord.builder) {
+        coord.builder->setUnavailable(nixgrpc::Builder::Unavailable::stopping, true);
+    }
+    server.GetHealthCheckService()->SetServingStatus("", false);
+}
+
+// Returns on idle timeout or SIGTERM, or after a takeover. A builder's first
+// SIGTERM, or a successor taking over, only stops it taking builds, and this
+// returns once those in flight have reported. The supervisor's stop timeout or
+// a second signal bounds that.
 void serve(
-    grpc::Server const & server,
+    grpc::Server & server,
     NixRemoteService & service,
     const nixgrpc::Options & options,
     nixgrpc::IdleTracker const & idle,
     nixgrpc::Coordinator & coord,
-    nixgrpc::Metrics & metrics)
+    nixgrpc::Metrics & metrics,
+    Generation & gen)
 {
     auto const watchdog = nixgrpc::sdWatchdogInterval();
-    std::chrono::nanoseconds const tick =
+    auto const tick = std::chrono::duration_cast<std::chrono::milliseconds>(
         watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
-                              : std::chrono::seconds(1);
+                              : std::chrono::seconds(1));
     bool draining = false;
     std::sig_atomic_t reloaded = 0;
     for (;;) {
-        if (stopSignal == 0) {
-            if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout) {
+        bool const predecessor = gen.predecessorAlive();
+        if (!stopping()) {
+            if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout && !predecessor && !gen.paused()) {
                 return;
             }
             if (reloadSignal != reloaded) {
                 reloaded = reloadSignal;
                 coord.reloadNixConfig();
             }
-            coord.tick();
+            if (!gen.paused()) {
+                coord.tick();
+            }
             service.tick();
         } else {
-            if (!draining) {
-                draining = true;
-                nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "draining"}});
-                if (coord.builder) {
-                    coord.builder->setUnavailable(nixgrpc::Builder::Unavailable::stopping, true);
-                }
-                server.GetHealthCheckService()->SetServingStatus("", false);
+            if (!std::exchange(draining, true)) {
+                startDrain(server, coord);
             }
             coord.tick(); // gives back unclaimed leases
-            if (stopSignal >= nixgrpc::kCancelBuilds || drained(coord, metrics)) {
+            if (stopSignal >= nixgrpc::kCancelBuilds || (drained(coord, metrics) && !predecessor)) {
                 return;
             }
         }
         if (watchdog.count() != 0) {
             nixgrpc::sdNotify("WATCHDOG=1");
         }
-        std::this_thread::sleep_for(tick);
+        waitTick(gen, server, coord, metrics, tick);
     }
+}
+
+auto exitEvent() -> const char *
+{
+    if (handedOver) {
+        return "handed_over_exit";
+    }
+    return stopSignal != 0 ? "signal_exit" : "idle_exit";
 }
 } // namespace
 
@@ -1380,7 +1682,9 @@ try {
 
     const std::span args(argv, static_cast<size_t>(argc));
     auto options = nixgrpc::parseOptions({args.begin(), args.end()});
-    auto const listenFds = nixgrpc::systemdListenFds();
+    Generation gen;
+    auto detached = inherit(gen, options);
+    auto const & listenFds = gen.listenFds;
     if (options.sandbox) {
         nixgrpc::sandbox::apply(sandboxPolicy(options, listenFds.empty()));
     }
@@ -1472,8 +1776,9 @@ try {
         throw nix::Error("failed to start gRPC server on '%s'", options.listen);
     }
     if (acceptor) {
-        nixgrpc::acceptInto(listenFds, acceptor);
+        gen.acceptor.emplace(listenFds, acceptor).start();
     }
+    offerTakeover(gen, coord, options);
 
     // The ports as bound, also for port 0: tests ask for it, since a port they
     // picked and let go of may meanwhile be another test's.
@@ -1485,10 +1790,17 @@ try {
     if (tunnelled && coord.builder) {
         startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);
     }
-    nixgrpc::sdNotify("READY=1");
+    if (!detached) {
+        // A successor is not the main process yet, whose messages alone
+        // systemd reads, and the unit runs already.
+        nixgrpc::sdNotify("READY=1");
+    }
+    if (detached && gen.predecessor) {
+        becomeMain(*detached, *gen.predecessor);
+    }
 
-    serve(*server, service, options, idle, coord, metrics);
-    nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", stopSignal != 0 ? "signal_exit" : "idle_exit"}});
+    serve(*server, service, options, idle, coord, metrics, gen);
+    nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", exitEvent()}});
     stopSignal = nixgrpc::kCancelBuilds;
     nixgrpc::sdNotify("STOPPING=1");
     server->GetHealthCheckService()->SetServingStatus(false);
@@ -1503,6 +1815,16 @@ try {
         nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "shutdown_forced"}});
         std::_Exit(0);
     }).detach();
+    if (gen.goaway.joinable()) {
+        // Shutdown() has been under way since the takeover; give what is left
+        // the same grace. _Exit: that thread may still use the server.
+        std::thread([&server] -> void {
+            std::this_thread::sleep_for(shutdownGrace);
+            grpc_server_cancel_all_calls(server->c_server());
+        }).detach();
+        gen.goaway.join();
+        std::_Exit(0);
+    }
     server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
     server->Wait();
     if (coord.builder) {

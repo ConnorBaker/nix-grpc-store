@@ -3,8 +3,6 @@ use std::time::Instant;
 use super::helpers::*;
 use crate::harness::*;
 
-const UNIT: &str = "nix-grpc-daemon";
-
 fn probe(query: &str) -> String {
     let system = succeed(CLIENT, &["readlink", "-f", "/run/current-system"]);
     let o = run_t(
@@ -462,8 +460,21 @@ test "$(curl -s -o /dev/null -w '%{http_code}' "$1/$nar")" = 404"#,
 /// of its users (one per worker) wait for that build.
 #[test]
 fn an_input_whose_nar_the_cache_lost_is_built_again() {
+    users_of_a_lost_input("lostnar", false);
+}
+
+/// As above, but the input has other bytes on every build, so niks3 puts up
+/// a narinfo for the rebuild's NAR. worker2's nix-daemon, which kept the old
+/// narinfo when it missed the input, looks the input up again.
+#[test]
+fn an_input_whose_nar_the_cache_lost_is_built_again_with_other_bytes() {
+    users_of_a_lost_input("lostnondet", true);
+}
+
+fn users_of_a_lost_input(tag: &str, nondet: bool) {
     farm_ready();
-    let (tag, dep) = ("lostnar", expr("DEP"));
+    let dep = expr("DEP");
+    let nondet = if nondet { "true" } else { "false" };
     // vip pins it to worker1; copying it there publishes it to niks3.
     let input = succeed(
         CLIENT,
@@ -482,6 +493,9 @@ fn an_input_whose_nar_the_cache_lost_is_built_again() {
             "--arg",
             "features",
             r#"["vip"]"#,
+            "--arg",
+            "nondet",
+            nondet,
         ],
     )
     .trim()
@@ -503,7 +517,7 @@ fn an_input_whose_nar_the_cache_lost_is_built_again() {
     let missed = |w| events(w, "input_not_substitutable");
     let (missed1, missed2) = (missed(WORKER1), missed(WORKER2));
     let users = format!(
-        r#"map (f: (import {dep} {{ tag = "{tag}"; salt = f; features = [ "vip" ]; jobFeatures = [ f ]; }}).job) [ "vip" "w2" ]"#
+        r#"map (f: (import {dep} {{ tag = "{tag}"; salt = f; features = [ "vip" ]; jobFeatures = [ f ]; nondet = {nondet}; }}).job) [ "vip" "w2" ]"#
     );
     let o = run_t(
         CLIENT,
@@ -595,6 +609,7 @@ in
     args = [ "-c" "echo {tag} > $out" ];
   }};
 }}"#
+
         ),
     );
     let out = fail(
@@ -621,7 +636,6 @@ in
     let other = succeed(CLIENT, &["nix", "eval", "--raw", "-f", &file, "other.outPath"]);
     succeed(CLIENT, &["nix", "path-info", "--store", &envoy(), other.trim()]);
 }
-
 /// Two builds of a path that does not build reproducibly: the farm serves
 /// the one the cache published, also from the builder that lost.
 #[test]
@@ -752,136 +766,12 @@ fn a_failed_upload_fails_the_build_instead_of_rebuilding_it() {
 }
 
 #[test]
-fn a_niks3_restart_does_not_cost_the_leader_its_role() {
-    farm_ready();
-    let was = leader();
-    let yields = || journal_count(was, UNIT, "event=scheduler_yield");
-    let before = yields();
-    succeed(LB, &["systemctl", "restart", "niks3.service"]);
-    wait_for_unit(LB, "niks3.service");
-    retry(60, "scheduler settled", settled);
-    assert_eq!(leader(), was);
-    assert_eq!(yields(), before);
-    build(&envoy(), "after-niks3-restart", &[]);
-}
-
-#[test]
-fn scheduler_down_the_other_node_takes_the_lock_and_keeps_it() {
-    farm_ready();
-    let (was, nxt) = (leader(), standby());
-    let pattern = "event=scheduler_take_over";
-    let before = journal_count(nxt, UNIT, pattern);
-    succeed(was, &["systemctl", "stop", "nix-grpc-daemon.service"]);
-    wait_journal_above(nxt, UNIT, pattern, before, 30);
-    retry(30, "one worker on the new scheduler", || {
-        sched_workers(nxt) == 1
-    });
-    build(&envoy(), "on-standby", &[]);
-    succeed(was, &["systemctl", "start", "nix-grpc-daemon.service"]);
-    retry(60, "scheduler settled", settled);
-    assert_eq!(leader(), nxt);
-    assert_eq!(sched_workers(was), 0);
-}
-
-#[test]
-fn clean_scheduler_restart_peers_are_told_and_running_builds_survive() {
-    farm_ready();
-    spawn_build("rs", "rs");
-    wait_building();
-    let who = building();
-    let (was, nxt) = (leader(), standby());
-    let pattern = "event=scheduler_restarting addr=";
-    let before = journal_count(nxt, UNIT, pattern);
-    // --no-block: a build on the leader drains first, so the restart only
-    // completes after release_slow().
-    succeed(
-        was,
-        &[
-            "systemctl",
-            "restart",
-            "--no-block",
-            "nix-grpc-daemon.service",
-        ],
-    );
-    sleep(5);
-    assert_eq!(building(), who, "restart killed or moved the build");
-    release_slow();
-    wait_journal_above(nxt, UNIT, pattern, before, 60);
-    wait_unit_done("rs", 120);
-    assert_unit_success("rs");
-    assert_no_journal(CLIENT, "rs", "reconnecting");
-    retry(60, "scheduler settled", settled);
-}
-
-#[test]
-fn scheduler_restart_mid_build_finishes_without_a_double_build() {
-    farm_ready();
-    spawn_build("mid", "mid");
-    wait_building();
-    assert_eq!(building().len(), 1, "{:?}", building());
-    // The scheduler forgets the build. If it ran on the leader it dies with
-    // the daemon. Either way no second copy may start while one is alive.
-    let ldr = leader();
-    succeed(
-        ldr,
-        &["systemctl", "kill", "-s", "KILL", "nix-grpc-daemon.service"],
-    );
-    succeed(ldr, &["systemctl", "start", "nix-grpc-daemon.service"]);
-    sleep(5);
-    assert!(building().len() <= 1, "{:?}", building());
-    release_slow();
-    wait_unit_done("mid", 120);
-    assert_unit_success("mid");
-}
-
-#[test]
 fn interrupting_the_client_stops_the_build_on_the_worker() {
     farm_ready();
     spawn_build("intr", "intr");
     wait_building();
     succeed(CLIENT, &["systemctl", "kill", "-s", "INT", "intr"]);
     retry(20, "the build stopped", || building().is_empty());
-}
-
-#[test]
-fn a_deploy_mid_build_drains_and_the_new_generation_takes_over() {
-    farm_ready();
-    spawn_build("sw", "sw");
-    wait_building();
-    let busy = if building() == [WORKER1] {
-        WORKER1
-    } else {
-        WORKER2
-    };
-    if busy == WORKER2 {
-        succeed(
-            WORKER2,
-            &[
-                "timeout",
-                "120",
-                "/run/current-system/specialisation/next/bin/switch-to-configuration",
-                "test",
-            ],
-        );
-    } else {
-        succeed(WORKER1, &["systemctl", "reload", "nix-grpc-daemon.service"]);
-    }
-    succeed(busy, BUILDER);
-    build(&envoy(), "during-drain", &[]);
-    succeed(busy, &["pkill", "-f", "read -t [9]0 x"]);
-    wait_unit_done("sw", 90);
-    assert_unit_success("sw");
-    wait_until_succeeds(
-        busy,
-        &[
-            "sh",
-            "-c",
-            "systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
-        ],
-        60,
-    );
-    wait_members(&system(), &WORKERS);
-    retry(90, "scheduler settled", settled);
 }
 
 #[test]
@@ -1070,6 +960,325 @@ fn x_nix_worker_picks_the_worker_on_every_system() {
             .map(|((node, after), (_, before))| (node, after - before))
             .collect();
         assert_eq!(sent, vec![(WORKER1, 20), (WORKER2, 0)], "{cluster}");
+    }
+}
+
+fn farm_gives(path: &str) {
+    let got = run_t(CLIENT, &["nix", "path-info", "--store", &envoy(), path], 120);
+    assert_eq!(
+        got.code,
+        0,
+        "the farm cannot give {path}: {}",
+        got.combined()
+    );
+}
+
+/// An input the farm counts as held whose NAR the cache lost: the dependant
+/// below `tag`'s job cannot get it anywhere. Returns its path and NAR.
+fn lost_input(tag: &str, nondet: bool) -> (String, String) {
+    let inp = input_only_in_the_cache(tag, nondet);
+    let nar = nar_of(&inp);
+    lose(&nar);
+    // The farm still counts it as held: niks3 lists it as a closure root.
+    succeed(
+        CLIENT,
+        &["nix-store", "--store", &envoy(), "--check-validity", &inp],
+    );
+    (inp, nar)
+}
+
+/// The same through nix's build hook (`--builders`), which hands the plugin
+/// one derivation at a time: the job's lost input is found among its input
+/// derivations and built on the farm, not uploaded again to a worker that
+/// counts it as held.
+#[test]
+fn lost_input_is_built_for_a_build_hook_s_job() {
+    farm_ready();
+    let dep = expr("DEP");
+    let eval = |tag: &str, attr: &str| {
+        succeed(
+            CLIENT,
+            &[
+                "nix", "eval", "--raw", "-f", &dep, attr, "--argstr", "tag", tag, "--arg", "features",
+                r#"["vip"]"#, "--arg", "jobFeatures", "[]",
+            ],
+        )
+        .trim()
+        .to_string()
+    };
+    // A tag whose input's derivation sorts before the job's: the run then
+    // holds the job behind its producer, and the hook's job is still the
+    // one whose result the plugin returns.
+    let base = |path: &str| path.rsplit('/').next().unwrap_or_default().to_string();
+    let tag = (0..32)
+        .map(|i| format!("losthook{i}"))
+        .find(|tag| {
+            let job = eval(tag, "job.drvPath");
+            let refs = succeed(CLIENT, &["nix-store", "--query", "--references", &job]);
+            refs.lines()
+                .filter(|r| r.ends_with(&format!("-local-input-{tag}.drv")))
+                .any(|r| base(r) < base(&job))
+        })
+        .expect("no tag whose input's derivation sorts first");
+    let tag = tag.as_str();
+    let (inp, nar) = lost_input(tag, false);
+    // The client has it, built again here: the hook does not upload it,
+    // since the farm counts it as held.
+    let again = succeed(
+        CLIENT,
+        &[
+            "nix-build",
+            "--no-out-link",
+            "--option",
+            "extra-system-features",
+            "vip",
+            &dep,
+            "-A",
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+            "--arg",
+            "features",
+            r#"["vip"]"#,
+        ],
+    );
+    assert_eq!(again.trim(), inp);
+    let hook = hook();
+    let mut cmd = vec![
+        "sh",
+        "-c",
+        r#"NIX_REMOTE=daemon exec "$@""#,
+        "sh",
+        "nix",
+        "build",
+        "-L",
+    ];
+    cmd.extend(hook.iter().map(String::as_str));
+    cmd.extend([
+        "--print-out-paths",
+        "--no-link",
+        "-f",
+        &dep,
+        "job",
+        "--argstr",
+        "tag",
+        tag,
+        "--arg",
+        "features",
+        r#"["vip"]"#,
+        "--arg",
+        "jobFeatures",
+        "[]",
+    ]);
+    let built = run_t(CLIENT, &cmd, 240);
+    assert_eq!(built.code, 0, "the build failed: {}", built.combined());
+    assert_eq!(built.stdout.trim(), eval(tag, "job.outPath"), "{}", built.combined());
+    assert!(
+        built.combined().contains(&format!("farm lacks '{inp}'")),
+        "{inp} was not built anew: {}",
+        built.combined()
+    );
+    assert_eq!(cache_status(&nar), "200");
+}
+
+#[test]
+fn lost_input_is_built_for_its_user_on_the_same_worker() {
+    farm_ready();
+    let (inp, nar) = lost_input("lostsame", false);
+    // Nothing drains here, so a give-back of worker1's own is a placement
+    // that expired unclaimed (Builder::tick).
+    let no_shows = || events(WORKER1, "give_back");
+    let no_shows0 = no_shows();
+    let built = build_dep_job(&envoy(), "lostsame", r#"["vip"]"#, false, 240);
+    assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
+    assert!(
+        built.stderr.contains(&format!("farm lacks '{inp}'")),
+        "{inp} was not built anew: {}",
+        built.stderr
+    );
+    assert_eq!(holders(&inp), [WORKER1]);
+    // Published with niks3 checking the bucket, which took the NAR again.
+    assert_eq!(cache_status(&nar), "200");
+    // Worker1, the only vip builder, has one slot. Its user, given back and
+    // placed again while it waited, was cancelled: the input's build did not
+    // wait for that placement to expire.
+    assert_eq!(no_shows() - no_shows0, 0, "a placement expired unused");
+    farm_gives(built.stdout.trim());
+}
+
+#[test]
+fn lost_input_rebuilt_on_one_worker_reaches_its_user_on_another() {
+    farm_ready();
+    let (inp, nar) = lost_input("lostcross", false);
+    // The input builds on worker1 alone (vip), its user on worker2 alone (w2).
+    let built = build_dep_job(&envoy(), "lostcross", r#"["w2"]"#, false, 240);
+    assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
+    assert!(
+        built.stderr.contains(&format!("farm lacks '{inp}'")),
+        "{inp} was not built anew: {}",
+        built.stderr
+    );
+    assert_eq!(cache_status(&nar), "200");
+    // Built on worker1, fetched from the cache by worker2.
+    assert_eq!(holders(&inp), WORKERS);
+    farm_gives(built.stdout.trim());
+}
+
+#[test]
+fn lost_input_rebuilt_with_other_bytes_reaches_its_user_on_another() {
+    farm_ready();
+    // As the test above, but the input has other bytes on every build, so
+    // its rebuild's NAR is another object than the one the cache lost.
+    let (inp, nar) = lost_input("lostbytes", true);
+    let built = build_dep_job(&envoy(), "lostbytes", r#"["w2"]"#, true, 240);
+    assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
+    assert!(
+        built.stderr.contains(&format!("farm lacks '{inp}'")),
+        "{inp} was not built anew: {}",
+        built.stderr
+    );
+    // The cache's narinfo names the rebuild's NAR now, which it has.
+    let rebuilt = nar_of(&inp);
+    assert_ne!(rebuilt, nar, "the rebuild has the same bytes");
+    assert_eq!(cache_status(&rebuilt), "200");
+    assert_eq!(holders(&inp), WORKERS);
+    farm_gives(built.stdout.trim());
+}
+
+#[test]
+fn lost_input_missed_by_two_users_at_once_is_built_once() {
+    farm_ready();
+    let (inp, nar) = lost_input("losttwo", false);
+    let lost = |w| events(w, "input_lost");
+    let (lost1, lost2) = (lost(WORKER1), lost(WORKER2));
+    let builds = || events(WORKER1, "built") + events(WORKER2, "built");
+    let builds0 = builds();
+    // One user per worker, so both try the input at once.
+    let users = format!(
+        r#"map (u: (import {} {{ tag = "losttwo"; salt = u.salt; features = [ "vip" ]; jobFeatures = u.features; }}).job) [ {{ salt = "1"; features = [ "vip" ]; }} {{ salt = "2"; features = [ "w2" ]; }} ]"#,
+        expr("DEP")
+    );
+    let built = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "-L",
+            "--no-link",
+            "--print-out-paths",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "--impure",
+            "--expr",
+            &users,
+        ],
+        240,
+    );
+    assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
+    assert!(
+        lost(WORKER1) > lost1 && lost(WORKER2) > lost2,
+        "not both users missed {inp}"
+    );
+    // Each user that missed it says so, but the run builds it once: the
+    // input and the two users are the only builds.
+    assert!(
+        built.stderr.contains(&format!("farm lacks '{inp}'")),
+        "{inp} was not built anew: {}",
+        built.stderr
+    );
+    let anew = builds() - builds0;
+    assert_eq!(anew, 3, "{anew} builds for the input and its two users: {}", built.stderr);
+    assert_eq!(cache_status(&nar), "200");
+    let outs: Vec<&str> = built.stdout.split_whitespace().collect();
+    assert_eq!(outs.len(), 2, "{}", built.stdout);
+    for out in outs {
+        farm_gives(out);
+    }
+}
+
+#[test]
+fn an_input_a_substituter_offers_unsigned_is_built() {
+    farm_ready();
+    let dep = expr("DEP");
+    let offer = env("NGS_OFFER_URL");
+    let tag = "offered2";
+    // The input, built on the client only, then offered unsigned and deleted there.
+    let inp = succeed(
+        CLIENT,
+        &[
+            "nix-build",
+            "--no-out-link",
+            &dep,
+            "-A",
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+        ],
+    );
+    let inp = inp.trim();
+    succeed(CLIENT, &["nix", "copy", "--to", &offer, inp]);
+    succeed(CLIENT, &["nix-store", "--delete", inp]);
+    for w in WORKERS {
+        fail(w, &["test", "-e", inp]);
+        let dry = succeed(
+            w,
+            &[
+                "sh",
+                "-c",
+                r#"NIX_REMOTE=daemon nix-store --realise --dry-run "$1" 2>&1"#,
+                "sh",
+                inp,
+            ],
+        );
+        assert!(
+            dry.contains("will be fetched"),
+            "{} is not offered {inp}: {dry}",
+            w.0
+        );
+    }
+    // No builder can fetch the input, so the build must make it first.
+    let built = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "-L",
+            "--no-link",
+            "--print-out-paths",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &dep,
+            "job",
+            "--argstr",
+            "tag",
+            tag,
+        ],
+        240,
+    );
+    assert_eq!(
+        built.code, 0,
+        "the build on an input offered unsigned failed: {}",
+        built.stderr
+    );
+    for path in [inp, built.stdout.trim()] {
+        let got = run_t(
+            CLIENT,
+            &["nix", "path-info", "--store", &envoy(), path],
+            120,
+        );
+        assert_eq!(
+            got.code,
+            0,
+            "the farm cannot give {path}: {}",
+            got.combined()
+        );
     }
 }
 

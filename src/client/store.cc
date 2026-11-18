@@ -1,4 +1,5 @@
-// grpc:// Store: channel setup, error mapping, trust probe, worker-protocol tunnel, registration.
+// grpc:// Store: channel setup, error mapping, trust probe, worker-protocol tunnel, and the
+// entry GrpcStoreConfig::openStore (store-config.cc) loads this library for.
 
 #include "store.hh"
 
@@ -22,11 +23,9 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/derivations.hh>
-#include <nix/store/globals.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/remote-store.hh>
 #include <nix/store/store-api.hh>
-#include <nix/store/store-registration.hh>
 #include <nix/store/worker-protocol.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
@@ -155,7 +154,7 @@ auto GrpcStore::connectHint(const std::string & msg) const -> std::string
   return more.empty() ? "" : "\nhint:" + more;
 }
 
-auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> Error
+auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> GrpcStatusError
 {
   std::string hint;
   auto const code = status.error_code();
@@ -164,8 +163,8 @@ auto GrpcStore::statusError(const grpc::Status & status, const char * opName) co
     hint = connectHint(status.error_message());
   }
   // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
-  return Error("gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
-               status.error_message(), hint);
+  return GrpcStatusError(status, "gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
+                         status.error_message(), hint);
 }
 
 auto GrpcStore::isTrustedClient() -> std::optional<TrustedFlag> {
@@ -231,39 +230,14 @@ auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
   return conn;
 }
 
-auto GrpcStoreConfig::openStore() const -> ref<Store> {
+} // namespace nix
+
+// Declared in store-config.hh.
+extern "C" void nix_grpc_store_open(const nix::GrpcStoreConfig & config, std::shared_ptr<nix::Store> & store) {
   // gRPC reads its trace settings in grpc_init().
-  if (debug) {
+  if (config.debug) {
     nixgrpc::enableGrpcTracing();
   }
   nixgrpc::retainGrpcRuntime();
-  return make_ref<GrpcStore>(ref{shared_from_this()});
-}
-
-} // namespace nix
-
-namespace {
-
-// "2.31.5" / "2.35pre20260619_f8bb823a" -> "2.31" / "2.35"
-auto majorMinor(std::string_view version) -> std::string_view {
-  auto const firstDot = version.find('.');
-  auto const end = version.find_first_not_of("0123456789", firstDot + 1);
-  return version.substr(0, end);
-}
-
-} // namespace
-
-// Called by Nix right after dlopen(). Registering here instead of in a static
-// initializer lets a version mismatch degrade to a warning.
-extern "C" void nix_plugin_entry() {
-  auto const running = majorMinor(nix::nixVersion);
-  auto const builtAgainst = majorMinor(NIX_GRPC_BUILT_AGAINST_NIX);
-  if (running != builtAgainst) {
-    nix::warn(
-        "nix-grpc-store plugin was built against Nix %s but is being loaded by Nix %s. "
-        "grpc:// stores are unavailable",
-        std::string(builtAgainst), std::string(running));
-    return;
-  }
-  static const nix::RegisterStoreImplementation<nix::GrpcStoreConfig> regGrpcStore;
+  store = std::make_shared<nix::GrpcStore>(nix::ref{config.shared_from_this()});
 }
