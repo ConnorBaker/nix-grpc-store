@@ -351,8 +351,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 // no error tells the scheduler. So ask it, and take no builds meanwhile.
 void Coordinator::askLocalDaemon(Builder & bld)
 {
-    constexpr std::chrono::seconds patience{5};
-    bool const answers = nixDaemonAnswers(options.socketPath, patience);
+    bool const answers = nixDaemonAnswers(options.socketPath, daemonPatience);
     if (answers == daemonAnswered) {
         return;
     }
