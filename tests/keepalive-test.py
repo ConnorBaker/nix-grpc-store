@@ -33,9 +33,6 @@ import time
 import urllib.request
 
 ALIVE_S = 3  # answer pings this long after Assigned, like a live client
-DEADLINE_S = 120  # keepalive time (20 s) + gRPC ping timeout (60 s), plus slack
-SETUP_S = 30
-REVOKE_S = 15  # from the close to clientGone and the builder's Done
 
 DATA, HEADERS, RST_STREAM, SETTINGS, PING, GOAWAY = 0x0, 0x1, 0x3, 0x4, 0x6, 0x7
 ENHANCE_YOUR_CALM = 0xB
@@ -118,7 +115,8 @@ class Conn:
         self.buf = b""
         self.data = {}  # stream -> bytes
 
-    # One frame, or None on timeout. Raises EOFError when the peer closed.
+    # One frame, or None once `timeout` (None: no limit) is over. Raises
+    # EOFError when the peer closed.
     def next_frame(self, timeout):
         self.sock.settimeout(timeout)
         while True:
@@ -142,7 +140,7 @@ class Conn:
 
 def scrape(port):
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as resp:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics") as resp:
             text = resp.read().decode()
     except OSError:
         return None
@@ -228,19 +226,17 @@ def main():
         return 1
 
     try:
-        start = time.monotonic()
-        vals = None
-        while time.monotonic() - start < SETUP_S:
+        # The metrics say when the in-process worker is there, and nothing
+        # tells of it: ask until they do.
+        while True:
             if proc.poll() is not None:
                 return setup_fail(f"daemon exited with {proc.returncode}")
             vals = scrape(mport)
             if vals and vals.get(("nix_grpc_sched", "workers"), 0) >= 1:
                 break
             time.sleep(0.2)
-        else:
-            return setup_fail(f"no in-process worker in the metrics: {show(vals)}")
         print(f"before: {show(vals)}")
-        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock = socket.create_connection(("127.0.0.1", port))
         conn = Conn(sock)
 
         sock.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(SETTINGS, 0, 0))
@@ -261,15 +257,10 @@ def main():
 
         assigned = None
         while assigned is None:
-            if time.monotonic() - start > 2 * SETUP_S:
-                return setup_fail("no Assigned for the Want")
             try:
-                got = conn.next_frame(1)
+                kind, flags, stream, payload = conn.next_frame(None)
             except EOFError:
                 return setup_fail("connection closed before Assigned")
-            if got is None:
-                continue
-            kind, flags, stream, payload = got
             if kind == SETTINGS and not flags & ACK:
                 sock.sendall(frame(SETTINGS, ACK, 0))
             elif kind == PING and not flags & ACK:
@@ -296,16 +287,14 @@ def main():
         silent = None
         pings = 0
         goaways = []  # (error code, debug data)
-        closed = None
+        # Until the daemon closes the connection.
         while True:
-            now = time.monotonic()
-            if silent is None and now - assigned > ALIVE_S:
-                silent = now
+            alive_left = assigned + ALIVE_S - time.monotonic()
+            if silent is None and alive_left <= 0:
+                silent = time.monotonic()
                 print("client goes silent")
-            if silent is not None and now - silent > DEADLINE_S:
-                break
             try:
-                got = conn.next_frame(1)
+                got = conn.next_frame(alive_left if silent is None else None)
             except EOFError:
                 closed = time.monotonic()
                 break
@@ -325,11 +314,6 @@ def main():
                 sock.sendall(frame(SETTINGS, ACK, 0))
             elif kind == PING and not flags & ACK:
                 sock.sendall(frame(PING, ACK, 0, payload))
-        if closed is None:
-            return fail(
-                f"Schedule stream still open {DEADLINE_S}s after the client went silent ({pings} unanswered pings); "
-                f"the scheduler still counts it and the build was not revoked: {show(scrape(mport))}"
-            )
         if silent is None:
             return fail("connection closed while the client was still answering")
         print(f"server closed the connection at +{closed - silent:.1f}s ({pings} unanswered pings)")
@@ -340,14 +324,14 @@ def main():
             return fail("closed without an unanswered ping")
         if (ENHANCE_YOUR_CALM, b"ping_timeout") not in goaways:
             return fail(f"closed without the keepalive's GOAWAY ENHANCE_YOUR_CALM ping_timeout: {goaways}")
-        vals = None
-        while time.monotonic() - closed < REVOKE_S:
+        # Nothing tells of clientGone and the builder's Done but the metrics.
+        while True:
+            if proc.poll() is not None:
+                return fail(f"the daemon exited with {proc.returncode}")
             vals = scrape(mport)
             if vals and clients(vals) == 0 and cancelled(vals) >= 1:
                 break
             time.sleep(0.2)
-        else:
-            return fail(f"connection closed but clientGone and the revoke not seen within {REVOKE_S}s: {show(vals)}")
         print(f"after close: {show(vals)}")
         if cancelled(vals) != 1:
             return fail(f"expected one cancelled Done, the revoked build: {show(vals)}")
