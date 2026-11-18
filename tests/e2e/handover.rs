@@ -2,7 +2,7 @@
 //! reloaded mid-build into other configurations (its specialisations).
 use crate::fixtures::*;
 use crate::harness::{
-    MACHINE, env, journal_count, query, retry, retry_with_clients, sleep, unit_result,
+    MACHINE, env, journal, journal_count, query, retry, unit_result,
 };
 
 const UNIT: &str = "nix-grpc-daemon.service";
@@ -97,7 +97,7 @@ fn start_build(tag: &str) {
     ];
     argv.extend(build_argv(&store, &slow, tag, true));
     succeed(&argv);
-    retry_with_clients(MACHINE, &[tag], "the build started", || starts(tag) > 0);
+    retry(&[(MACHINE, tag)],"the build started", || starts(tag) > 0);
 }
 
 // Lets the running build of `tag` end: its builder reads a line from the
@@ -117,7 +117,7 @@ os.write(os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK), b"\n")' "/proc/$p/cw
 // Releases the build of `tag` once its builder reads the fifo; its client
 // ending first fails the wait.
 fn release(tag: &str) {
-    retry_with_clients(MACHINE, &[tag], &format!("{tag} released"), || try_release(tag));
+    retry(&[(MACHINE, tag)],&format!("{tag} released"), || try_release(tag));
 }
 
 fn starts(tag: &str) -> usize {
@@ -192,7 +192,7 @@ fn take_over_into(name: &str) -> String {
     let handed = journal_count(MACHINE, UNIT, "event=handed_over pid=");
     let out = switch_to(name);
     assert_eq!(out.code, 0, "switch to {name}:\n{}", out.combined());
-    wait_journal_above(UNIT, "event=handed_over pid=", handed);
+    wait_journal_above(UNIT, "event=handed_over pid=", handed, &[UNIT]);
     let new = main_pid();
     assert_ne!(new, old, "no new main process after the switch to {name}");
     new
@@ -223,7 +223,7 @@ pub mod upgrade {
 
         // 3. A build while the old generation drains, as builds arrived when
         // this node refused them, is taken while the first one still runs.
-        wait_journal_above(UNIT, "event=draining", draining);
+        wait_journal_above(UNIT, "event=draining", draining, &[UNIT]);
         quick_build("after");
         assert_eq!(
             unit_state("long"),
@@ -236,7 +236,7 @@ pub mod upgrade {
         finished_once("long");
 
         // 5. The old process is gone and the new generation serves.
-        retry("the old generation exited", || !alive(&old));
+        retry(&[], "the old generation exited", || !alive(&old));
         let new = main_pid();
         assert_ne!(new, old);
         let new_exe = exe(&new);
@@ -247,7 +247,7 @@ pub mod upgrade {
         assert_journal(UNIT, &format!("event=handed_over pid={new}$"));
         // Written once the successor has seen its predecessor go, which can
         // come after the pid is gone: the line is the event.
-        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={old}$"), 0);
+        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={old}$"), 0, &[UNIT]);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("later");
     }
@@ -265,18 +265,13 @@ pub mod upgrade {
         start_build("stopped-new");
         let kills = journal_count(MACHINE, UNIT, "SIGKILL");
         succeed(&["systemctl", "stop", "--no-block", UNIT]);
-        // An absence window: a stop that drains never ends while its
-        // builds are held.
-        sleep(5);
-        assert_eq!(
-            unit_state(UNIT),
-            "deactivating",
-            "5 s after the stop the unit is not draining; journal since:\n{}",
-            query(
-                MACHINE,
-                &["journalctl", "-u", UNIT, "-n", "40", "--no-pager"]
-            )
-        );
+        // The stop drains: had it killed the held builds, they would not
+        // finish once below, and the journal would count a SIGKILL.
+        retry(&[], "the stop drains", || match unit_state(UNIT).as_str() {
+            "deactivating" => true,
+            "active" => false,
+            s => panic!("the stop did not drain: {s}\n{}", journal(MACHINE, UNIT)),
+        });
         assert!(alive(&old) && alive(&new), "a generation did not drain");
         release("stopped-old");
         release("stopped-new");
@@ -312,11 +307,11 @@ pub mod upgrade {
         assert!(alive(&first) && alive(&second), "a predecessor left early");
         release("chain");
         finished_once("chain");
-        retry("both predecessors exited", || {
+        retry(&[], "both predecessors exited", || {
             !alive(&first) && !alive(&second)
         });
         assert_eq!(main_pid(), third);
-        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={second}$"), 0);
+        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={second}$"), 0, &[UNIT]);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("chain-later");
     }
@@ -390,7 +385,7 @@ pub mod failures {
         // Gone because systemd gave up on the reload, not after its own wait
         // for the sockets (30 s), which ends in "sent no sockets": by what
         // it says, not by when.
-        retry("the successors exited", || others.iter().all(|p| !alive(p)));
+        retry(&[], "the successors exited", || others.iter().all(|p| !alive(p)));
         succeed(&["kill", "-CONT", &old]);
         assert_eq!(
             journal_count(MACHINE, UNIT, "sent no sockets"),
@@ -413,7 +408,7 @@ pub mod failures {
         let new = take_over_into(other("next", "base"));
         succeed(&["kill", "-KILL", &new]);
         // Its client builds again: release each build until it ends.
-        retry("crash-long ended", || {
+        retry(&[], "crash-long ended", || {
             let _ = try_release("crash-long");
             unit_state("crash-long") != "active"
         });

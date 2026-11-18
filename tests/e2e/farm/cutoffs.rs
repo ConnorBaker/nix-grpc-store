@@ -91,7 +91,7 @@ fn an_input_fetch_that_fails_is_given_back_not_rebuilt() {
     // Without the reset worker1 gets the input, no build of it needed: on a
     // connection of its own while the ones that failed still shun the cache.
     let mut last = String::new();
-    retry("the build gets the input again", || {
+    retry(&[], "the build gets the input again", || {
         let o = build_dep_job(&store, tag, r#"["vip"]"#, false);
         last = o.stderr;
         o.code == 0
@@ -158,7 +158,7 @@ fn a_root_niks3_dropped_after_planning_is_given_back_not_rebuilt() {
             r#"["vip"]"#,
         ],
     );
-    retry_with_clients(CLIENT, &[slow], "worker1 runs the slow build", || {
+    retry(&[(CLIENT, slow)],"worker1 runs the slow build", || {
         building().contains(&WORKER1)
     });
     let job = "dropped-job";
@@ -187,7 +187,7 @@ fn a_root_niks3_dropped_after_planning_is_given_back_not_rebuilt() {
             r#"["vip"]"#,
         ],
     );
-    retry_with_clients(CLIENT, &[job], "the job waits for worker1", || {
+    retry(&[(CLIENT, job)],"the job waits for worker1", || {
         gauge_sum(leader(), r#"kind="queued""#) >= 1
     });
     // niks3's GC takes it: no closure root any more, nothing in the bucket.
@@ -327,7 +327,7 @@ fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
             "qm",
         ],
     );
-    retry_with_clients(CLIENT, &["qm"], "the query reached the builder", || {
+    retry(&[(CLIENT, "qm")],"the query reached the builder", || {
         journal_count(gone, UNIT, pattern) > before
     });
     let pid = query(gone, &["systemctl", "show", "-P", "MainPID", UNIT]);
@@ -396,7 +396,7 @@ fn an_upload_cut_off_after_longer_than_the_restart_grace_is_retried() {
     );
     let uploading = |w: Node| gauge(w, r#"nix_grpc_inflight{kind="AddMultipleToStore"}"#) > 0;
     let mut busy = None;
-    retry_with_clients(CLIENT, &["held"], "the derivations are uploading", || {
+    retry(&[(CLIENT, "held")],"the derivations are uploading", || {
         busy = WORKERS.into_iter().find(|&w| uploading(w));
         busy.is_some()
     });
@@ -464,7 +464,7 @@ fn a_builder_stopped_mid_upload_lets_it_land_and_the_build_moves_on() {
     );
     let uploading = |w: Node| gauge(w, r#"nix_grpc_inflight{kind="AddMultipleToStore"}"#) > 0;
     let mut busy = None;
-    retry_with_clients(CLIENT, &["up"], "an upload is in flight", || {
+    retry(&[(CLIENT, "up")],"an upload is in flight", || {
         busy = WORKERS.into_iter().find(|&w| uploading(w));
         busy.is_some()
     });
@@ -507,7 +507,7 @@ fn a_builder_the_balancer_cannot_reach_hands_its_builds_to_another() {
         );
     };
     reject("-I");
-    retry("the balancer lost the builder", || {
+    retry(&[], "the balancer lost the builder", || {
         unhealthy(&sys).contains(&cut)
     });
     let refused = events(leader(), "refused");
@@ -535,7 +535,7 @@ fn a_builder_the_balancer_cannot_reach_hands_its_builds_to_another() {
     assert_eq!(o.code, 0, "{}", o.combined());
     assert!(events(leader(), "refused") > refused);
     wait_members(&sys, &WORKERS);
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
 }
 
 /// Moves the scheduler to `w`.
@@ -547,10 +547,10 @@ fn lead(w: Node) {
     let pattern = "event=scheduler_take_over";
     let before = journal_count(w, UNIT, pattern);
     succeed(was, &["systemctl", "stop", "nix-grpc-daemon.service"]);
-    wait_journal_above(w, UNIT, pattern, before);
+    wait_journal_above(w, UNIT, pattern, before, &[UNIT]);
     succeed(was, &["systemctl", "start", "nix-grpc-daemon.service"]);
     wait_members(&system(), &WORKERS);
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
     assert_eq!(leader(), w);
 }
 
@@ -588,7 +588,7 @@ fn a_build_whose_stream_breaks_goes_on_and_the_client_follows_it_again() {
         let attached = events(WORKER1, "attached");
         // Like a tunnel or proxy on the way resetting the stream.
         succeed(LB, &["ss", "-tK", "dst", &ip, "dport", "=", ":50051"]);
-        retry_with_clients(CLIENT, &["flap"], "the client attached again", || {
+        retry(&[(CLIENT, "flap")],"the client attached again", || {
             events(WORKER1, "attached") > attached
         });
         assert_eq!(building(), [WORKER1], "the build stopped or moved");
@@ -632,7 +632,7 @@ fn an_upload_cut_off_again_and_again_while_it_imports_is_retried() {
             ],
         );
         let held = format!("flock -n -E 99 {lock} true; [ $? = 99 ]");
-        retry_with_clients(w, &["hold-import"], "the lock is held", || {
+        retry(&[(w, "hold-import")],"the lock is held", || {
             run(w, &["sh", "-c", &held]).code == 0
         });
     }
@@ -663,7 +663,7 @@ fn an_upload_cut_off_again_and_again_while_it_imports_is_retried() {
     // than the restart grace in all. Before, the client gave up then.
     for cut in 0..2 {
         let mut busy = None;
-        retry_with_clients(CLIENT, &["held-import"], "an upload started", || {
+        retry(&[(CLIENT, "held-import")],"an upload started", || {
             let now = started();
             busy = (0..WORKERS.len()).find(|&i| now[i] > seen[i]).map(|i| WORKERS[i]);
             seen = now;
@@ -674,7 +674,7 @@ fn an_upload_cut_off_again_and_again_while_it_imports_is_retried() {
         // Like the builder's tunnel going away: "reset reason: connection termination".
         let ip = env(&format!("NGS_{}_IP", busy.unwrap().0.to_uppercase()));
         succeed(LB, &["ss", "-tK", "dst", &ip, "dport", "=", ":50051"]);
-        retry_with_clients(CLIENT, &["held-import"], "the client retried", || {
+        retry(&[(CLIENT, "held-import")],"the client retried", || {
             retries() > cut
         });
     }

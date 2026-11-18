@@ -5,7 +5,7 @@
 //! and a build trace the GC left behind meets a rebuild.
 
 use crate::fixtures::*;
-use crate::harness::{MACHINE, journal, retry_with_clients, strs, unit_result};
+use crate::harness::{MACHINE, journal, retry, strs, unit_result};
 
 const EXPR: &str = "/tmp/floating.nix";
 /// The client's own store, so that only the builder's /nix/store has what
@@ -69,7 +69,7 @@ fn spawn_slow(unit: &str, store: &str, tag: &str) {
     let mut cmd = Vec::from(["systemd-run", "--unit", unit].map(String::from));
     cmd.extend(build_argv(store, "slow", tag, ""));
     succeed(&strs(&cmd));
-    retry_with_clients(MACHINE, &[unit], "the slow build runs", || {
+    retry(&[(MACHINE, unit)],"the slow build runs", || {
         run(&["pgrep", "-f", &slow(tag)]).code == 0
     });
 }
@@ -240,7 +240,7 @@ fn a_floating_output_the_gc_took_before_an_attached_client_held_it_is_built_agai
     let mut cmd = Vec::from(["systemd-run", "--unit", "floating-share-b"].map(String::from));
     cmd.extend(build_argv(other, "slow", "share", ""));
     succeed(&strs(&cmd));
-    retry_with_clients(MACHINE, &["floating-share-b"], "the second client attached", || {
+    retry(&[(MACHINE, "floating-share-b")],"the second client attached", || {
         events("attached") > attached
     });
     // Each session's connection, the owner's opened first.

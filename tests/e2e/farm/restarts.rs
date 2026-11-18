@@ -9,7 +9,7 @@ fn a_niks3_restart_does_not_cost_the_leader_its_role() {
     let before = yields();
     succeed(LB, &["systemctl", "restart", "niks3.service"]);
     wait_for_unit(LB, "niks3.service");
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
     assert_eq!(leader(), was);
     assert_eq!(yields(), before);
     build(&envoy(), "after-niks3-restart", &[]);
@@ -22,11 +22,11 @@ fn scheduler_down_the_other_node_takes_the_lock_and_keeps_it() {
     let pattern = "event=scheduler_take_over";
     let before = journal_count(nxt, UNIT, pattern);
     succeed(was, &["systemctl", "stop", "nix-grpc-daemon.service"]);
-    wait_journal_above(nxt, UNIT, pattern, before);
-    retry("one worker on the new scheduler", || sched_workers(nxt) == 1);
+    wait_journal_above(nxt, UNIT, pattern, before, &[UNIT]);
+    retry(&[], "one worker on the new scheduler", || sched_workers(nxt) == 1);
     build(&envoy(), "on-standby", &[]);
     succeed(was, &["systemctl", "start", "nix-grpc-daemon.service"]);
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
     assert_eq!(leader(), nxt);
     assert_eq!(sched_workers(was), 0);
 }
@@ -56,11 +56,11 @@ fn clean_scheduler_restart_peers_are_told_and_running_builds_survive() {
     sleep(5);
     assert_eq!(building(), who, "restart killed or moved the build");
     release_slow();
-    wait_journal_above(nxt, UNIT, pattern, before);
+    wait_journal_above(nxt, UNIT, pattern, before, &[UNIT]);
     wait_unit_done("rs");
     assert_unit_success("rs");
     assert_no_journal(CLIENT, "rs", "reconnecting");
-    retry("scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
 }
 
 #[test]
@@ -124,12 +124,12 @@ fn a_draining_builder_lets_a_client_attach_to_the_build_it_runs() {
         busy,
         &["systemctl", "stop", "--no-block", "nix-grpc-daemon.service"],
     );
-    wait_journal_above(busy, UNIT, draining, before);
+    wait_journal_above(busy, UNIT, draining, before, &[UNIT]);
     // The scheduler sends whoever wants the drv to the worker that runs it,
     // draining or not. Like a client whose stream to it broke.
     let attached = events(busy, "attached");
     spawn_build("da2", "drain-attach");
-    retry_with_clients(CLIENT, &["da2"], "the second client attached", || {
+    retry(&[(CLIENT, "da2")],"the second client attached", || {
         events(busy, "attached") > attached
     });
     release_slow();
