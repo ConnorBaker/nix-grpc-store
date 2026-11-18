@@ -83,6 +83,8 @@ public:
     // SIGHUP: without --max-jobs, read nix's max-jobs anew and hand the
     // scheduler the builder's new capacity. From the serve loop.
     void reloadNixConfig();
+    // The store takes no new file, or not `need` more bytes (none for 0).
+    [[nodiscard]] auto outOfSpace(uint64_t need) const -> bool;
     // Before Shutdown(): peers of the scheduler are told to reconnect rather
     // than left to find a dead stream.
     void restarting();
@@ -96,7 +98,6 @@ private:
     bool daemonAnswered = true;
     std::optional<Elector> elector;
     grpc::HealthCheckServiceInterface * health = nullptr;
-    std::atomic<bool> lastHealthy{true};
     void setSchedulerActive(bool active);
     void runRemoteSession(Builder & bld, const std::stop_token & stop);
     void askLocalDaemon(Builder & bld);

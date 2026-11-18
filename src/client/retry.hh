@@ -40,8 +40,9 @@ inline auto tlsRejected(std::string_view msg) -> bool
     return std::ranges::any_of(needles, [&](std::string_view needle) -> bool { return msg.contains(needle); });
 }
 
-// A worker or the balancer restarting under us, or not reachable right now.
-// The daemon sends UNAVAILABLE only for that; TLS setup failures are config errors.
+// A worker or the balancer restarting under us, not reachable right now, or a
+// worker out of disk. The daemon sends UNAVAILABLE only for those; TLS setup
+// failures are config errors.
 inline auto goneAway(const grpc::Status & status) -> bool
 {
     auto const & msg = status.error_message();
@@ -75,19 +76,31 @@ inline auto workerLeft(const grpc::Status & status) -> bool
     }
 }
 
-// The connection died under an open stream. Only callers that know what the
-// stream already delivered can retry this safely.
+// The connection died under an open stream. gRPC reports a reset under it, a
+// balancer's included, as "Stream removed", or ends the call UNKNOWN or
+// INTERNAL with "RST_STREAM" or "Socket closed". Only callers that know what
+// the stream already delivered can retry this safely.
 inline auto streamBroken(const grpc::Status & status) -> bool
 {
-    return status.error_message().contains("Stream removed");
+    auto const & msg = status.error_message();
+    switch (status.error_code()) {
+    case grpc::StatusCode::UNKNOWN:
+    case grpc::StatusCode::INTERNAL:
+        return msg.contains("Stream removed") || msg.contains("RST_STREAM") || msg.contains("Socket closed");
+    default:
+        return msg.contains("Stream removed");
+    }
 }
 
 // The call broke or its server left, as opposed to the server answering with
-// an error. A failed publish is an answer: worth a retry elsewhere, but not
-// progress, so the retries end when they stop getting anywhere.
+// an error. A failed publish, or a worker out of space, is an answer: worth a
+// retry elsewhere, but not progress, so the retries end when they stop
+// getting anywhere.
 inline auto cutOff(const grpc::Status & status) -> bool
 {
-    return !status.error_message().contains("publish failed") && (streamBroken(status) || goneAway(status));
+    auto const & msg = status.error_message();
+    return !msg.contains("publish failed") && !msg.contains("out of space: ")
+           && (streamBroken(status) || goneAway(status));
 }
 
 // The pauses of one retry loop, under a deadline.

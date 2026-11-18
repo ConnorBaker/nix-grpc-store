@@ -147,7 +147,6 @@ services.nix-grpc-daemon = {
   roles = [ "builder" ];              # [ "builder" "scheduler" ] on the scheduler node
   scheduler = "10.0.0.4:50052";       # leave out on the scheduler node itself
   idleTimeout = null;
-  minFree = "20G";
   tls = {
     certFile = "/run/keys/worker.crt";
     keyFile = "/run/keys/worker.key";
@@ -176,7 +175,6 @@ services.nix-grpc-daemon = {
 | `advertise` | The address the balancer reaches this node at. A builder's must be `IP:port`, since the scheduler passes it to envoy as an endpoint. It routes requests and grants no access: only peers with the `trusted` role can open a session. A scheduler node's must match its entry in the balancer's `scheduler`. |
 | `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`, read again on SIGHUP. |
 | `lookupThreads` | Cache lookups a scheduler runs at once for incoming build requests, 32 by default. Raise it when requests wait on a slow cache while the scheduler is idle. |
-| `minFree` | Below this much free disk the node takes no new builds until space returns. |
 | `buildLogRetention` | How long a builder keeps Nix's build logs, `"30d"` by default. `null` keeps them forever, as Nix does. |
 | `trustedProxies` | Peers with a matching client cert are balancers. The node takes the real client identity from the `x-forwarded-client-cert` header they set. Other peers can't set it. |
 | `accessRules` | Maps CNs to roles. CI needs `trusted`, and so do the other nodes for their connection to the scheduler. |
@@ -204,7 +202,7 @@ too, and so do the systems in `extraSystems` (e.g. ones the
 nix-daemon hands to `external-builders`). Add each of them to the
 balancer's `systems`. A
 scheduler-only node is the same with `roles = [ "scheduler" ]` and no
-`scheduler`, `maxJobs` or `minFree`.
+`scheduler` or `maxJobs`.
 
 A node has two outbound connections, to the scheduler and to niks3, and
 on each it can present its certificate, a bearer token, or both. With
@@ -440,12 +438,28 @@ queries that name the old one no longer match. `unplaceable`
 counts queued builds that no connected builder could take at all, so a
 group does not grow for builds it cannot run. The number to scale a
 group on is therefore `queued - unplaceable` for its label set.
+`running` counts every build placed on a builder, which holds its slot
+until it ends, whether a client still follows it or not: one revoked
+and not yet ended, and one a builder reported to a restarted scheduler,
+which knows nothing else of it and counts it under the builder's native
+system.
+`lingering` counts builds kept for a lease (`grpc-lease`, `grpc-linger`)
+after its clients left, or for the 10 s a client whose stream broke has
+to come back: a running one is also in `running`, since it
+holds its slot, and a queued one is not in `queued`, since nobody wants
+it placed until its client is back.
 Scale-down is a drain, see below. [kubernetes.md](kubernetes.md#autoscale-a-worker-group)
 has a KEDA example.
 
 **Drain a builder.** `systemctl stop nix-grpc-daemon` stops new builds
 arriving, hands assignments no client has claimed yet back to the
-scheduler, and returns once the claimed ones have published. After
+scheduler, and returns once the claimed ones have published. A build
+kept for a lease still runs, so the drain waits for it too: for it to
+end, or for its lease to end and the scheduler to revoke it
+(`--max-linger` at most); a client of the lease may come back to it
+meanwhile. A restarted scheduler has lost its leases, and a build a
+builder reports to it then has no client and no lease: it runs to its
+end. After
 `TimeoutStopSec` (1h) the rest is killed and the clients are sent to
 another worker. A second SIGTERM cancels right away. `nixos-rebuild
 switch` reloads the unit, which drains the same way but returns at once.
@@ -517,7 +531,7 @@ assignment.
 scrape envoy's admin port (`/stats/prometheus`). The scheduler adds
 `nix_grpc_sched{kind="queued|workers|rested|clients|leader"}` and, per system
 and feature set,
-`nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|slots|free"}`.
+`nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|slots|free|lingering"}`.
 Only the node holding the lock has `leader` 1 and non-zero values, so
 aggregate with `max by (system, kind)` over the scheduler nodes. A
 Grafana dashboard for all of it ships as `deploy/helm/nix-grpc-farm/files/farm.json`
@@ -558,9 +572,9 @@ isn't in `accessRules`.
 
 **`no connected, non-draining worker for system … offers features {…}`** —
 no builder for that system (with those `system-features`) is connected
-to the scheduler, or all of them are low on disk, stopping, or have a
-local nix-daemon that does not answer. Each builder says which in
-`nix_grpc_unavailable{reason="stopping|low_disk|local_daemon"}` and in
+to the scheduler, or all of them are stopping or have a local
+nix-daemon that does not answer. Each builder says which in
+`nix_grpc_unavailable{reason="stopping|local_daemon"}` and in
 its journal (`event=unhealthy`). The client
 prints this as a warning and waits two minutes before giving up, because
 right after a scheduler restart the builders may still be reconnecting.

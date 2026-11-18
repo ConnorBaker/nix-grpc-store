@@ -374,6 +374,49 @@ With access control enabled, remote builders need the `trusted` role.
 The builder protocol imports unsigned outputs built on the client,
 which also requires `trustClients` (see above).
 
+A client that gives up after a while and is followed by another for the
+same build, a chain of time-bounded `nix build`s, can ask the scheduler
+to keep its builds running in between, under a lease that names the
+chain (the same name for each of its `nix build`s):
+
+    NIX_CONFIG="grpc-lease = $chain" nix build --option grpc-linger 600 …
+
+Once a build's last client leaves, the scheduler keeps it while any lease
+on it is live, until 600 s after the last client of that lease left, in
+whatever state it is: running, even while other builds wait for its slot;
+assigned to a builder (and back in its place in the queue should the
+builder give it back or go); or queued, in its place, though not placed
+while no client is there to take it. The next client to ask for it
+follows it again instead of starting it anew. Each lease counts on its
+own, capped by the scheduler's `--max-linger`: a client without one (an
+interactive `nix build`, whose linger is 0) neither keeps a build nor ends
+another's lease. When the chain is over, end its lease:
+
+    NIX_CONFIG="grpc-lease = $chain" nix store info --store "grpc://host:port?release-lease=true"
+
+It reports `released lease …: N builds` once the scheduler has
+answered, N being the builds that carried the lease (0: none), and
+fails if the scheduler does not answer (one that predates leases). A
+build only that lease kept is let go; one a client of the lease still
+follows runs on for it, and is let go as it leaves. A later Want with
+the lease keeps nothing for as long as `--max-linger`: the scheduler
+remembers each released id that long, a Release that came before any
+Want of its lease too, at most 65,536 of them, so Releases of fresh ids
+flooding in can drop a real one early. A restarted scheduler has
+forgotten them, as it has its leases. A scheduler does not know who
+set a lease: any client allowed to schedule that knows the id can end
+it, so the id goes in the environment, not on the command line where
+every user's `ps` shows it, and the report above and the scheduler's
+log show only its first 8 characters. Without a linger (`0`, the
+default) a build is forgotten as its last client leaves, and one placed
+on a builder is revoked: at once on a Cancel, and 10 s later when the
+client's stream broke, so that a client that reconnects finds it still
+running. An interrupted `nix build` thus stops its builds within 10 s.
+`grpc-lease` and `grpc-linger` are global settings, not URI parameters,
+because `builders` is shared by every build on the machine; the daemon
+applies them only for a trusted user. A linger without a lease keeps a
+build for the longest such linger and cannot be released.
+
 ## URI parameters
 
   * `insecure` — plaintext, no TLS (testing only)
@@ -399,6 +442,9 @@ which also requires `trustClients` (see above).
     the scheduler sends it back to the same assignment, where the build
     still runs.
   * `max-builds` (default 64) — concurrent `BuildDerivation` streams.
+  * `release-lease` (default false) — when the store connects (`nix store
+    info`), end the lease the `grpc-lease` setting names on the scheduler
+    first; see above.
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that
     system. Use one `nix.buildMachines` entry per system.
@@ -416,9 +462,10 @@ which also requires `trustClients` (see above).
   * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
-  * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--extra-system SYSTEM`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
+  * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--extra-system SYSTEM`, `--max-jobs N` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
   * `--lookup-threads N` — how many cache lookups a scheduler runs at once for incoming Wants, default 32. Raise it when Wants wait on a slow cache while the scheduler is idle
   * `--niks3 URL [--niks3-cache-url URL] [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both. `--niks3-cache-url` is the cache as nodes substitute from it: with it, a builder that cannot get an input which the cache lost (niks3 lists it as a closure root, but the bucket has no narinfo for it or its NAR answers 404) names it, so the client builds it
+  * `--max-linger SECS` — the longest a client's `grpc-linger` keeps a build once its clients left, default 600; `0` turns lingering off
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring
@@ -456,8 +503,8 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | `nix_grpc_nar_bytes_total` | direction, cn | uncompressed NAR bytes imported/exported |
 | `nix_grpc_build_info` | version, worker, system, features | constant 1, for joins and version skew |
 | `nix_grpc_sched` | kind = queued, workers, rested, clients, leader | scheduler state; `rested` counts workers that get no builds because they kept giving builds back |
-| `nix_grpc_sched_system` | system, features, kind = queued, unplaceable, running, slots, free | queue (by required features) and capacity (by offered features), for autoscaling |
-| `nix_grpc_unavailable` | reason = stopping, low_disk, local_daemon | 1 while a worker takes no new builds for that reason |
+| `nix_grpc_sched_system` | system, features, kind = queued, unplaceable, running, slots, free, lingering | queue (by required features) and capacity (by offered features), for autoscaling; `lingering`: builds kept for a departed client's lease, or for 10 s after its stream broke (running ones are in `running` too) |
+| `nix_grpc_unavailable` | reason = stopping, local_daemon | 1 while a worker takes no new builds for that reason |
 | `nix_grpc_events_total` | kind | assigned, cached, attached, give_back, given_back_<reason>, expect_late, unexpected_build, scheduler_take_over, scheduler_yield, … |
 | `nix_grpc_lookup_seconds` | stage = queued, cache | scheduler: time a batch of build requests waits for a lookup thread, then for the cache's answer. Not part of the queue wait |
 | `nix_grpc_lookup_keys` | result = asked, present | scheduler: outputs one such lookup asks the cache about, and how many of them it has |

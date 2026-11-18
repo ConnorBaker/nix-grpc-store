@@ -63,8 +63,6 @@
 ++ [
   "--role"
   (lib.concatStringsSep "," cfg.roles)
-  "--min-free"
-  cfg.minFree
 ]
 ++ lib.concatMap (s: [
   "--extra-system"
@@ -77,6 +75,10 @@
 ++ lib.optionals (cfg.lookupThreads != null) [
   "--lookup-threads"
   (toString cfg.lookupThreads)
+]
+++ lib.optionals (cfg.maxLinger != null) [
+  "--max-linger"
+  (toString cfg.maxLinger)
 ]
 ++ lib.optionals (cfg.scheduler != null) [
   "--scheduler"

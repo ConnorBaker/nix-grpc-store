@@ -57,8 +57,6 @@ pkgs.testers.runNixOSTest {
         enable = true;
         listen = "[::]:50051";
         trustClients = true;
-        # The VM disk is small.
-        minFree = "0";
         package = config.programs.nix-grpc-store.package;
       };
 
