@@ -137,6 +137,57 @@ awk '/^VmHWM/ {{print $2}}' /proc/$pid/status"#
     );
 }
 
+/// A log that compresses to more than one GetBuildLog message arrives
+/// whole: the same bytes as the server's own copy.
+#[test]
+fn long_build_log_streams_in_chunks() {
+    let drv = succeed(&["nix-instantiate", "/etc/biglog.nix"]);
+    let drv = drv.trim();
+    succeed(&[
+        "nix",
+        "build",
+        "--store",
+        STORE,
+        "--impure",
+        "-f",
+        "/etc/biglog.nix",
+        "--no-link",
+    ]);
+    // The VM's store is the server's: both read the file its nix-daemon wrote.
+    succeed(&[
+        "sh",
+        "-c",
+        r#"nix log --store "$1" "$2" > /tmp/biglog.grpc && nix log "$2" > /tmp/biglog.local && cmp /tmp/biglog.grpc /tmp/biglog.local"#,
+        "sh",
+        STORE,
+        drv,
+    ]);
+    let size: u64 = succeed(&["stat", "-c", "%s", "/tmp/biglog.grpc"])
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(size > 4_000_000, "{size}");
+    // The same for a log kept uncompressed, which the server streams as it
+    // reads the file rather than through bunzip2.
+    write_file(
+        "/tmp/plainlog.nix",
+        &drv_expr("plainlog-grpc", "echo never > $out"),
+    );
+    let drv = succeed(&["nix-instantiate", "/tmp/plainlog.nix"]);
+    let drv = drv.trim();
+    let base = drv.rsplit('/').next().unwrap();
+    let plain = format!("/nix/var/log/nix/drvs/{}/{}", &base[..2], &base[2..]);
+    succeed(&[
+        "sh",
+        "-c",
+        r#"mkdir -p "${1%/*}" && head -c 3000000 /dev/urandom | base64 > "$1" && nix log --store "$2" "$3" > /tmp/plainlog.grpc && nix log "$3" > /tmp/plainlog.local && cmp /tmp/plainlog.grpc /tmp/plainlog.local"#,
+        "sh",
+        &plain,
+        STORE,
+        drv,
+    ]);
+}
+
 /// GetBuildLog request as a `printf` format of the raw gRPC frame.
 pub(crate) fn get_build_log_request(drv_path: &str) -> String {
     assert!(drv_path.len() < 126 && !drv_path.contains(['%', '\\']));
