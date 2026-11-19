@@ -94,8 +94,8 @@ struct Fixture
 };
 
 // Without eof, the start of a NAR the stream then breaks off.
-auto sendNar(grpc::ServerWriter<nix::remote::NarFrame> & writer, uint32_t index, const std::string & nar, bool eof = true)
-    -> void
+auto sendNar(grpc::ServerWriter<nix::remote::NarFrame> & writer, uint32_t index, const std::string & nar, bool eof = true,
+             const std::string & hash = "sha256-one") -> void
 {
     std::string compressed(ZSTD_compressBound(nar.size()), '\0');
     auto const size = ZSTD_compress(compressed.data(), compressed.size(), nar.data(), nar.size(), 1);
@@ -105,7 +105,18 @@ auto sendNar(grpc::ServerWriter<nix::remote::NarFrame> & writer, uint32_t index,
     frame.set_path_index(index);
     frame.set_data(compressed);
     frame.set_eof(eof);
+    frame.set_nar_hash(hash);
     writer.Write(frame);
+}
+
+// The first frame of a stream that resumes, from the NAR `hash`.
+auto resumeAt(const nix::remote::FetchNarsRequest & request, grpc::ServerWriter<nix::remote::NarFrame> & writer,
+              const std::string & hash = "sha256-one") -> void
+{
+    nix::remote::NarFrame resumed;
+    resumed.set_offset(request.offset());
+    resumed.set_nar_hash(hash);
+    writer.Write(resumed);
 }
 
 auto narOf(const std::string & path) -> std::string { return "nar of " + path; }
@@ -128,6 +139,11 @@ auto anyUnavailable() -> nixgrpc::RetryPolicy
         },
         .budget = [] -> std::chrono::milliseconds { return retryBudget; },
     };
+}
+
+auto budgetOf(std::chrono::milliseconds budget) -> nixgrpc::RetryPolicy
+{
+    return {.retryable = anyUnavailable().retryable, .budget = [=] -> std::chrono::milliseconds { return budget; }};
 }
 
 auto fetch(nixgrpc::NarFetcher & fetcher, const nix::StorePath & path) -> std::string
@@ -188,6 +204,115 @@ void midStreamBreakRefetchesUntouchedPaths()
     auto const requests = fix.service.requests();
     assert(requests.size() == 2);
     assert(requests.at(1) == std::vector<std::string>{std::string(pathB().to_string())});
+}
+
+// Half of a NAR, then the stream breaks; `rest` answers the next call.
+auto cutHalfway(const std::string & nar, std::function<void(const nix::remote::FetchNarsRequest &, grpc::ServerWriter<nix::remote::NarFrame> &)> rest) -> Handler
+{
+    return [nar, rest = std::move(rest)](int call, const auto & request, auto & writer) -> grpc::Status {
+        if (call == 0) {
+            sendNar(writer, 0, nar.substr(0, nar.size() / 2), false);
+            return {grpc::StatusCode::UNAVAILABLE, "Stream removed (Socket closed)"};
+        }
+        rest(request, writer);
+        return grpc::Status::OK;
+    };
+}
+
+// A path cut off mid-NAR goes on where it ended.
+void midPathBreakResumes()
+{
+    auto const nar = narOf(std::string(pathA().to_string()));
+    std::atomic<uint64_t> asked = 0;
+    Fixture fix(cutHalfway(nar, [&](const auto & request, auto & writer) -> void {
+        asked = request.offset();
+        resumeAt(request, writer);
+        sendNar(writer, 0, nar.substr(request.offset()));
+    }));
+    auto fetcher = fix.fetcher(anyUnavailable());
+
+    assert(fetch(*fetcher, pathA()) == nar);
+    assert(asked == nar.size() / 2);
+}
+
+// The retry may reach another builder, with another NAR of the path, or a
+// server may not say which NAR it has: the rest must not be joined to the start.
+void otherNarIsRefused()
+{
+    auto const nar = narOf(std::string(pathA().to_string()));
+    for (auto const & [start, rest] :
+         std::vector<std::pair<std::string, std::string>>{{"sha256-one", "sha256-two"}, {"sha256-one", ""}, {"", ""}}) {
+        Fixture fix([&](int call, const auto & request, auto & writer) -> grpc::Status {
+            if (call == 0) {
+                sendNar(writer, 0, nar.substr(0, nar.size() / 2), false, start);
+                return {grpc::StatusCode::UNAVAILABLE, "Stream removed (Socket closed)"};
+            }
+            resumeAt(request, writer, rest);
+            sendNar(writer, 0, nar.substr(request.offset()), true, rest);
+            return grpc::Status::OK;
+        });
+        auto fetcher = fix.fetcher(anyUnavailable());
+
+        assert(fetchFails(*fetcher, pathA()));
+        assert(fix.service.calls() == 2);
+    }
+}
+
+// A stream cut off after longer than the retry budget, twice, still resumes:
+// each cut-off attempt that delivered bytes gets the budget anew.
+void lateCutsResume()
+{
+    auto const nar = narOf(std::string(pathA().to_string()));
+    constexpr std::chrono::seconds budget{1};
+    Fixture fix([&](int call, const auto & request, auto & writer) -> grpc::Status {
+        resumeAt(request, writer);
+        if (call == 2) {
+            sendNar(writer, 0, nar.substr(request.offset()));
+            return grpc::Status::OK;
+        }
+        sendNar(writer, 0, nar.substr(request.offset(), 1), false);
+        std::this_thread::sleep_for(budget * 3 / 2);
+        return {grpc::StatusCode::UNAVAILABLE, "Stream removed (Socket closed)"};
+    });
+    auto fetcher = fix.fetcher(budgetOf(budget));
+
+    assert(fetch(*fetcher, pathA()) == nar);
+    assert(fix.service.calls() == 3);
+}
+
+// Attempts that deliver nothing get the budget once, from the first failure,
+// even one that took longer than the budget. The server would deliver at
+// call `delivers`: a client that never gave up stops there.
+void unproductiveAttemptsEnd()
+{
+    constexpr std::chrono::seconds budget{1};
+    constexpr int delivers = 10;
+    Fixture fix([&](int call, const auto & request, auto & writer) -> grpc::Status {
+        if (call == 0) {
+            std::this_thread::sleep_for(budget * 3 / 2);
+        }
+        if (call < delivers) {
+            return {grpc::StatusCode::UNAVAILABLE, "Stream removed (Socket closed)"};
+        }
+        sendNar(writer, 0, narOf(request.paths(0)));
+        return grpc::Status::OK;
+    });
+    auto fetcher = fix.fetcher(budgetOf(budget));
+
+    assert(fetchFails(*fetcher, pathA()));
+    assert(fix.service.calls() == 2);
+}
+
+// A server that does not say it resumes, as one from before offsets, would
+// send the start again.
+void serverThatStartsOverIsRefused()
+{
+    auto const nar = narOf(std::string(pathA().to_string()));
+    Fixture fix(cutHalfway(nar, [&](const auto &, auto & writer) -> void { sendNar(writer, 0, nar); }));
+    auto fetcher = fix.fetcher(anyUnavailable());
+
+    assert(fetchFails(*fetcher, pathA()));
+    assert(fix.service.calls() == 2);
 }
 
 void nonRetryableFailsAtOnce()
@@ -345,6 +470,11 @@ try {
     failedFetchIsRetried();
     connectFailureIsRetried();
     midStreamBreakRefetchesUntouchedPaths();
+    midPathBreakResumes();
+    lateCutsResume();
+    unproductiveAttemptsEnd();
+    otherNarIsRefused();
+    serverThatStartsOverIsRefused();
     nonRetryableFailsAtOnce();
     rerecordedPathIsFetchedOnce();
     finishedSessionsGo();

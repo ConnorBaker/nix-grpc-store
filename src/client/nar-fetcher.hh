@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <set>
 #include <span>
@@ -77,11 +78,22 @@ class NarSpool
     uint64_t written = 0;
     bool eof = false;
     std::exception_ptr failure;
+    std::string narHash; // only the session's reader thread uses it
 
 public:
     explicit NarSpool(std::shared_ptr<SpoolFile> file)
         : file(std::move(file))
     {
+    }
+
+    // A resumed path must go on with the NAR it started with, and a start
+    // from a server that did not name its NAR cannot be resumed.
+    void identify(const std::string & hash)
+    {
+        if (written != 0 && (narHash.empty() || hash != narHash)) {
+            throw nix::Error("gRPC FetchNars resumed with NAR %s instead of %s", hash, narHash);
+        }
+        narHash = hash;
     }
 
     void append(std::string_view data)
@@ -150,6 +162,19 @@ public:
         return written == 0 && !eof && !failure;
     }
 
+    [[nodiscard]] auto delivered() -> bool
+    {
+        std::scoped_lock const lock(mutex);
+        return eof;
+    }
+
+    // Where a fresh stream resumes this path.
+    [[nodiscard]] auto received() -> uint64_t
+    {
+        std::scoped_lock const lock(mutex);
+        return written;
+    }
+
     void readInto(nix::Sink & sink)
     {
         uint64_t pos = 0;
@@ -182,19 +207,32 @@ public:
 };
 
 // Decode one FetchNars stream (server-controlled path_index/data/eof) into
-// the per-path spools. Throws on malformed input; the caller fails all
-// targets.
+// the per-path spools, the first resumed at `offset`. Throws on malformed
+// input; the caller fails all targets.
 template<class Reader>
-inline void demuxNarFrames(Reader & reader, const std::vector<std::shared_ptr<NarSpool>> & targets)
+inline void demuxNarFrames(Reader & reader, const std::vector<std::shared_ptr<NarSpool>> & targets, uint64_t offset = 0)
 {
     std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> const dctx{ZSTD_createDCtx(), ZSTD_freeDCtx};
     std::string out(ZSTD_DStreamOutSize(), '\0');
     nix::remote::NarFrame frame;
+    bool first = true;
     while (reader.Read(&frame)) {
+        // A server that starts over would add the NAR's start a second time.
+        if (std::exchange(first, false)) {
+            if (frame.offset() != offset) {
+                throw nix::Error("gRPC FetchNars resumed at byte %d instead of %d", frame.offset(), offset);
+            }
+            if (offset != 0) {
+                targets.front()->identify(frame.nar_hash());
+            }
+        }
         if (frame.path_index() >= targets.size()) {
             throw nix::Error("gRPC FetchNars sent path index %d for %d requested paths", frame.path_index(), targets.size());
         }
         const auto & target = targets.at(frame.path_index());
+        if (!frame.nar_hash().empty()) {
+            target->identify(frame.nar_hash());
+        }
         ZSTD_inBuffer zin{.src = frame.data().data(), .size = frame.data().size(), .pos = 0};
         while (true) {
             ZSTD_outBuffer zout{.dst = out.data(), .size = out.size(), .pos = 0};
@@ -336,6 +374,7 @@ private:
             for (const auto & item : pending) {
                 request.add_paths(std::string(item.path.to_string()));
             }
+            request.set_offset(pending.front().spool->received());
             {
                 std::scoped_lock const lock(callMutex);
                 if (stop.stop_requested()) {
@@ -347,7 +386,7 @@ private:
             if (!reader) {
                 throw nix::Error("failed to open gRPC FetchNars stream to '%s'", fetcher.authority);
             }
-            demuxNarFrames(*reader, pending | std::views::transform(&Pending::spool) | std::ranges::to<std::vector>());
+            demuxNarFrames(*reader, pending | std::views::transform(&Pending::spool) | std::ranges::to<std::vector>(), request.offset());
             return reader->Finish();
         }
 
@@ -377,10 +416,22 @@ private:
 
         void attempts(const std::stop_token & stop)
         {
-            Backoff backoff(fetcher.retry.budget());
+            // As GrpcStore::retryingWithProgress: the budget counts from the
+            // first failure, and anew after an attempt that delivered bytes:
+            // the server was reachable.
+            std::optional<Backoff> backoff;
+            auto const received = [&] -> uint64_t {
+                return std::ranges::fold_left(
+                    pending | std::views::transform([](const Pending & item) -> uint64_t { return item.spool->received(); }),
+                    uint64_t{0}, std::plus{});
+            };
             try {
                 for (;;) {
+                    auto const before = received();
                     auto const status = fetchOnce(stop);
+                    if (!backoff || received() > before) {
+                        backoff.emplace(fetcher.retry.budget());
+                    }
                     releaseCall();
                     if (!status.ok()) {
                         nix::checkInterrupt(); // our own cancel; the handler below passes it on
@@ -388,12 +439,14 @@ private:
                     auto cause = std::make_exception_ptr(
                         status.ok() ? nix::Error("gRPC FetchNars stream ended early")
                                     : nix::Error("gRPC FetchNars failed: %s", status.error_message()));
-                    // A path cut off mid-NAR cannot resume, but the ones not
-                    // started yet can go on a fresh stream. Giving up fails
-                    // them all at once (failAll), the cut-off ones included.
-                    auto const cutOff = std::ranges::stable_partition(pending, &NarSpool::untouched, &Pending::spool);
-                    if (cutOff.begin() == pending.begin() || stop.stop_requested()
-                        || !fetcher.retry.shouldRetry(status, backoff)) {
+                    // A stream sends its paths in order: past the whole ones,
+                    // only the first can be cut off mid-NAR. A fresh stream
+                    // resumes it where it ended, then sends the rest. Giving
+                    // up fails them all at once (failAll).
+                    std::erase_if(pending, [](const Pending & item) -> bool { return item.spool->delivered(); });
+                    auto const later = std::ranges::subrange(pending.begin() + (pending.empty() ? 0 : 1), pending.end());
+                    auto const cutOff = std::ranges::stable_partition(later, &NarSpool::untouched, &Pending::spool);
+                    if (pending.empty() || stop.stop_requested() || !fetcher.retry.shouldRetry(status, *backoff)) {
                         failAll(pending, cause);
                         return;
                     }
@@ -407,7 +460,7 @@ private:
                     std::mutex sleepMutex;
                     std::unique_lock sleepLock(sleepMutex);
                     // Returns early only when the fetcher shuts down.
-                    wake.wait_for(sleepLock, stop, backoff.next(), [] -> bool { return false; });
+                    wake.wait_for(sleepLock, stop, backoff->next(), [] -> bool { return false; });
                     if (stop.stop_requested()) {
                         failAll(pending, cause);
                         return;

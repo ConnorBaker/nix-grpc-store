@@ -183,10 +183,27 @@ pkgs.testers.runNixOSTest {
         client.succeed(f"systemd-run --unit long --setenv=PATH=/run/current-system/sw/bin sh -c \"{build('long', 1)} > /root/long.out\"")
         wait_succeeds(client, "journalctl -u long | grep -q STARTED-long", clients=[(client, "long")])
         old = main_pid()
+        # A copy through the tunnels for any builder, slowed down to run across the takeover. Once
+        # at full speed first: publishing the path to the cache is not what is tested.
+        big = single.succeed("head -c 16M /dev/urandom > /root/big && nix-store --add /root/big").strip()
+        client.succeed(f"nix copy --no-check-sigs --from '{store}' {big} && nix store delete {big}")
+        old_journal = f"journalctl -a -o cat _PID={old}"
+        fetches = int(single.succeed(f"{old_journal} | grep -c 'event=rpc_start method=FetchNars' || true"))
+        single.succeed("tc qdisc add dev eth1 root tbf rate 4mbit burst 32kbit latency 400ms")
+        client.succeed(f"systemd-run --unit fetch --setenv=PATH=/run/current-system/sw/bin sh -c \"nix copy --no-check-sigs --from '{store}' {big}\"")
+        wait_stream(single, f"{old_journal} -f --no-tail", "event=rpc_start method=FetchNars", more_than=fetches, clients=[(client, "fetch")], now=old_journal)
         # "event=handed_over pid=": not the old process's handed_over_exit
         handed = int(single.succeed(f"journalctl -u {unit} | grep -c 'event=handed_over pid=' || true"))
         single.succeed("/run/current-system/specialisation/next/bin/switch-to-configuration test")
         wait_journal(single, unit, "event=handed_over pid=", more_than=handed, clients=[(single, unit)])
+        single.succeed("tc qdisc del dev eth1 root")
+        wait_until("the fetch to end", lambda: ended(client, "fetch"))
+        fetched = client.succeed("journalctl -o cat -u fetch")
+        assert client.succeed("systemctl show -P Result fetch").strip() == "success", fetched
+        # The takeover cut the copy off, and it went on where it ended.
+        assert "retrying 1 paths" in fetched, fetched
+        single.succeed(f"journalctl -o cat -u {unit} | grep -E 'method=FetchNars .*paths=1 offset=[1-9]'")
+        client.succeed(f"nix path-info {big}")
         new = main_pid()
         assert new != old, f"no new main process: {new}"
         # The successor says ready before its tunnels are open: the builds
