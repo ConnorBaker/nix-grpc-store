@@ -587,6 +587,9 @@ struct Entry
     bool unplaceable = false; // as last told to the followers
     double holdDueMs = 0;     // when its latest hold ends
     std::vector<WorkerId> givers; // could not run it, latest last
+    // Followers whose build of it runs where another scheduler placed it
+    // (Want.running_on). Not queued while there are any.
+    std::vector<ClientId> elsewhere;
     // Its last follower gone at this time while a lease on it was live:
     // kept, queued or assigned, until keptUntilMs (and not before its hold,
     // holdDueMs, is over). Queued, it keeps its place
@@ -727,6 +730,7 @@ public:
         double cpHintMs = 0;
         double lingerMs = 0;      // see Want.linger_s, capped by the caller
         std::string_view leaseId; // see Want.lease_id
+        bool runsElsewhere = false; // see Want.running_on
     };
 
     // Caller handled the cache-hit case already.
@@ -776,6 +780,11 @@ public:
         slot->cpHint = std::max(slot->cpHint, cpHintMs);
         if (slot->worker != noWorker) {
             return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId), .idleMs = idleMs};
+        }
+        // Its build runs on a worker that another scheduler placed it on.
+        std::erase(slot->elsewhere, client);
+        if (info.runsElsewhere) {
+            slot->elsewhere.push_back(client);
         }
         enqueue(drv);
         return {.drv = drv, .assigned = {}, .idleMs = idleMs};
@@ -1477,6 +1486,7 @@ private:
         if (slot->worker != noWorker) {
             serve(client, -1);
         }
+        std::erase(slot->elsewhere, client);
         auto held = unhold(drv, *slot, client, nowMs, why);
         if (!slot->followers.empty()) {
             if (slot->worker == noWorker) {
@@ -1765,8 +1775,14 @@ private:
     void enqueue(DrvId drv)
     {
         if (const auto & slot = entries.at(drv)) {
-            sys(slot->system).queue.set(drv, prio(*slot), slot->featureKey, slot->followers,
-                                        [this](ClientId client) -> Share { return shareOf(client); });
+            auto & queue = sys(slot->system).queue;
+            // Built elsewhere for now: queued once nobody's build runs there.
+            if (!slot->elsewhere.empty()) {
+                queue.erase(drv, slot->featureKey);
+                return;
+            }
+            queue.set(drv, prio(*slot), slot->featureKey, slot->followers,
+                      [this](ClientId client) -> Share { return shareOf(client); });
         }
     }
 
