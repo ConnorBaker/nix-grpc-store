@@ -412,7 +412,9 @@ self_test() {
     set +m
     # WHEN acked: once a release is answered (release.tsv: exit 0, acknowledged).
     local ready=(test -s "$watch")
-    [ "$when" = acked ] && ready=(grep -q $'\t0\t1\t' "$T/run-$k/out/release.tsv")
+    # ... and once every builder was asked (one `store info` each, in releases).
+    [ "$when" = acked ] && ready=(sh -c 'grep -q "$(printf "\t0\t1\t")" "$1" && [ "$(wc -l < "$2")" -ge "$(tr ";" "\n" < "$3" | grep -c .)" ]' acked \
+      "$T/run-$k/out/release.tsv" "$T/run-$k/releases" "$T/run-$k/builders")
     until "${ready[@]}" 2> /dev/null || ! kill -0 "$pid" 2> /dev/null; do sleep 0.1; done
     for s in $sigs; do
       kill -"$s" "$pid"
