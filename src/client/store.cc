@@ -268,7 +268,7 @@ struct LingerSetting : nix::Setting<unsigned> {
 protected:
   void appendOrSet(unsigned value, bool append) override {
     nix::Setting<unsigned>::appendOrSet(value, append);
-    static_cast<void>(nix::setEnv(lingerEnv, std::to_string(get()).c_str()));
+    nix::setEnv(lingerEnv, std::to_string(get()).c_str());
   }
 };
 
@@ -292,7 +292,7 @@ struct LeaseSetting : nix::Setting<std::string> {
 protected:
   void appendOrSet(std::string value, bool append) override {
     nix::Setting<std::string>::appendOrSet(std::move(value), append);
-    static_cast<void>(nix::setEnv(leaseEnv, get().c_str()));
+    nix::setEnv(leaseEnv, get().c_str());
   }
 };
 
