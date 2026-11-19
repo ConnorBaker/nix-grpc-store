@@ -12,6 +12,11 @@
   driver.race_timer.cancel()
   log.info("the test's global timeout is cancelled: its waits have no deadline")
 
+  def ended(m, unit):
+      # Inactive or failed: a unit still deactivating, or activating, runs
+      # yet, though `systemctl is-active` says it is not active.
+      return m.execute(f"systemctl show -P ActiveState {unit}", timeout=None)[1].strip() in ("inactive", "failed")
+
   def wait_until(what, cond, clients=(), last=None):
       # For states with no event to wait on: cond() polled. clients are
       # (machine, unit) pairs that bring the state about; once one is gone,
@@ -19,7 +24,7 @@
       with log.nested(f"waiting for {what}"):
           while not cond():
               for m, unit in clients:
-                  if m.execute(f"systemctl is-active -q {unit}", timeout=None)[0] != 0:
+                  if ended(m, unit):
                       if (last or cond)():
                           return
                       journal = m.execute(f"journalctl -a --no-pager -u {unit}", timeout=None)[1]

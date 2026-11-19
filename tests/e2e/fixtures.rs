@@ -120,6 +120,10 @@ pub fn unit_state(unit: &str) -> String {
     harness::unit_state(MACHINE, unit)
 }
 
+pub fn ended(unit: &str) -> bool {
+    harness::ended(MACHINE, unit)
+}
+
 pub fn assert_journal(unit: &str, pattern: &str) {
     harness::assert_journal(MACHINE, unit, pattern);
 }

@@ -429,7 +429,7 @@ in
             check(status["exit"] == 0, f"the chain did not get its build: {status}")
             check(followed and int(followed[0]) >= grace_s + 4, f"the next link did not follow the kept build after the gap: {followed}")
             check(q is not None and (late is None or q < late), f"the chain's build lost its place to a build that came in the gap: qchain {q}, late {late}")
-            wait_succeeds(client, "! systemctl is-active -q late")
+            wait_until("late ended", lambda: ended(client, "late"))
 
         with subtest("(B) an untrusted user's linger is dropped: its build is kept for the hold only"):
             bob = chain_of("bob", "bob", 600, unbounded, gap=True)

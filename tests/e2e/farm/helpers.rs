@@ -292,14 +292,14 @@ pub fn spawn_build(unit: &str, tag: &str) {
 pub fn release_until_done(unit: &str) {
     retry(&[], &format!("{unit} ended, its slow builds released"), || {
         release_slow();
-        run(CLIENT, &["systemctl", "is-active", unit]).code != 0
+        ended(CLIENT, unit)
     });
 }
 
 pub fn wait_unit_done(units: &str) {
-    let mut cmd = vec!["sh", "-c", r#"! systemctl is-active "$@""#, "sh"];
-    cmd.extend(units.split_whitespace());
-    wait_until_succeeds(CLIENT, &cmd);
+    for unit in units.split_whitespace() {
+        retry(&[], &format!("{unit} ended"), || ended(CLIENT, unit));
+    }
 }
 
 pub fn assert_unit_success(unit: &str) {
