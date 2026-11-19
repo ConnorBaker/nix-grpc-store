@@ -649,7 +649,7 @@ fn a_builder_serves_the_build_the_cache_published() {
     farm.extend_from_slice(&[&store, "--eval-store", "auto"]);
     farm.extend_from_slice(&args);
     succeed(CLIENT, &farm);
-    wait_building();
+    wait_building("twice");
     let loser = building()[0];
     let winner = if loser == WORKER1 { WORKER2 } else { WORKER1 };
 
@@ -664,9 +664,12 @@ fn a_builder_serves_the_build_the_cache_published() {
         winner,
         &["systemd-run", "--unit", "twice-local", "nix-store", "--realise", &drv],
     );
-    wait_until_succeeds(winner, BUILDER, 60);
-    run_t(winner, &["pkill", "-f", "read -t [9]0 x"], 60);
-    wait_until_succeeds(winner, &["sh", "-c", "! systemctl is-active twice-local"], 60);
+    wait_until_succeeds(winner, BUILDER);
+    run(winner, &["pkill", "-f", BUILDER[2]]);
+    wait_until_succeeds(
+        winner,
+        &["sh", "-c", "systemctl is-active twice-local | grep -qxE 'inactive|failed'"],
+    );
     let mut eval = vec!["nix", "eval", "--raw"];
     eval.extend_from_slice(&args);
     eval.push("outPath");
@@ -674,8 +677,8 @@ fn a_builder_serves_the_build_the_cache_published() {
     let push = format!("{} {out}", env("NGS_NIKS3_PUSH"));
     succeed(winner, &["sh", "-c", &push]);
 
-    run_t(loser, &["pkill", "-f", "read -t [9]0 x"], 60);
-    wait_unit_done("twice", 120);
+    run(loser, &["pkill", "-f", BUILDER[2]]);
+    wait_unit_done("twice");
     assert_unit_success("twice");
     let hash = |w| succeed(w, &["nix-store", "--query", "--hash", &out]);
     assert_eq!(hash(loser), hash(winner), "{} kept its own build", loser.0);
@@ -704,11 +707,11 @@ fn a_finished_build_is_published_after_its_client_left() {
     let built = || WORKERS.into_iter().map(|w| events(w, "built")).sum::<i64>();
     let before = built();
     spawn_build("left", "left");
-    wait_building();
+    wait_building("left");
     block("-I");
     let unblock = Unblock;
     release_slow();
-    retry(60, "the build finished", || built() > before);
+    retry(&[(CLIENT, "left")], "the build finished", || built() > before);
     succeed(CLIENT, &["systemctl", "stop", "left"]);
     // Longer than a builder takes to notice that its client is gone.
     sleep(5);
@@ -722,7 +725,7 @@ fn a_finished_build_is_published_after_its_client_left() {
     let fresh = ["--option", "narinfo-cache-negative-ttl", "0"];
     let mut query = vec!["nix", "path-info", "--store", &cache, &out];
     query.extend(fresh);
-    wait_until_succeeds(CLIENT, &query, 120);
+    wait_until_succeeds(CLIENT, &query);
 }
 
 /// Uploads a new path straight to `w`, so that it publishes. It runs from
