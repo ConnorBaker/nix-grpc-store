@@ -35,7 +35,7 @@
 }:
 let
   client = variant == "client";
-  # One per slot (at most 63).
+  # nix-grpc-daemon advertises no more slots than these.
   nixbld = lib.genList (i: "nixbld${toString (i + 1)}") 64;
   passwd = writeTextDir "etc/passwd" (
     ''

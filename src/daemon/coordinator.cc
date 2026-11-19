@@ -4,13 +4,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -19,7 +23,9 @@
 #include <utility>
 #include <vector>
 
+#include <grp.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <grpcpp/client_context.h>
 #include <grpcpp/create_channel.h>
@@ -35,6 +41,7 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/globals.hh>
+#include <nix/store/local-settings.hh>
 #include <nix/store/store-api.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
@@ -54,7 +61,6 @@
 #include "nix_remote.pb.h"
 #include "options.hh"
 #include "sched-reactor.hh"
-#include "scheduler.hh"
 
 namespace nixgrpc {
 
@@ -66,10 +72,36 @@ using nix::remote::WorkerMsg;
 using nix::remote::WorkerMsgs;
 
 namespace {
-// 0 (nix: no local builds) still takes one.
-auto nixMaxJobs() -> unsigned
+// max-jobs, but no more than nix-daemon has build users for: its
+// auto-allocated uid slots, else the members of build-users-group, as
+// user-lock.cc takes them (settings as read at start, as nix-daemon's).
+auto servable(unsigned jobs) -> unsigned
 {
-    return std::clamp(nixcompat::configuredMaxBuildJobs(), 1U, static_cast<unsigned>(sched::FreeIndex::maxSlots));
+    auto const & local = nix::settings.getLocalSettings();
+    std::optional<unsigned> users;
+    if (auto const * uids = local.getAutoAllocateUidSettings()) {
+        users = uids->uidCount / nix::maxIdsPerBuild;
+    } else if (auto const & name = local.buildUsersGroup.get(); !name.empty()) {
+        group grp{};
+        group * found = nullptr;
+        auto const hint = sysconf(_SC_GETGR_R_SIZE_MAX);
+        std::vector<char> buf(hint > 0 ? static_cast<size_t>(hint) : 1);
+        int err = 0;
+        while ((err = getgrnam_r(name.c_str(), &grp, buf.data(), buf.size(), &found)) == ERANGE) {
+            buf.resize(buf.size() * 2);
+        }
+        if (err == 0 && found != nullptr) {
+            auto * const * const end = std::ranges::find(grp.gr_mem, std::unreachable_sentinel, nullptr);
+            users = static_cast<unsigned>(std::ranges::distance(grp.gr_mem, end));
+        }
+    }
+    if (!users || *users >= jobs) {
+        return jobs;
+    }
+    logLine(
+        LogLevel::info,
+        {{"event", "max_jobs_build_users"}, {"max_jobs", std::to_string(jobs)}, {"build_users", std::to_string(*users)}});
+    return *users;
 }
 } // namespace
 
@@ -189,7 +221,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
             .advertise = options.advertise,
             .systems = {nix::settings.thisSystem.get()},
             .features = {},
-            .maxJobs = options.maxJobs != 0 ? options.maxJobs : nixMaxJobs()};
+            .maxJobs = servable(options.maxJobs != 0 ? options.maxJobs : nixcompat::configuredMaxBuildJobs())};
         self.systems.append_range(nix::settings.extraPlatforms.get());
         self.systems.append_range(options.extraSystems);
         // As nix-daemon builds: system-features plus those its experimental
@@ -415,7 +447,7 @@ void Coordinator::reloadNixConfig()
     }
     unsigned jobs = 0;
     try {
-        jobs = nixMaxJobs();
+        jobs = servable(nixcompat::configuredMaxBuildJobs());
     } catch (nix::Error & err) {
         logLine(LogLevel::info, {{"event", "max_jobs_unreadable"}, {"error", err.msg()}});
         return;
