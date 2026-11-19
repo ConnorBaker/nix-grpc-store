@@ -53,6 +53,9 @@ auto spawn(const std::function<bool()> & body) -> pid_t
     auto const pid = ::fork();
     assert(pid >= 0);
     if (pid == 0) {
+        // Dies with the test: a failed assert there ends the run, not waits on us.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): prctl(2) is variadic.
+        (void) ::prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
         bool held = false;
         try {
             held = body();
