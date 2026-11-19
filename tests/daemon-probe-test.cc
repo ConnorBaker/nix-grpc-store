@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
-#include <latch>
 #include <print>
 #include <string>
 #include <string_view>
@@ -25,8 +24,9 @@
 
 namespace {
 
-// The late nix-daemon greets only once the probe gave up, so any patience
-// shows that; a short one keeps the test short.
+// The late nix-daemon greets twice this after reading the probe's greeting:
+// always after a probe with this patience gave up, so a stall cannot fail a
+// probe that gives up, and one that waits longer takes it for alive.
 constexpr std::chrono::milliseconds shortPatience{200};
 
 // Serves every connection to `path` with `serve` until destroyed.
@@ -85,15 +85,14 @@ auto run() -> int
             status = EXIT_FAILURE;
         }
     };
-    std::latch gaveUp{1};
     {
         Listener const greets(dir / "greets", [](int conn) -> void {
             readGreeting(conn);
             (void) ::write(conn, nixgrpc::probe::daemonMagic.data(), nixgrpc::probe::daemonMagic.size());
         });
-        Listener const late(dir / "greets too late", [&gaveUp](int conn) -> void {
+        Listener const late(dir / "greets too late", [](int conn) -> void {
             readGreeting(conn);
-            gaveUp.wait();
+            std::this_thread::sleep_for(2 * shortPatience);
             (void) ::write(conn, nixgrpc::probe::daemonMagic.data(), nixgrpc::probe::daemonMagic.size());
         });
         Listener const other(dir / "answers something else", [](int conn) -> void {
@@ -102,7 +101,6 @@ auto run() -> int
         });
         expect("greets", true);
         expect("greets too late", false, shortPatience);
-        gaveUp.count_down();
         expect("answers something else", false);
         expect("is missing", false);
     }
