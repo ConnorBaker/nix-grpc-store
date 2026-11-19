@@ -164,6 +164,7 @@ void Builder::finished(
         const std::scoped_lock lock(shared->mutex);
         shared->finished = true;
         shared->resultWire = std::move(resultWire);
+        shared->built = outcome == nix::remote::Done::BUILT;
         shared->cv.notify_all();
     }
     sendDone(drvPath, assignId, outcome, outputs, reason);
