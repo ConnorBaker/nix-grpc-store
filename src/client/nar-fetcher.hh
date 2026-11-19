@@ -86,10 +86,11 @@ public:
     {
     }
 
-    // A resumed path must go on with the NAR it started with.
+    // A resumed path must go on with the NAR it started with, and a start
+    // from a server that did not name its NAR cannot be resumed.
     void identify(const std::string & hash)
     {
-        if (written != 0 && hash != narHash) {
+        if (written != 0 && (narHash.empty() || hash != narHash)) {
             throw nix::Error("gRPC FetchNars resumed with NAR %s instead of %s", hash, narHash);
         }
         narHash = hash;
