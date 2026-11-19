@@ -126,6 +126,31 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   return status;
 }
 
+namespace {
+// The worker does not hold the build: it never got the call (the balancer
+// could not connect to it) or turned it down.
+auto notTaken(const grpc::Status & status) -> bool {
+  auto const & msg = status.error_message();
+  switch (status.error_code()) {
+  case grpc::StatusCode::FAILED_PRECONDITION: // not scheduled there
+    return true;
+  case grpc::StatusCode::UNAVAILABLE:
+    return msg.contains("connection failure") || msg.contains("connection timeout");
+  default:
+    return false;
+  }
+}
+
+// A worker that went away or would not take the call. `refused` names the
+// assignment in the next Want, so the scheduler places it elsewhere and
+// revokes it there: only for a worker that does not hold the build, as a
+// worker whose stream to us broke builds on and we attach again. `left`
+// makes the first such bounce per worker free (Executor::bounced).
+auto bounced(const grpc::Status & status) -> GrpcStore::Bounced {
+  return {.refused = notTaken(status), .left = notTaken(status) || nixgrpc::goneAway(status)};
+}
+} // namespace
+
 auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store & evalStore)
     -> Attempt {
   remote::BuildDerivationRequest request;
@@ -148,31 +173,36 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
   std::string missing;
   auto status = tryBuildDerivation(request, headers, res, missing);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-    uploadDrvClosure(evalStore, {job.drvPath}, headers);
-    status = tryBuildDerivation(request, headers, res, missing);
+    try {
+      // Keeps the assignment there however long the upload takes.
+      auto uploadHeaders = headers;
+      uploadHeaders.emplace_back("x-nix-drv", request.drv_path());
+      uploadDrvClosure(evalStore, {job.drvPath}, uploadHeaders);
+      status = tryBuildDerivation(request, headers, res, missing);
+    } catch (GrpcStatusError & err) {
+      // The upload goes to the assigned worker too, which may drain or die
+      // under it as under BuildDerivation: the same answers below.
+      if (!nixgrpc::workerLeft(err.status)) {
+        throw;
+      }
+      status = err.status;
+    }
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
   if (!status.ok()) {
     checkInterrupt();
   }
-  switch (status.error_code()) {
-  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more), or an input missing
-    if (!missing.empty()) {
-      return MissingInput{.path = parseStorePath(missing)};
-    }
-    [[fallthrough]];
-  case grpc::StatusCode::ABORTED:             // superseded: the scheduler already sent where to go
-  case grpc::StatusCode::UNAVAILABLE:         // worker gone or failing for a while
-  case grpc::StatusCode::CANCELLED:           // worker shut down (ours was checked above)
-  case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
-  case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
-    if (status.error_code() != grpc::StatusCode::ABORTED) {
-      printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
-    }
-    return Bounced{.refused = status.error_code() == grpc::StatusCode::UNAVAILABLE};
-  default:
-    checkStatus(status, "BuildDerivation");
+  if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION && !missing.empty()) {
+    return MissingInput{.path = parseStorePath(missing)};
   }
+  if (status.error_code() == grpc::StatusCode::ABORTED) {
+    return Bounced{};
+  }
+  if (nixgrpc::workerLeft(status)) {
+    printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
+    return bounced(status);
+  }
+  checkStatus(status, "BuildDerivation");
   if (!res) {
     throw Error("gRPC BuildDerivation stream ended without a result");
   }
@@ -273,6 +303,8 @@ struct GrpcStore::Run {
     want->set_cp_hint_ms(job.cpHintMs);
     want->set_build_mode(static_cast<uint32_t>(job.mode));
     want->set_system(job.drv.platform);
+    want->set_linger_s(nixgrpc::lingerSeconds());
+    want->set_lease_id(nixgrpc::leaseId());
     debug("grpc: want %s", job.drvPath.to_string());
   }
 
@@ -342,10 +374,28 @@ struct GrpcStore::Run {
         work->job->result = std::move(*result);
         exe.finished(work->jid, succeeded);
       } else if (const auto * bounce = std::get_if<Bounced>(&res)) {
-        exe.bounced(work->jid, std::chrono::steady_clock::now(), bounce->refused);
+        exe.bounced(work->jid, std::chrono::steady_clock::now(), {.refused = bounce->refused, .left = bounce->left});
       }
             flushLocked();
     }
+  }
+
+  // The input derivation of `job` that outputs `path`, if any: from the
+  // planner (farmInputs), or, for a job it did not plan (a build hook's,
+  // buildOne), from the job's derivation.
+  [[nodiscard]] auto producerOf(const Job & job, const StorePath & path) const -> std::optional<StorePath> {
+    if (auto const found = job.farmInputs.find(path); found != job.farmInputs.end()) {
+      return found->second;
+    }
+    std::optional<StorePath> producer;
+    nixcompat::forInputDrvs(evalStore.readDerivation(job.drvPath), [&](const StorePath & input) -> void {
+      auto const outputs = evalStore.queryStaticPartialDerivationOutputMap(input);
+      if (std::ranges::any_of(outputs | std::views::values,
+                              [&](const std::optional<StorePath> & out) -> bool { return out == path; })) {
+        producer = input;
+      }
+    });
+    return producer;
   }
 
   // A drv output becomes a job in this run, a source or .drv is uploaded again.
@@ -354,18 +404,31 @@ struct GrpcStore::Run {
     {
       std::scoped_lock const lock(mutex);
       if (!recovered.emplace(work.jid, path).second) {
-        throw Error("input '%s' is missing on the farm", pathS);
+        // Missed again although recovered once: the farm may still be
+        // getting it (a worker whose nix-daemon cached a stale narinfo).
+        // Placed again like after any bounce, within reschedule-retries.
+        printError("%s: input '%s' is still missing on the farm, asking the scheduler again",
+                   work.job->drvPath.to_string(), pathS);
+        return Bounced{};
       }
     }
-    auto const producer = work.job->farmInputs.find(path);
-    if (producer == work.job->farmInputs.end()) {
+    auto const producer = producerOf(*work.job, path);
+    if (!producer) {
       warn("%s: worker lacks '%s', uploading it again", work.job->drvPath.to_string(), pathS);
-      store.uploadDrvClosure(evalStore, {work.job->drvPath}, store.routingFor(work.job->drv, work.where.addr, work.where.system));
+      try {
+        auto headers = store.routingFor(work.job->drv, work.where.addr, work.where.system);
+        headers.emplace_back("x-nix-drv", std::string(work.job->drvPath.to_string()));
+        store.uploadDrvClosure(evalStore, {work.job->drvPath}, headers);
+      } catch (GrpcStatusError & err) {
+        if (!nixgrpc::workerLeft(err.status)) {
+          throw;
+        }
+        return bounced(err.status);
+      }
       return Bounced{};
     }
-    warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS,
-         producer->second.to_string());
-    auto const drvPath = producer->second;
+    warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS, producer->to_string());
+    auto const & drvPath = *producer;
     auto const full = evalStore.readDerivation(drvPath);
     std::scoped_lock const lock(mutex);
     auto const name = std::string(drvPath.to_string());
@@ -596,6 +659,34 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
   }
 }
 
+auto GrpcStore::releaseLease(const std::string & lease) -> uint32_t {
+  // Long enough to connect, then for the answer. A scheduler that predates
+  // Release ignores it: this runs out.
+  constexpr auto answerWithin = std::chrono::seconds(10);
+  nixgrpc::Call call;
+  call.ctx().set_deadline(
+      std::chrono::system_clock::now() + std::chrono::seconds(config->connectTimeout.get()) + answerWithin);
+  call.ctx().set_wait_for_ready(true);
+  auto stream = sched->Schedule(&call.ctx());
+  remote::ClientMsgs msgs;
+  msgs.add_msgs()->mutable_release()->set_lease_id(lease);
+  if (stream->Write(msgs)) {
+    remote::SchedMsgs answer;
+    while (stream->Read(&answer)) {
+      for (const auto & msg : answer.msgs()) {
+        if (msg.has_released() && msg.released().lease_id() == lease) {
+          call.ctx().TryCancel();
+          static_cast<void>(stream->Finish());
+          return msg.released().builds();
+        }
+      }
+    }
+  }
+  auto const status = stream->Finish();
+  throw Error("scheduler at '%s' did not answer the release of lease '%s': %s", config->authority.to_string(),
+              lease.substr(0, nixgrpc::leaseIdShown), status.ok() ? "the stream ended" : status.error_message());
+}
+
 void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) {
   if (jobs.empty()) {
     return;
@@ -708,7 +799,8 @@ auto GrpcStore::buildOne(const StorePath & drvPath, const BasicDerivation & drv,
   std::map<StorePath, Job> jobs;
   jobs.emplace(drvPath, Job{.drvPath = drvPath, .drv = drv, .mode = buildMode});
   runJobs(jobs, *evalStore);
-  auto & job = jobs.begin()->second;
+  // recover() may have added the producer of a lost input to `jobs`.
+  auto & job = jobs.at(drvPath);
   if (!job.result) {
     throw Error("'%s' was not built", printStorePath(drvPath));
   }

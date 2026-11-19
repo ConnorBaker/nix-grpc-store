@@ -205,7 +205,8 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
                 .present = std::move(present),
                 .lookupThreads =
                     options.lookupThreads != 0 ? options.lookupThreads : Dispatcher::Config::defaultLookupThreads,
-                .logLevel = options.logLevel},
+                .logLevel = options.logLevel,
+                .maxLingerMs = static_cast<double>(std::chrono::milliseconds(options.maxLinger).count())},
             metrics);
         scheduler = std::make_unique<SchedulerService>(*dispatcher, auth, idle);
         eds = std::make_unique<EdsService>(*dispatcher, auth, idle);

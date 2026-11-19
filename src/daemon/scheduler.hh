@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -381,10 +382,9 @@ public:
     template<typename F>
     void set(DrvId drv, double key, const std::string & features, const std::vector<ClientId> & clients, const F & shareOf)
     {
-        if (clients.empty()) {
-            erase(drv, features);
-            return;
-        }
+        // With no client (kept for one that will be back) it stays queued in
+        // no line: counted, never on top, in its place by `key` once a client
+        // waits for it again.
         if (drv >= stamps.size()) {
             stamps.resize(size_t{drv} + 1, 0);
         }
@@ -558,6 +558,17 @@ struct Assign
     std::vector<ClientId> clients;
 };
 
+// A chain's promise to come back for a build (Want.lease_id, Want.linger_s):
+// live while a client holding it follows the build, and for termMs once the
+// last such client left. Not Core::Lease, which names an assignment.
+struct ChainLease
+{
+    std::string id;     // "" for clients that declared a linger without an id
+    double termMs = 0;  // an id's latest declaration; without one, the longest
+    uint32_t links = 0; // followers holding it
+    double leftMs = 0;  // when its last holder left (links == 0)
+};
+
 struct Entry
 {
     std::string drvPath;
@@ -566,6 +577,9 @@ struct Entry
     std::vector<std::string> features; // required
     std::string featureKey;            // featureSetKey(features); fixed while queued
     std::vector<ClientId> followers;
+    // Followers holding a lease on it (at most one each), and which.
+    std::vector<std::pair<ClientId, std::string>> holders;
+    std::vector<ChainLease> leases;
     WorkerId worker = noWorker;
     uint64_t assignId = 0;
     double enqMs = 0;
@@ -573,6 +587,15 @@ struct Entry
     bool unplaceable = false; // as last told to the followers
     double holdDueMs = 0;     // when its latest hold ends
     std::vector<WorkerId> givers; // could not run it, latest last
+    // Its last follower gone at this time while a lease on it was live:
+    // kept, queued or assigned, until keptUntilMs (and not before its hold,
+    // holdDueMs, is over). Queued, it keeps its place
+    // but is not placed: no client would take the assignment.
+    std::optional<double> idleSinceMs;
+    double keptUntilMs = 0; // its key in Core::lingering while idleSinceMs
+    // The lease its last client held when that client's stream ended and
+    // its hold began, if any: that lease's Release ends the hold.
+    std::optional<std::string> holdLease;
 };
 
 // What a give-back says: the worker takes no builds at all right now, or it
@@ -688,6 +711,8 @@ public:
     {
         DrvId drv = 0;
         std::optional<std::pair<WorkerId, uint64_t>> assigned;
+        // It was kept with no follower for this long, until this Want.
+        std::optional<double> idleMs;
     };
 
     struct WantInfo
@@ -697,6 +722,8 @@ public:
         std::string_view system;
         std::vector<std::string> features;
         double cpHintMs = 0;
+        double lingerMs = 0;      // see Want.linger_s, capped by the caller
+        std::string_view leaseId; // see Want.lease_id
     };
 
     // Caller handled the cache-hit case already.
@@ -730,12 +757,25 @@ public:
                 serve(client, 1);
             }
         }
+        // A client back for a build kept for it: it follows the build again.
+        std::optional<double> idleMs;
+        if (slot->idleSinceMs) {
+            idleMs = nowMs - *slot->idleSinceMs;
+            unkeep(drv, *slot);
+        }
+        // A lease released meanwhile keeps nothing, nor holds anything for
+        // this client's return: it is on its way out, or its chain was stopped.
+        if (wasReleased(info.leaseId, nowMs)) {
+            releasedClients.insert(client);
+        } else if (info.lingerMs > 0) {
+            hold(drv, *slot, client, info.leaseId, info.lingerMs);
+        }
         slot->cpHint = std::max(slot->cpHint, cpHintMs);
         if (slot->worker != noWorker) {
-            return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId)};
+            return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId), .idleMs = idleMs};
         }
         enqueue(drv);
-        return {.drv = drv};
+        return {.drv = drv, .assigned = {}, .idleMs = idleMs};
     }
 
     // The drv's only client could not use its assignment: the drv is placed
@@ -760,42 +800,16 @@ public:
         return wid;
     }
 
-    // Worker to Revoke on, if the last follower left an assigned drv.
-    auto cancel(ClientId client, std::string_view drvPath) -> std::optional<WorkerId>
+    // Worker to Revoke on, if the last follower cancelled an assigned drv
+    // that no lease keeps. A Cancel says the client no longer wants it: the
+    // lease it held on it ends, unless another of its clients still holds it.
+    auto cancel(ClientId client, std::string_view drvPath, double nowMs) -> std::optional<WorkerId>
     {
         auto found = findDrv(drvPath);
         if (!found) {
             return std::nullopt;
         }
-        return cancel(client, *found);
-    }
-
-    // `follows[client]` keeps the id until clientGone; a stale id there is
-    // harmless because followers is checked, and cheaper than a linear erase per
-    // cancel.
-    auto cancel(ClientId client, DrvId drv) -> std::optional<WorkerId> // NOLINT(bugprone-easily-swappable-parameters)
-    {
-        if (drv >= entries.size()) {
-            return std::nullopt;
-        }
-        auto & slot = entries.at(drv);
-        if (!slot || std::erase(slot->followers, client) == 0) {
-            return std::nullopt;
-        }
-        if (slot->worker != noWorker) {
-            serve(client, -1);
-        }
-        if (!slot->followers.empty()) {
-            if (slot->worker == noWorker) {
-                enqueue(drv);
-            }
-            return std::nullopt;
-        }
-        if (slot->worker == noWorker) {
-            retire(drv);
-            return std::nullopt;
-        }
-        return slot->worker;
+        return leave(client, *found, nowMs, Departure::cancelled).revoke;
     }
 
     // Before the client's first want.
@@ -813,16 +827,22 @@ public:
         ownerOf.emplace(client, iter->second);
     }
 
-    // A placed drv nobody else waits for is held for the client's return.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then when.
-    void clientGone(ClientId client, double nowMs)
+    // A client's stream ended. `kept`: drvs whose last follower this was,
+    // kept for a lease; `revokes`: assigned drvs whose last follower this
+    // was, neither kept nor held (a client of a released lease). The others
+    // are held for its return (holdMs).
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    void clientGone(ClientId client, double nowMs, std::vector<std::pair<DrvId, WorkerId>> & revokes, std::vector<DrvId> & kept)
     {
         if (auto const iter = follows.find(client); iter != follows.end()) {
             auto const drvs = std::move(iter->second);
             follows.erase(iter);
             for (auto const drv : drvs) {
-                if (cancel(client, drv)) {
-                    hold(drv, nowMs);
+                auto const left = leave(client, drv, nowMs, Departure::gone);
+                if (left.revoke) {
+                    revokes.emplace_back(drv, *left.revoke);
+                } else if (left.kept) {
+                    kept.push_back(drv);
                 }
             }
             for (auto & [name, state] : systems) {
@@ -836,6 +856,89 @@ public:
             }
             ownerOf.erase(iter);
         }
+        releasedClients.erase(client);
+    }
+
+    // Drvs kept with no follower whose last lease and hold are over by
+    // `nowMs`: a queued one is forgotten (returned, by path), an assigned one
+    // gets the worker to Revoke it on and stays assigned until its Done.
+    auto expireLingers(double nowMs, std::vector<std::pair<DrvId, WorkerId>> & revokes) -> std::vector<std::string>
+    {
+        std::vector<std::string> forgotten;
+        while (!lingering.empty() && lingering.begin()->first <= nowMs) {
+            auto const [until, drv] = *lingering.begin();
+            auto & slot = entries.at(drv);
+            if (!slot || !slot->idleSinceMs || slot->keptUntilMs != until) {
+                lingering.erase(lingering.begin()); // stale
+                continue;
+            }
+            if (!keep(drv, *slot, nowMs)) {
+                if (slot->worker == noWorker) {
+                    forgotten.push_back(slot->drvPath);
+                }
+                letGo(drv, revokes);
+            }
+        }
+        while (!releasedBy.empty() && releasedBy.begin()->first <= nowMs) {
+            released.erase(releasedBy.begin()->second);
+            releasedBy.erase(releasedBy.begin());
+        }
+        return forgotten;
+    }
+
+    // A chain is over (Release): lease `lease` ends on every build. One it
+    // alone kept is forgotten if queued and revoked (into `revokes`) if
+    // assigned, its hold ended too, as nobody of the chain comes
+    // back for it; one followed by a client of it runs on for that client but
+    // is no longer kept for the lease once it leaves, nor held then.
+    // Until `untilMs` a Want
+    // with the lease keeps nothing, so a link still on its way out cannot
+    // renew it. The number of builds that held it.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    auto release(std::string_view lease, double nowMs, double untilMs, std::vector<std::pair<DrvId, WorkerId>> & revokes) -> size_t
+    {
+        if (lease.empty()) {
+            return 0; // a linger without an id: nobody can name it
+        }
+        rememberReleased(std::string(lease), untilMs);
+        auto const found = leaseDrvs.find(std::string(lease));
+        if (found == leaseDrvs.end()) {
+            return 0;
+        }
+        auto const drvs = std::move(found->second);
+        leaseDrvs.erase(found);
+        size_t held = 0;
+        for (auto const drv : drvs) {
+            auto & slot = entries.at(drv);
+            if (!slot) {
+                continue;
+            }
+            auto const lse = std::ranges::find(slot->leases, lease, &ChainLease::id);
+            if (lse == slot->leases.end()) {
+                continue;
+            }
+            held++;
+            std::erase_if(slot->holders, [&](const auto & holder) -> bool {
+                if (holder.second != lease) {
+                    return false;
+                }
+                releasedClients.insert(holder.first);
+                return true;
+            });
+            slot->leases.erase(lse); // unindexed above
+            bool const endsHold = slot->holdLease == lease; // the hold of a client of this lease
+            if (endsHold) {
+                endClientHold(*slot);
+            }
+            // One another hold still keeps is revoked when that hold ends (expire).
+            if (slot->followers.empty() && (slot->idleSinceMs || endsHold)) {
+                bool const kept = slot->idleSinceMs && keep(drv, *slot, nowMs);
+                if (!kept && slot->holdDueMs <= nowMs) {
+                    letGo(drv, revokes);
+                }
+            }
+        }
+        return held;
     }
 
     struct HelloInfo
@@ -1040,7 +1143,8 @@ public:
                 std::erase(wkr.running, held.drv);
                 unplace(held.drv);
                 requeued = true;
-            } else if (slot->followers.empty()) {
+            } else if (slot->followers.empty() && !slot->idleSinceMs) {
+                // One kept for a lease ends with its lease (expireLingers).
                 revokes.emplace_back(slot->worker, slot->drvPath);
             }
         }
@@ -1138,6 +1242,10 @@ public:
         // Keyed by what the derivation requires.
         size_t queued = 0;      // wanted, not placed
         size_t unplaceable = 0; // of those, no connected worker could ever run it
+        // Kept with no follower for a lease or a reconnect: an assigned one is
+        // in `running` too, it holds its slot; a queued one is not in
+        // `queued`, nobody wants it placed until its client is back.
+        size_t lingering = 0;
         // Keyed by what the worker offers (native system).
         size_t running = 0; // assigned, until the worker's Done
         size_t slots = 0;   // maxJobs of workers that take work
@@ -1189,7 +1297,13 @@ public:
         // placeable() is O(workers). Entries sharing system+features share the answer.
         std::map<StatsKey, bool> memo;
         for (const auto & slot : entries) {
-            if (!slot || slot->followers.empty() || slot->worker != noWorker) {
+            if (!slot) {
+                continue;
+            }
+            if (slot->idleSinceMs) {
+                out[{.system = slot->system, .features = featureKey(slot->features)}].lingering++;
+            }
+            if (slot->followers.empty() || slot->worker != noWorker) {
                 continue;
             }
             const StatsKey key{.system = slot->system, .features = featureKey(slot->features)};
@@ -1224,6 +1338,10 @@ public:
     static constexpr size_t initialEntries = 1U << 16U;
 
 private:
+    // tests/lease-invariants-test.cc checks the lease bookkeeping below
+    // against itself.
+    friend struct LeaseInvariants;
+
     Config cfg;
     PathMap<DrvId> drvIds; // live entries only
     std::vector<DrvId> freeIds;
@@ -1239,6 +1357,19 @@ private:
     };
     std::unordered_map<std::string, SystemState> systems;
     std::unordered_map<ClientId, std::vector<DrvId>> follows;
+    // Drvs kept with no follower, by when their last lease ends (keptUntilMs).
+    std::set<std::pair<double, DrvId>> lingering;
+    // Drvs each named lease is on, for Release.
+    std::unordered_map<std::string, std::vector<DrvId>> leaseDrvs;
+    // Released leases, until when a Want with one keeps nothing; and by that time.
+    std::unordered_map<std::string, double> released;
+    std::set<std::pair<double, std::string>> releasedBy;
+    // Clients that held a lease when it was released: nobody of their chain
+    // comes back, so their stream's end gets no hold.
+    std::unordered_set<ClientId> releasedClients;
+    // Ids come from the network: past this many, the oldest is forgotten
+    // early, which only lets a stray Want of its chain keep a build again.
+    static constexpr size_t maxReleased = 1U << 16U;
     // Output path -> who built it last, for input locality. A tie-breaker
     // only, so on overflow the table is simply dropped.
     PathMap<std::pair<WorkerId, uint64_t>> lastBuilder;
@@ -1301,6 +1432,213 @@ private:
         }
     }
 
+    struct Leave
+    {
+        std::optional<WorkerId> revoke; // its last follower left: stop it there
+        bool kept = false;              // its last follower left: kept for a lease or a reconnect
+    };
+
+    // Why a client no longer follows a drv.
+    enum class Departure : uint8_t {
+        gone,      // its stream ended: its lease counts from now, and it may reconnect
+        cancelled, // it said it no longer wants the drv (Cancel): its lease there ends
+    };
+
+    // `client` no longer follows `drv`. A drv whose last follower that was
+    // is forgotten if queued and revoked if assigned, unless a lease on it
+    // is live, or its stream ended while it was assigned (held for holdMs):
+    // then it stays as it is until the last one is over.
+    // `follows[client]` keeps the id until clientGone; a stale id there is
+    // harmless because followers is checked, and cheaper than a linear erase per
+    // cancel.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    auto leave(ClientId client, DrvId drv, double nowMs, Departure why) -> Leave
+    {
+        if (drv >= entries.size()) {
+            return {};
+        }
+        auto & slot = entries.at(drv);
+        if (!slot || std::erase(slot->followers, client) == 0) {
+            return {};
+        }
+        if (slot->worker != noWorker) {
+            serve(client, -1);
+        }
+        auto held = unhold(drv, *slot, client, nowMs, why);
+        if (!slot->followers.empty()) {
+            if (slot->worker == noWorker) {
+                enqueue(drv);
+            }
+            return {};
+        }
+        // Not for a client of a released lease: its chain said nobody comes back.
+        if (why == Departure::gone && slot->worker != noWorker && !releasedClients.contains(client)) {
+            hold(drv, nowMs);
+            slot->holdLease = std::move(held);
+        }
+        if (keep(drv, *slot, nowMs)) {
+            return {.kept = true};
+        }
+        if (slot->worker == noWorker) {
+            retire(drv);
+            return {};
+        }
+        if (why == Departure::gone && slot->holdDueMs > nowMs) {
+            return {}; // held: revoked when its hold ends (expire)
+        }
+        return {.revoke = slot->worker};
+    }
+
+    // `client` holds lease `lease` on `drv` from its Want: one lease per
+    // client, its first.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    void hold(DrvId drv, Entry & ent, ClientId client, std::string_view lease, double termMs)
+    {
+        if (std::ranges::any_of(ent.holders, [&](const auto & holder) -> bool { return holder.first == client; })) {
+            return;
+        }
+        auto lse = std::ranges::find(ent.leases, lease, &ChainLease::id);
+        if (lse == ent.leases.end()) {
+            ent.leases.push_back(ChainLease{.id = std::string(lease)});
+            lse = std::prev(ent.leases.end());
+            if (!lease.empty()) {
+                leaseDrvs[std::string(lease)].push_back(drv);
+            }
+        }
+        // An id is one chain, whose latest link says how long; without one
+        // there is nobody to say less, so the longest counts.
+        lse->termMs = lease.empty() ? std::max(lse->termMs, termMs) : termMs;
+        lse->links++;
+        ent.holders.emplace_back(client, std::string(lease));
+    }
+
+    // `client` left `drv`: the lease it held there counts from now, or ends
+    // there if it cancelled and none of its other clients holds it.
+    // The lease it held there, if any.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    auto unhold(DrvId drv, Entry & ent, ClientId client, double nowMs, Departure why) -> std::optional<std::string>
+    {
+        auto const holder =
+            std::ranges::find_if(ent.holders, [&](const auto & held) -> bool { return held.first == client; });
+        if (holder == ent.holders.end()) {
+            return std::nullopt;
+        }
+        auto lease = std::move(holder->second);
+        ent.holders.erase(holder);
+        auto const lse = std::ranges::find(ent.leases, lease, &ChainLease::id);
+        if (lse == ent.leases.end() || --lse->links > 0) {
+            return lease;
+        }
+        lse->leftMs = nowMs;
+        if (why == Departure::cancelled) {
+            dropLease(drv, ent, lse);
+        }
+        return lease;
+    }
+
+    // With no follower: kept, or kept on, while a lease on it is live, and
+    // then until its hold is over too. Leases over by `nowMs` are dropped. False if nothing
+    // keeps it any more.
+    auto keep(DrvId drv, Entry & ent, double nowMs) -> bool
+    {
+        if (ent.idleSinceMs) {
+            lingering.erase({ent.keptUntilMs, drv});
+        }
+        double until = 0;
+        for (auto lse = ent.leases.begin(); lse != ent.leases.end();) {
+            if (lse->links == 0 && lse->leftMs + lse->termMs <= nowMs) {
+                lse = dropLease(drv, ent, lse);
+            } else {
+                until = std::max(until, lse->leftMs + lse->termMs);
+                ++lse;
+            }
+        }
+        // Only a lease keeps a build; a hold (holdMs) alone does not, but a
+        // kept build stays kept until its hold is over too.
+        if (until <= nowMs) {
+            ent.idleSinceMs.reset();
+            return false;
+        }
+        until = std::max(until, ent.holdDueMs);
+        if (!ent.idleSinceMs) {
+            ent.idleSinceMs = nowMs;
+        }
+        ent.keptUntilMs = until;
+        lingering.emplace(until, drv);
+        return true;
+    }
+
+    // It has a follower again, or is gone: no longer kept for its leases,
+    // which it still carries.
+    void unkeep(DrvId drv, Entry & ent)
+    {
+        endClientHold(ent);
+        if (ent.idleSinceMs) {
+            lingering.erase({ent.keptUntilMs, drv});
+            ent.idleSinceMs.reset();
+        }
+    }
+
+    // The hold for a client's return is over. One on a worker that is down
+    // is that worker's hold too (workerGone): it plays out, and expire queues
+    // the drv again.
+    void endClientHold(Entry & ent)
+    {
+        ent.holdLease.reset();
+        if (ent.worker == noWorker || workers.at(ent.worker).up) {
+            ent.holdDueMs = 0;
+        }
+    }
+
+    // No follower and nothing keeps it: forget it if queued, revoke it if assigned.
+    void letGo(DrvId drv, std::vector<std::pair<DrvId, WorkerId>> & revokes)
+    {
+        auto & slot = entries.at(drv);
+        if (!slot) {
+            return;
+        }
+        if (slot->worker == noWorker) {
+            retire(drv);
+            return;
+        }
+        revokes.emplace_back(drv, slot->worker);
+    }
+
+    auto dropLease(DrvId drv, Entry & ent, std::vector<ChainLease>::iterator lse) -> std::vector<ChainLease>::iterator
+    {
+        if (!lse->id.empty()) {
+            if (auto const found = leaseDrvs.find(lse->id); found != leaseDrvs.end()) {
+                std::erase(found->second, drv);
+                if (found->second.empty()) {
+                    leaseDrvs.erase(found);
+                }
+            }
+        }
+        return ent.leases.erase(lse);
+    }
+
+    void rememberReleased(std::string lease, double untilMs)
+    {
+        if (auto const old = released.find(lease); old != released.end()) {
+            releasedBy.erase({old->second, lease});
+            released.erase(old);
+        } else if (released.size() >= maxReleased) {
+            released.erase(releasedBy.begin()->second);
+            releasedBy.erase(releasedBy.begin());
+        }
+        releasedBy.emplace(untilMs, lease);
+        released.emplace(std::move(lease), untilMs);
+    }
+
+    [[nodiscard]] auto wasReleased(std::string_view lease, double nowMs) const -> bool
+    {
+        if (lease.empty()) {
+            return false;
+        }
+        auto const found = released.find(std::string(lease));
+        return found != released.end() && found->second > nowMs;
+    }
+
     // Entry is finished or abandoned: free the slot and its id for reuse.
     // Frees the worker's slot if the lease is the drv's current assignment.
     auto release(Lease lease) -> std::optional<DrvId>
@@ -1326,7 +1664,8 @@ private:
             return;
         }
         place(*slot, noWorker);
-        if (slot->followers.empty()) {
+        // Kept for a client that will be back: in its place for it.
+        if (slot->followers.empty() && !slot->idleSinceMs) {
             retire(drv);
         } else {
             enqueue(drv);
@@ -1368,6 +1707,10 @@ private:
         auto & slot = entries.at(drv);
         if (!slot) {
             return;
+        }
+        unkeep(drv, *slot);
+        while (!slot->leases.empty()) {
+            dropLease(drv, *slot, slot->leases.begin());
         }
         auto const iter = systems.find(slot->system);
         place(*slot, noWorker);
@@ -1448,6 +1791,11 @@ private:
         auto const drv = queue.top().value_or(0);
         auto & slot = entries.at(drv);
         queue.erase(drv, slot ? slot->featureKey : std::string());
+        if (slot && slot->followers.empty() && slot->worker == noWorker && slot->idleSinceMs) {
+            // Kept for a client that will be back: in its place, not placed.
+            pass.skipped.push_back(drv);
+            return;
+        }
         if (!slot || slot->followers.empty() || slot->worker != noWorker) {
             if (slot && slot->followers.empty() && slot->worker == noWorker) {
                 retire(drv); // stale

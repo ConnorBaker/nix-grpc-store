@@ -1,9 +1,11 @@
 #pragma once
 // Prometheus metrics, served on --metrics-listen.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -19,6 +21,7 @@ namespace nixgrpc {
 class Metrics
 {
     std::shared_ptr<prometheus::Registry> registry = std::make_shared<prometheus::Registry>();
+    std::string listen;
     std::unique_ptr<prometheus::Exposer> exposer;
 
     prometheus::Family<prometheus::Counter> * rpcs =
@@ -100,7 +103,7 @@ class Metrics
     prometheus::Family<prometheus::Gauge> * schedSystemFam =
         &prometheus::BuildGauge()
              .Name("nix_grpc_sched_system")
-             .Help("Scheduler state per system and feature set: queued, unplaceable, running, slots, free")
+             .Help("Scheduler state per system and feature set: queued, unplaceable, running, slots, free, lingering")
              .Register(*registry);
     // Touched on every scheduler message; Family::Add hashes the label map each time.
     prometheus::Gauge * schedQueuedGauge = &sched->Add({{"kind", "queued"}});
@@ -305,6 +308,24 @@ public:
     {
         schedSystemFam->Remove(gauge);
     }
+    // The nix_grpc_sched_system series with these labels, if exported.
+    [[nodiscard]] auto schedSystemNow(std::string_view system, std::string_view features, std::string_view kind) const
+        -> std::optional<double>
+    {
+        for (const auto & family : schedSystemFam->Collect()) {
+            for (const auto & metric : family.metric) {
+                auto const has = [&](std::string_view name, std::string_view value) -> bool {
+                    return std::ranges::any_of(metric.label, [&](const prometheus::ClientMetric::Label & label) -> bool {
+                        return label.name == name && label.value == value;
+                    });
+                };
+                if (has("system", system) && has("features", features) && has("kind", kind)) {
+                    return metric.gauge.value;
+                }
+            }
+        }
+        return std::nullopt;
+    }
 
     void schedClients(int delta) const
     {
@@ -312,9 +333,19 @@ public:
     }
 
     // `listen` empty: keep counting but do not serve /metrics.
-    explicit Metrics(const std::string & listen)
+    explicit Metrics(std::string listen)
+        : listen(std::move(listen))
     {
-        if (!listen.empty()) {
+        serve(true);
+    }
+
+    // Off frees the port for a successor taking over, on serves again if the
+    // takeover failed. From one thread.
+    void serve(bool serving)
+    {
+        if (!serving) {
+            exposer.reset();
+        } else if (!exposer && !listen.empty()) {
             exposer = std::make_unique<prometheus::Exposer>(listen);
             exposer->RegisterCollectable(registry);
         }

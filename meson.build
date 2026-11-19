@@ -207,6 +207,7 @@ if build_server
     'src/daemon/options.cc',
     'src/daemon/tunnel.cc',
     'src/daemon/tunnels.cc',
+    'src/daemon/takeover.cc',
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
 
@@ -302,6 +303,12 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('lease-invariants', executable('lease-invariants-test',
+    sources : ['tests/lease-invariants-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep] + absl_dep,
+  ))
+
   test('dispatcher', executable('dispatcher-test',
     sources : ['tests/dispatcher-test.cc'],
     include_directories : [include_directories('src/client')],
@@ -347,6 +354,13 @@ if build_server
       dependencies : [nix_util_dep],
       cpp_args : ['-UNDEBUG'],
     ))
+
+    test('takeover', executable('takeover-test',
+      sources : ['tests/takeover-test.cc', 'src/daemon/takeover.cc'],
+      include_directories : [src_inc, include_directories('src/daemon')],
+      dependencies : [nix_util_dep, threads_dep],
+      cpp_args : ['-UNDEBUG'],
+    ), timeout : 60)
   endif
 
   test('acl', executable('acl-test',
