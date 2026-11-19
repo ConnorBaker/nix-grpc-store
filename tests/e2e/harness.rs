@@ -261,6 +261,12 @@ pub fn unit_state(node: Node, unit: &str) -> String {
         .to_string()
 }
 
+/// Inactive or failed: a unit still deactivating, or activating, runs yet,
+/// though `systemctl is-active` says it is not active.
+pub fn ended(node: Node, unit: &str) -> bool {
+    matches!(unit_state(node, unit).as_str(), "inactive" | "failed")
+}
+
 pub fn journal(node: Node, unit: &str) -> String {
     query(node, &["journalctl", "-u", unit, "--no-pager"])
 }
@@ -418,7 +424,7 @@ pub fn retry(clients: &[(Node, &str)], what: &str, mut f: impl FnMut() -> bool) 
         if f() {
             return;
         }
-        if let Some(&(node, c)) = clients.iter().find(|&&(node, c)| unit_state(node, c) != "active") {
+        if let Some(&(node, c)) = clients.iter().find(|&&(node, c)| ended(node, c)) {
             // It may have brought the state about just before it ended.
             if f() {
                 return;

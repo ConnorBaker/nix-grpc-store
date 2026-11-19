@@ -459,7 +459,7 @@ pkgs.testers.runNixOSTest {
         wait_succeeds(machine, f"! kubectl -n farm get pod {lb_pod}")
         rollout("nix-grpc-farm-lb")
         release("lb1", pods, "vialb")
-        wait_succeeds(machine, "! systemctl is-active vialb")
+        wait_until("vialb ended", lambda: ended(machine, "vialb"))
         machine.succeed("systemctl show -p Result --value vialb | grep -qx success || { journalctl -u vialb >&2; false; }")
 
     with subtest("deleting a worker pod mid-build drains it: the build finishes there and publishes"):
@@ -475,7 +475,7 @@ pkgs.testers.runNixOSTest {
         wait_stream(machine, f"kubectl -n farm logs -f {busy} -c nix-grpc-daemon", "event=draining( |$)")
         assert holder() == busy, "pod delete killed the build instead of draining"
         release("s1", [busy], "slow")
-        wait_succeeds(machine, "! systemctl is-active slow")
+        wait_until("slow ended", lambda: ended(machine, "slow"))
         machine.succeed("systemctl show -p Result --value slow | grep -qx success || { journalctl -u slow >&2; false; }")
         machine.fail("journalctl -u slow | grep -q 'asking the scheduler again'")
         narinfo = out_path("${slowExpr}", "s1").removeprefix("/nix/store/").split("-")[0] + ".narinfo"

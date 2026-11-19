@@ -77,16 +77,11 @@ fn spawn_slow(unit: &str, store: &str, tag: &str) {
 /// Lets `tag`'s slow build, built again unless the client gave up or got
 /// it already, end, and checks that `unit`'s client got `out` into `store`.
 fn finish_slow(unit: &str, store: &str, tag: &str, out: &str) {
-    wait_until_succeeds(&[
-        "sh",
-        "-c",
-        r#"pgrep -f "$1" || ! systemctl is-active -q "$2""#,
-        "sh",
-        &slow(tag),
-        unit,
-    ]);
+    retry(&[], &format!("{tag} runs, or {unit} ended"), || {
+        run(&["pgrep", "-f", &slow(tag)]).code == 0 || ended(unit)
+    });
     run(&["pkill", "-f", &slow(tag)]);
-    wait_until_succeeds(&["sh", "-c", r#"! systemctl is-active -q "$1""#, "sh", unit]);
+    retry(&[], &format!("{unit} ended"), || ended(unit));
     assert_eq!(unit_result(MACHINE, unit), "success", "{}", journal(MACHINE, unit));
     assert_eq!(
         succeed(&["nix", "store", "cat", "--store", store, out]).trim(),
@@ -250,7 +245,7 @@ fn a_floating_output_the_gc_took_before_an_attached_client_held_it_is_built_agai
         let stopped = Stopped::new(vec![sessions[1].clone()]);
         succeed(&["pkill", "-f", &slow("share")]);
         stopped.wait_request();
-        wait_until_succeeds(&["sh", "-c", "! systemctl is-active -q floating-share-a"]);
+        retry(&[], "floating-share-a ended", || ended("floating-share-a"));
         assert_eq!(unit_result(MACHINE, "floating-share-a"), "success");
         succeed(&["kill", "-KILL", &sessions[0]]);
         wait_until_succeeds(&["nix", "store", "delete", &out]);

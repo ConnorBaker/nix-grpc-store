@@ -1504,7 +1504,7 @@ impl<F> Worker2Full<F> {
         let unit = format!("{}-build", self.busy);
         spawn(&unit, &[format!("{drv}^*").as_str()]);
         retry(&[], "worker2 gave the drv back, or the build ended", || {
-            given() > before || unit_state(CLIENT, &unit) != "active"
+            given() > before || ended(CLIENT, &unit)
         });
         assert!(build_calls(WORKER2) > calls, "worker2 never got the drv");
         assert!(given() > before, "worker2 did not give the drv back");
