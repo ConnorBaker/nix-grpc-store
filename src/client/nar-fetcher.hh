@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <ranges>
+#include <span>
 #include <nix/store/path.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
@@ -324,10 +325,10 @@ private:
 
         // At once, under the fetcher's lock: a path asked for meanwhile joins
         // before any of them failed, or starts over after all did.
-        void failPending(const std::exception_ptr & cause)
+        void fail(std::span<const Pending> items, const std::exception_ptr & cause)
         {
             std::scoped_lock const lock(narMutex);
-            for (const auto & item : pending) {
+            for (const auto & item : items) {
                 item.spool->fail(cause);
             }
         }
@@ -393,31 +394,30 @@ private:
                     // A path cut off mid-NAR cannot resume, but the ones not
                     // started yet can go on a fresh stream.
                     auto const cutOff = std::ranges::stable_partition(pending, &NarSpool::untouched, &Pending::spool);
-                    for (const auto & item : cutOff) {
-                        item.spool->fail(cause);
+                    bool const again = cutOff.begin() != pending.begin() && retry.shouldRetry(status, backoff);
+                    // Everything that fails now, in one step.
+                    fail(again ? std::span<const Pending>(cutOff) : pending, cause);
+                    if (!again) {
+                        return;
                     }
                     pending.erase(cutOff.begin(), cutOff.end());
-                    bool retrying = !pending.empty() && retry.shouldRetry(status, backoff);
-                    if (retrying) {
-                        nix::logger->log(
-                            nix::lvlError,
-                            nix::fmt("%s: FetchNars: %s, retrying %d paths", authority, status.error_message(),
-                                     pending.size()));
-                        std::condition_variable_any wake;
-                        std::mutex sleepMutex;
-                        std::unique_lock sleepLock(sleepMutex);
-                        // Returns early only when the fetcher shuts down.
-                        wake.wait_for(sleepLock, stop, backoff.next(), [] -> bool { return false; });
-                        retrying = !stop.stop_requested();
-                    }
-                    if (!retrying) {
-                        failPending(cause);
+                    nix::logger->log(
+                        nix::lvlError,
+                        nix::fmt("%s: FetchNars: %s, retrying %d paths", authority, status.error_message(),
+                                 pending.size()));
+                    std::condition_variable_any wake;
+                    std::mutex sleepMutex;
+                    std::unique_lock sleepLock(sleepMutex);
+                    // Returns early only when the fetcher shuts down.
+                    wake.wait_for(sleepLock, stop, backoff.next(), [] -> bool { return false; });
+                    if (stop.stop_requested()) {
+                        fail(pending, cause);
                         return;
                     }
                 }
             } catch (...) {
                 releaseCall();
-                failPending(std::current_exception());
+                fail(pending, std::current_exception());
             }
         }
     };
