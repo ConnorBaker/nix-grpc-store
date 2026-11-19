@@ -6,9 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -22,6 +24,7 @@
 
 #include <nix/store/path.hh>
 #include <nix/util/error.hh>
+#include <nix/util/logging.hh>
 #include <nix/util/serialise.hh>
 
 #include "nar-fetcher.hh"
@@ -280,6 +283,61 @@ void finishedSessionsGo()
     }
 }
 
+// What the fetcher logs.
+class Recorder final : public nix::Logger
+{
+public:
+    void log(nix::Verbosity /*lvl*/, std::string_view msg) noexcept override
+    {
+        std::scoped_lock const lock(mutex);
+        lines.emplace_back(msg);
+    }
+
+    void logEI(const nix::ErrorInfo & /*info*/) noexcept override {}
+
+    [[nodiscard]] auto logged() -> std::vector<std::string>
+    {
+        std::scoped_lock const lock(mutex);
+        return lines;
+    }
+
+private:
+    std::mutex mutex;
+    std::vector<std::string> lines;
+};
+
+// A fetcher destroyed while a session still waits for a path cancels that
+// call itself. That ends it CANCELLED "Stream removed (CANCELLED)", which
+// the store's policy takes for a broken stream, or with a bare "CANCELLED"
+// before the stream started, which it takes for a daemon gone away
+// (retry.hh). The session gives up without retrying, or saying it does.
+void destroyedFetcherGivesUpQuietly()
+{
+    std::latch released{1};
+    Fixture fix([&](int, const auto & request, auto & writer) -> grpc::Status {
+        sendNar(writer, 0, narOf(request.paths(0)));
+        released.wait();
+        return grpc::Status::OK;
+    });
+    Recorder recorder;
+    auto * const saved = nix::logger;
+    nix::logger = &recorder;
+    auto fetcher = fix.fetcher({
+        // As the store's (store.cc).
+        .retryable = [](const grpc::Status & status) -> bool {
+            return nixgrpc::goneAway(status) || nixgrpc::streamBroken(status);
+        },
+        .budget = [] -> std::chrono::milliseconds { return retryBudget; },
+    });
+    fetcher->recordOrder({pathA(), pathB()}, {});
+    assert(fetch(*fetcher, pathA()) == narOf(std::string(pathA().to_string())));
+    fetcher.reset();
+    released.count_down();
+    nix::logger = saved;
+    assert(recorder.logged().empty());
+    assert(fix.service.calls() == 1);
+}
+
 } // namespace
 
 auto main() -> int
@@ -290,6 +348,7 @@ try {
     nonRetryableFailsAtOnce();
     rerecordedPathIsFetchedOnce();
     finishedSessionsGo();
+    destroyedFetcherGivesUpQuietly();
     return 0;
 } catch (...) {
     return 1;

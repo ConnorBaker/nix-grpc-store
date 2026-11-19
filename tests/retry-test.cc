@@ -2,8 +2,10 @@
 
 #include <cassert>
 #include <chrono>
+#include <future>
 #include <iostream>
 #include <latch>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -48,7 +50,8 @@ void classifiesFarmErrors()
     assert(nixgrpc::goneAway(unavailable("no healthy upstream")));
     // A call that reached a daemon as it exited idle, before any handler took it.
     assert(nixgrpc::goneAway({grpc::StatusCode::CANCELLED, ""}));
-    assert(!nixgrpc::goneAway({grpc::StatusCode::CANCELLED, "Cancelled by build hook"}));
+    // The NAR fetcher's own status once it shut down (nar-fetcher.hh).
+    assert(!nixgrpc::goneAway({grpc::StatusCode::CANCELLED, "NAR fetcher shut down"}));
     assert(nixgrpc::streamBroken({grpc::StatusCode::UNKNOWN, "Stream removed (Socket closed)"}));
 }
 
@@ -185,6 +188,88 @@ void classifiesAWorkerThatLeft()
     }
 }
 
+// A server on which no handler ever takes QueryValidPaths.
+class StoreInfoOnly final : public nix::remote::NixRemote::WithAsyncMethod_QueryValidPaths<nix::remote::NixRemote::Service>
+{
+public:
+    auto StoreInfo(grpc::ServerContext * /*ctx*/, const nix::remote::StoreInfoRequest * /*request*/,
+                   nix::remote::StoreInfoReply * /*reply*/) -> grpc::Status override
+    {
+        return grpc::Status::OK;
+    }
+};
+
+struct HeldQuery
+{
+    StoreInfoOnly service;
+    std::unique_ptr<grpc::ServerCompletionQueue> queue;
+    std::unique_ptr<grpc::Server> server;
+    std::unique_ptr<nix::remote::NixRemote::Stub> stub;
+    grpc::ClientContext ctx;
+    nix::remote::QueryValidPathsRequest request;
+    nix::remote::QueryValidPathsReply reply;
+    std::promise<grpc::Status> ended;
+
+    // Returns once the server has the query.
+    HeldQuery()
+    {
+        grpc::ServerBuilder builder;
+        int port = 0;
+        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+        builder.RegisterService(&service);
+        queue = builder.AddCompletionQueue();
+        server = builder.BuildAndStart();
+        assert(server);
+        stub = nix::remote::NixRemote::NewStub(
+            grpc::CreateChannel("127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
+        stub->async()->QueryValidPaths(&ctx, &request, &reply,
+                                       [this](const grpc::Status & status) -> void { ended.set_value(status); });
+        // Same connection, so the server has the query once it answers this.
+        grpc::ClientContext infoCtx;
+        nix::remote::StoreInfoReply info;
+        assert(stub->StoreInfo(&infoCtx, nix::remote::StoreInfoRequest{}, &info).ok());
+    }
+
+    HeldQuery(const HeldQuery &) = delete;
+    HeldQuery(HeldQuery &&) = delete;
+    auto operator=(const HeldQuery &) -> HeldQuery & = delete;
+    auto operator=(HeldQuery &&) -> HeldQuery & = delete;
+
+    ~HeldQuery()
+    {
+        server->Shutdown();
+        queue->Shutdown();
+        void * tag = nullptr;
+        bool okay = false;
+        while (queue->Next(&tag, &okay)) {
+        }
+    }
+
+    auto status() -> grpc::Status { return ended.get_future().get(); }
+};
+
+// A daemon handing over to its successor calls Shutdown(). A call that had
+// arrived but that no handler had taken yet never ran, so it is retried.
+void retriesACallNoHandlerTookAtShutdown()
+{
+    HeldQuery held;
+    held.server->Shutdown();
+    auto const status = held.status();
+    assert(status.error_code() == grpc::StatusCode::CANCELLED);
+    assert(nixgrpc::goneAway(status));
+}
+
+// Our own cancel reads the same, so goneAway() takes it for one too: each
+// caller rules it out first.
+void ownCancelReadsAsGoneAway()
+{
+    HeldQuery held;
+    held.ctx.TryCancel();
+    auto const status = held.status();
+    assert(status.error_code() == grpc::StatusCode::CANCELLED && status.error_message() == "CANCELLED");
+    assert(nixgrpc::goneAway(status));
+}
+
 } // namespace
 
 auto main() -> int
@@ -193,6 +278,8 @@ try {
     classifiesWhatAWorkerAnswersApartFromCutOffs();
     callCutOffByALeavingWorkerIsRetried();
     classifiesAWorkerThatLeft();
+    retriesACallNoHandlerTookAtShutdown();
+    ownCancelReadsAsGoneAway();
     return 0;
 } catch (...) {
     return 1;

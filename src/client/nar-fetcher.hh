@@ -392,7 +392,8 @@ private:
                     // started yet can go on a fresh stream. Giving up fails
                     // them all at once (failAll), the cut-off ones included.
                     auto const cutOff = std::ranges::stable_partition(pending, &NarSpool::untouched, &Pending::spool);
-                    if (cutOff.begin() == pending.begin() || !fetcher.retry.shouldRetry(status, backoff)) {
+                    if (cutOff.begin() == pending.begin() || stop.stop_requested()
+                        || !fetcher.retry.shouldRetry(status, backoff)) {
                         failAll(pending, cause);
                         return;
                     }
