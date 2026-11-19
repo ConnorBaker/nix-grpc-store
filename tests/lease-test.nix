@@ -469,8 +469,9 @@ in
             check(not procs, f"the lease id is on a command line: {procs}")
             stopped_at = time.monotonic()
             client.succeed("systemctl stop --no-block stopme-chain")
-            # the chain ends once its release is answered, after the revoke
-            wait_journal(hub, "nix-grpc-daemon", "event=revoked_running ", "tt-stopme", clients=[(client, "stopme-chain")])
+            # the chain may end once its release is answered, before the
+            # revoke reaches the builder that logs it: the daemon writes the line
+            wait_journal(hub, "nix-grpc-daemon", "event=revoked_running ", "tt-stopme", clients=[(hub, "nix-grpc-daemon")])
             took = time.monotonic() - stopped_at
             wait_succeeds(client, f"test -s {stop}/status.json")
             status = json.loads(client.succeed(f"cat {stop}/status.json"))
