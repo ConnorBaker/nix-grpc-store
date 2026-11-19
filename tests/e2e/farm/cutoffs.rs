@@ -300,7 +300,9 @@ fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
     wait_members(&sys, &[gone]);
     // Socket-activated, so there is one to stop whichever tests ran before.
     succeed(gone, &["systemctl", "start", "nix-daemon.service"]);
-    succeed(gone, &["pkill", "-STOP", "-x", "nix-daemon"]);
+    // Every process of the unit: since NixOS/nix 54988dc41e a worker is a
+    // fresh exec, not named nix-daemon, which `pkill -x` passes over.
+    succeed(gone, &["systemctl", "kill", "--signal=STOP", "nix-daemon.service"]);
     // QueryMissing, or QueryValidPaths where Nix hands queryMissing its
     // evaluation store (NixOS/nix#16433): then the client walks the graph
     // itself and sends no QueryMissing.
@@ -344,7 +346,7 @@ fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
         ],
         60,
     );
-    succeed(gone, &["pkill", "-CONT", "-x", "nix-daemon"]);
+    succeed(gone, &["systemctl", "kill", "--signal=CONT", "nix-daemon.service"]);
     wait_unit_done("qm", 120);
     assert_unit_success("qm");
     // The server cancelled the query when it stopped, and the client asked
