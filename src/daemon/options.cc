@@ -29,7 +29,6 @@
 #include "logfmt.hh"
 #include "niks3-client.hh"
 #include "parse-int.hh"
-#include "scheduler.hh"
 #include "tunnel-protocol.hh"
 #include "tunnel.hh"
 #include "tunnels.hh"
@@ -212,8 +211,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.extraSystems.emplace_back(next());
         } else if (arg == "--max-jobs") {
             auto jobs = parseInt<unsigned>(next());
-            if (!jobs || *jobs < 1 || *jobs > static_cast<unsigned>(sched::FreeIndex::maxSlots)) {
-                throw nix::Error("--max-jobs expects an integer in 1..%d", sched::FreeIndex::maxSlots);
+            if (!jobs || *jobs < 1) {
+                throw nix::Error("--max-jobs expects a positive integer");
             }
             options.maxJobs = *jobs;
         } else if (arg == "--lookup-threads") {

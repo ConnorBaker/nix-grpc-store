@@ -72,8 +72,14 @@ void testFreeIndex()
     assert(fi.get(3) == -5 && *fi.emptiest() == 2);
     fi.set(2, 0);
     assert(!fi.emptiest());
-    fi.set(4, 100); // clamped bucket, value kept
+    fi.set(4, 100);
     assert(fi.get(4) == 100 && *fi.emptiest() == 4);
+    // Ties: the first in the count's bucket, a leaver's place taken by the last.
+    fi.set(0, 100);
+    fi.set(1, 100);
+    assert(*fi.emptiest() == 4);
+    fi.set(4, 99);
+    assert(*fi.emptiest() == 1);
 }
 
 auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector<std::string_view> & running = {}, std::vector<std::string> features = {}, std::vector<Core::Superseded> * superseded = nullptr) -> WorkerId
@@ -127,6 +133,26 @@ void testMostFreeAndLocality()
     shard.want(1, {.drvPath = "c.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.dispatch(out);
     assert(out.size() == 2 && out[1].worker == w0);
+}
+
+// By exact free count, with and without features alike, and past 2^31.
+void testMostFreeIsExact()
+{
+    Core shard;
+    std::vector<Assign> out;
+    hello(shard, "small", 100, {}, {"kvm"});
+    auto const big = hello(shard, "big", 1000, {}, {"kvm"});
+    shard.want(1, {.drvPath = "p.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.want(1, {.drvPath = "k.drv", .inputs = {}, .system = "x", .features = {"kvm"}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[0].worker == big && out[1].worker == big);
+    auto const a = hello(shard, "a", UINT32_MAX);
+    hello(shard, "b", UINT32_MAX);
+    for (int i = 0; i < 64; i++) {
+        shard.want(1, {.drvPath = std::to_string(i) + ".drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    }
+    shard.dispatch(out);
+    assert(out.size() == 66 && std::ranges::count(out, a, &Assign::worker) == 32);
 }
 
 void testPriority()
@@ -303,6 +329,7 @@ void testSetMaxJobs()
     assert(out.size() == 3 && shard.queued() == 0);
     // Shrunk below what runs: nothing new until the excess finishes.
     shard.setMaxJobs(w0, 1);
+    assert((shard.stats()[{.system = "x", .features = ""}].free == 0));
     shard.want(1, {.drvPath = "d.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.done(lease(shard, w0, "a.drv"), {});
     shard.done(lease(shard, w0, "b.drv"), {});
@@ -311,10 +338,17 @@ void testSetMaxJobs()
     shard.done(lease(shard, w0, "c.drv"), {});
     shard.dispatch(out);
     assert(out.size() == 4 && out[3].worker == w0);
-    // Clamped as Hello's is.
-    shard.setMaxJobs(w0, 1000);
-    auto sts = shard.stats();
-    assert((sts[{.system = "x", .features = ""}].slots == FreeIndex::maxSlots));
+    // As stated, past 63 and past int32.
+    shard.setMaxJobs(w0, 0);
+    auto const w1 = hello(shard, "w1", 100);
+    for (int i = 0; i < 150; i++) {
+        shard.want(1, {.drvPath = std::to_string(i) + ".drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    }
+    shard.dispatch(out);
+    assert(out.size() == 104);
+    shard.setMaxJobs(w1, UINT32_MAX);
+    shard.dispatch(out);
+    assert((out.size() == 154 && shard.stats()[{.system = "x", .features = ""}].slots == UINT32_MAX));
 }
 
 void testFeatures()
@@ -1429,6 +1463,7 @@ try {
     testReleaseKeepsAnotherClientsGrace();
     testDraining();
     testSetMaxJobs();
+    testMostFreeIsExact();
     testFeatures();
     testStuckFeatureSet();
     testFeatureSetsWithCommas();

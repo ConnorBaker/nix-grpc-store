@@ -25,6 +25,7 @@
 # usage: keepalive-test.py <nix-grpc-daemon>
 # exit 0: pass, 1: fail, 2: the test never reached the state it tests.
 import math
+import os
 import re
 import socket
 import struct
@@ -198,6 +199,13 @@ def show(vals):
 def main():
     daemon = sys.argv[1]
     tmp = tempfile.mkdtemp()
+    # Past the old cap of 63.
+    probe = subprocess.run([daemon, "--max-jobs", "100", "--no-such-flag"], capture_output=True, text=True)
+    if "unknown flag" not in probe.stderr:
+        print(f"FAIL: --max-jobs 100 refused: {probe.stderr}")
+        return 1
+    # max-jobs, but no more than the 128 auto-allocated uid slots.
+    os.environ["NIX_CONFIG"] = "max-jobs = 200\nextra-experimental-features = auto-allocate-uids\nauto-allocate-uids = true"
     proc, log = testdaemon.start(daemon, tmp)
 
     def daemon_log():
@@ -235,6 +243,8 @@ def main():
                 break
             time.sleep(0.2)
         print(f"before: {show(vals)}")
+        if "max_jobs=128" not in daemon_log():
+            return fail("not advertising min(max-jobs 200, 128 build user slots)")
         sock = socket.create_connection(("127.0.0.1", port))
         conn = Conn(sock)
 

@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -451,22 +450,18 @@ public:
     }
 };
 
-// Workers bucketed by free slot count: O(1) "most free" and O(1) update.
+// Workers bucketed by exact free slot count, none or fewer sharing bucket 0:
+// "most free" and update in O(log buckets).
 class FreeIndex
 {
-public:
-    static constexpr int32_t maxSlots = 63;
-
-private:
-    std::vector<int32_t> free; // may go negative (draining below running)
+    std::vector<int64_t> free; // may go negative (draining below running)
     std::vector<uint32_t> pos;
     std::vector<bool> tracked;
-    std::vector<std::vector<WorkerId>> byFree = std::vector<std::vector<WorkerId>>(maxSlots + 1);
-    uint64_t nonempty = 0;
+    std::map<int64_t, std::vector<WorkerId>> byFree;
 
-    [[nodiscard]] static auto bucket(int32_t val) -> size_t
+    [[nodiscard]] static auto bucket(int64_t val) -> int64_t
     {
-        return static_cast<size_t>(std::clamp<int32_t>(val, 0, maxSlots));
+        return std::max<int64_t>(val, 0);
     }
 
     void check(WorkerId wid) const
@@ -489,17 +484,16 @@ public:
             tracked.resize(wid + 1, false);
         }
         tracked.at(wid) = true;
-        pos.at(wid) = static_cast<uint32_t>(byFree.at(0).size());
-        byFree.at(0).push_back(wid);
-        nonempty |= uint64_t{1};
+        pos.at(wid) = static_cast<uint32_t>(byFree[0].size());
+        byFree[0].push_back(wid);
     }
 
-    [[nodiscard]] auto get(WorkerId wid) const -> int32_t
+    [[nodiscard]] auto get(WorkerId wid) const -> int64_t
     {
         return wid < free.size() ? free.at(wid) : 0;
     }
 
-    void set(WorkerId wid, int32_t val)
+    void set(WorkerId wid, int64_t val)
     {
         check(wid);
         auto const from = bucket(free.at(wid));
@@ -518,25 +512,24 @@ public:
         pos.at(last) = idx;
         src.pop_back();
         if (src.empty()) {
-            nonempty &= ~(uint64_t{1} << from);
+            byFree.erase(from);
         }
-        pos.at(wid) = static_cast<uint32_t>(byFree.at(dest).size());
-        byFree.at(dest).push_back(wid);
-        nonempty |= uint64_t{1} << dest;
+        auto & dst = byFree[dest];
+        pos.at(wid) = static_cast<uint32_t>(dst.size());
+        dst.push_back(wid);
     }
 
-    [[nodiscard]] auto maxFree() const -> int32_t
+    [[nodiscard]] auto maxFree() const -> int64_t
     {
-        return nonempty == 0 ? 0 : maxSlots - std::countl_zero(nonempty);
+        return byFree.empty() ? 0 : byFree.rbegin()->first;
     }
 
     [[nodiscard]] auto emptiest() const -> std::optional<WorkerId>
     {
-        auto const top = maxFree();
-        if (top <= 0 || byFree.at(static_cast<size_t>(top)).empty()) {
+        if (maxFree() <= 0) {
             return std::nullopt;
         }
-        return byFree.at(static_cast<size_t>(top)).front();
+        return byFree.rbegin()->second.front();
     }
 };
 
@@ -610,7 +603,7 @@ struct Worker
     std::string addr;
     std::vector<std::string> systems;
     std::vector<std::string> features;
-    int32_t maxJobs = 0;
+    uint32_t maxJobs = 0;
     bool up = false;
     bool draining = false;
     // Give-backs for a failure of its own since it last finished a build.
@@ -990,7 +983,7 @@ public:
             sys(name).free.push(wid);
         }
         wkr.features = info.features;
-        wkr.maxJobs = static_cast<int32_t>(std::min<uint32_t>(info.maxJobs, FreeIndex::maxSlots));
+        wkr.maxJobs = info.maxJobs;
         for (auto [path, assignId] : info.running) {
             auto const drv = drvId(path);
             auto & slot = entries.at(drv);
@@ -1125,7 +1118,7 @@ public:
     // and nothing new is placed until enough finish.
     void setMaxJobs(WorkerId wid, uint32_t maxJobs)
     {
-        workers.at(wid).maxJobs = static_cast<int32_t>(std::min<uint32_t>(maxJobs, FreeIndex::maxSlots));
+        workers.at(wid).maxJobs = maxJobs;
         refreshFree(wid);
     }
 
@@ -1312,8 +1305,8 @@ public:
             if (!wkr.takesWork()) {
                 continue;
             }
-            sst.slots += static_cast<size_t>(wkr.maxJobs);
-            sst.free += static_cast<size_t>(std::max(0, wkr.maxJobs - static_cast<int32_t>(wkr.running.size())));
+            sst.slots += wkr.maxJobs;
+            sst.free += wkr.maxJobs - std::min<size_t>(wkr.maxJobs, wkr.running.size());
         }
         // placeable() is O(workers). Entries sharing system+features share the answer.
         std::map<StatsKey, bool> memo;
@@ -1847,7 +1840,7 @@ private:
         out.push_back(Assign{.drv = drv, .worker = *wid, .assignId = slot->assignId, .clients = slot->followers});
     }
 
-    [[nodiscard]] auto freeOf(WorkerId wid) const -> int32_t
+    [[nodiscard]] auto freeOf(WorkerId wid) const -> int64_t
     {
         const auto & wkr = workers.at(wid);
         if (wkr.systems.empty()) {
@@ -1869,8 +1862,8 @@ private:
     void refreshFree(WorkerId wid)
     {
         auto const & wkr = workers.at(wid);
-        auto const running = static_cast<int32_t>(std::min<size_t>(wkr.running.size(), FreeIndex::maxSlots));
-        auto const val = wkr.takesWork() ? wkr.maxJobs - running : 0;
+        auto const running = static_cast<int64_t>(wkr.running.size());
+        auto const val = wkr.takesWork() ? int64_t{wkr.maxJobs} - running : 0;
         for (const auto & name : wkr.systems) {
             sys(name).free.set(wid, val);
         }
@@ -1962,7 +1955,7 @@ private:
         }
         const auto topFree = std::max(1.0, static_cast<double>(freeOf(*best)));
         auto const score = [&](WorkerId wid, double bytes) -> double {
-            return bytes + (cfg.locLambda * freeOf(wid) / topFree);
+            return bytes + (cfg.locLambda * static_cast<double>(freeOf(wid)) / topFree);
         };
         std::vector<std::pair<WorkerId, double>> cands;
         for (const auto & input : ent.inputs) {
