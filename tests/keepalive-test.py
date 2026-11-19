@@ -183,6 +183,13 @@ def main():
     port, mport = free_port(), free_port()
     tmp = tempfile.mkdtemp()
     log = open(os.path.join(tmp, "daemon.log"), "w+")
+    # Past the old cap of 63.
+    probe = subprocess.run([daemon, "--max-jobs", "100", "--no-such-flag"], capture_output=True, text=True)
+    if "unknown flag" not in probe.stderr:
+        print(f"FAIL: --max-jobs 100 refused: {probe.stderr}")
+        return 1
+    # max-jobs, but no more than the 128 auto-allocated uid slots.
+    conf = "max-jobs = 200\nextra-experimental-features = auto-allocate-uids\nauto-allocate-uids = true"
     proc = subprocess.Popen(
         [
             daemon,
@@ -190,6 +197,7 @@ def main():
             "--proxy-socket", os.path.join(tmp, "no-nix-daemon"),
             "--metrics-listen", f"127.0.0.1:{mport}",
         ],
+        env={**os.environ, "NIX_CONFIG": conf},
         stdout=log,
         stderr=subprocess.STDOUT,
     )
@@ -219,6 +227,8 @@ def main():
         else:
             return setup_fail(f"no in-process worker in the metrics: {show(vals)}")
         print(f"before: {show(vals)}")
+        if "max_jobs=128" not in daemon_log():
+            return fail("not advertising min(max-jobs 200, 128 build user slots)")
         sock = socket.create_connection(("127.0.0.1", port), timeout=5)
         conn = Conn(sock)
 

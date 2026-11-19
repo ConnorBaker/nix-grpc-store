@@ -4,6 +4,7 @@
 // NIX_COMPAT_VERSION_{MAJOR,MINOR} come from meson (version of the
 // `nix-store` pkg-config dependency).
 
+#include <algorithm>
 #include <concepts>
 #include <cstdint>
 #include <map>
@@ -485,7 +486,7 @@ public:
 // startup: fresh settings filled by Nix's own loader (nix.conf and its
 // includes, the user files, NIX_CONFIG). 2.36 moved max-jobs and friends into
 // a WorkerSettings base; there only that base is instantiated, so no other
-// setting's parser runs (or warns).
+// setting's parser runs (or warns). 0 (nix: no local builds) still takes one.
 inline auto configuredMaxBuildJobs() -> unsigned {
   constexpr auto load = []<typename S>(S &settings) -> unsigned {
     if constexpr (requires { settings.getWorkerSettings(); }) {
@@ -501,7 +502,7 @@ inline auto configuredMaxBuildJobs() -> unsigned {
       return fresh.maxBuildJobs;
     }
   };
-  return load(nix::settings);
+  return std::max(load(nix::settings), 1U);
 }
 
 // The worker's own `cores`. 2.36 moved it into LocalSettings.
