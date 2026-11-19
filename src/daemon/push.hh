@@ -35,8 +35,7 @@
 namespace nixgrpc {
 
 // Polled about once a second by blocking waits so a gone client or a
-// daemon shutdown does not pin a handler thread forever. Empty: never
-// cancelled, and nothing polled.
+// daemon shutdown does not pin a handler thread forever.
 using Cancelled = std::function<bool()>;
 constexpr std::chrono::seconds cancelPoll{1};
 
@@ -79,7 +78,7 @@ public:
     using Signatures = std::map<std::string, std::set<std::string>>;
 
     // Returns after niks3 committed all of `paths`.
-    auto pushWait(const std::vector<std::string> & paths, const Cancelled & cancelled = {}) -> Signatures
+    auto pushWait(const std::vector<std::string> & paths, const Cancelled & cancelled) -> Signatures
     {
         auto const pending = std::make_shared<Pending>(paths.size());
         uint64_t reqId = 0;
@@ -168,13 +167,10 @@ private:
         {
             auto inner = sync.lock();
             while (inner->left > 0) {
-                if (!cancelled) {
-                    inner.wait(done);
-                } else if (cancelled()) {
+                if (cancelled()) {
                     return {.status = "cancelled", .message = "gave up waiting for niks3 push"};
-                } else {
-                    inner.wait_for(done, cancelPoll);
                 }
+                inner.wait_for(done, cancelPoll);
             }
             return std::move(inner->res);
         }
