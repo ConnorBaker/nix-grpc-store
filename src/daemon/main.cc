@@ -1879,6 +1879,22 @@ void startTunnels(
 
 } // namespace
 
+namespace {
+// The --oidc-config providers, logged, if any.
+auto loadOidc(const nixgrpc::Options & options) -> std::optional<nixgrpc::oidc::Verifier>
+{
+    if (options.oidcConfig.empty()) {
+        return std::nullopt;
+    }
+    auto cfg = nixgrpc::oidc::loadConfig(options.oidcConfig);
+    for (const auto & provider : cfg.providers) {
+        nixgrpc::logLine(
+            nixgrpc::LogLevel::info, {{"event", "oidc_provider"}, {"name", provider.name}, {"issuer", provider.issuer}});
+    }
+    return std::optional<nixgrpc::oidc::Verifier>(std::in_place, std::move(cfg));
+}
+} // namespace
+
 auto main(int argc, char ** argv) -> int
 try {
     // Pump threads write to a socket whose peer may already be gone; we want
@@ -1923,16 +1939,7 @@ try {
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
     }
-    std::optional<nixgrpc::oidc::Verifier> oidc;
-    if (!options.oidcConfig.empty()) {
-        auto cfg = nixgrpc::oidc::loadConfig(options.oidcConfig);
-        for (const auto & provider : cfg.providers) {
-            nixgrpc::logLine(
-                nixgrpc::LogLevel::info,
-                {{"event", "oidc_provider"}, {"name", provider.name}, {"issuer", provider.issuer}});
-        }
-        oidc.emplace(std::move(cfg));
-    }
+    std::optional<nixgrpc::oidc::Verifier> oidc = loadOidc(options);
     nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc, .metrics = &metrics};
     // Outlives the builder, which tells it when to leave.
     std::optional<nixgrpc::tunnel::Tunnels> tunnels;
