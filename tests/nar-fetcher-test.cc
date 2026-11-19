@@ -3,11 +3,14 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -21,6 +24,7 @@
 
 #include <nix/store/path.hh>
 #include <nix/util/error.hh>
+#include <nix/util/logging.hh>
 #include <nix/util/serialise.hh>
 
 #include "nar-fetcher.hh"
@@ -89,7 +93,9 @@ struct Fixture
     }
 };
 
-auto sendNar(grpc::ServerWriter<nix::remote::NarFrame> & writer, uint32_t index, const std::string & nar) -> void
+// Without eof, the start of a NAR the stream then breaks off.
+auto sendNar(grpc::ServerWriter<nix::remote::NarFrame> & writer, uint32_t index, const std::string & nar, bool eof = true)
+    -> void
 {
     std::string compressed(ZSTD_compressBound(nar.size()), '\0');
     auto const size = ZSTD_compress(compressed.data(), compressed.size(), nar.data(), nar.size(), 1);
@@ -98,7 +104,7 @@ auto sendNar(grpc::ServerWriter<nix::remote::NarFrame> & writer, uint32_t index,
     nix::remote::NarFrame frame;
     frame.set_path_index(index);
     frame.set_data(compressed);
-    frame.set_eof(true);
+    frame.set_eof(eof);
     writer.Write(frame);
 }
 
@@ -144,19 +150,6 @@ auto fetchFails(nixgrpc::NarFetcher & fetcher, const nix::StorePath & path) -> b
 auto pathA() -> nix::StorePath { return {"00000000000000000000000000000000-a"}; }
 auto pathB() -> nix::StorePath { return {"11111111111111111111111111111111-b"}; }
 
-// A failed fetch must not be cached: nix repl keeps the store after ^C and
-// asks for the same path again.
-void failedFetchIsRetried()
-{
-    Fixture fix([](int, const auto &, auto &) -> grpc::Status {
-        return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
-    });
-    auto fetcher = fix.fetcher();
-
-    assert(fetchFails(*fetcher, pathA()));
-    assert(fetchFails(*fetcher, pathA()));
-    assert(fix.service.calls() == 2);
-}
 
 // A starved client misses the connect deadline once; the copy must survive.
 void connectFailureIsRetried()
@@ -208,18 +201,48 @@ void nonRetryableFailsAtOnce()
     assert(fix.service.calls() == 1);
 }
 
-// The paths a failed session never delivered must be asked for again too.
-void siblingFailureIsRetried()
+constexpr size_t siblings = 20000;
+
+// One session for A, many siblings and B. Its first call breaks off all but
+// B mid-NAR if `cutOff` and ends with `first`; later calls deliver. Once A
+// failed, path `next` of that order must be fetched anew, not get the failure
+// that was pending for it: the siblings keep the session failing its paths
+// long enough for it to be asked for meanwhile.
+void freshAfterFailure(const grpc::Status & first, bool cutOff, nixgrpc::RetryPolicy retry, size_t next)
 {
-    Fixture fix([](int, const auto &, auto &) -> grpc::Status {
-        return {grpc::StatusCode::PERMISSION_DENIED, "no"};
+    Fixture fix([&](int call, const auto & request, auto & writer) -> grpc::Status {
+        for (int i = 0; i < request.paths_size(); ++i) {
+            if (call > 0) {
+                sendNar(writer, static_cast<uint32_t>(i), narOf(request.paths(i)));
+            } else if (cutOff && i + 1 < request.paths_size()) {
+                sendNar(writer, static_cast<uint32_t>(i), "part", false);
+            }
+        }
+        return call > 0 ? grpc::Status::OK : first;
     });
-    auto fetcher = fix.fetcher();
-    fetcher->recordOrder({pathA(), pathB()}, {});
+    auto fetcher = fix.fetcher(std::move(retry));
+    std::vector<nix::StorePath> order{pathA()};
+    for (size_t i = 0; i < siblings; ++i) {
+        auto const hash = std::to_string(i);
+        order.emplace_back(std::string(pathA().hashPart().size() - hash.size(), '0') + hash + "-sibling");
+    }
+    order.push_back(pathB());
+    fetcher->recordOrder(order, {});
 
     assert(fetchFails(*fetcher, pathA()));
-    assert(fetchFails(*fetcher, pathB()));
-    assert(fix.service.calls() == 2);
+    assert(!fetchFails(*fetcher, order.at(next)));
+}
+
+// A failed fetch is not cached: nix repl keeps the store after ^C and asks
+// for the same path again. Nor are the paths a failed session never
+// delivered, also those it cut off, and also when it retries the rest.
+void failedFetchIsRetried()
+{
+    grpc::Status const denied{grpc::StatusCode::PERMISSION_DENIED, "no"};
+    freshAfterFailure(denied, false, {}, 0);
+    freshAfterFailure(denied, false, {}, siblings + 1);
+    freshAfterFailure(denied, true, {}, siblings + 1);
+    freshAfterFailure({grpc::StatusCode::UNAVAILABLE, "Stream removed (Socket closed)"}, true, anyUnavailable(), siblings);
 }
 
 // Each unannounced path gets a session; finished ones must not pile up.
@@ -240,6 +263,61 @@ void finishedSessionsGo()
     }
 }
 
+// What the fetcher logs.
+class Recorder final : public nix::Logger
+{
+public:
+    void log(nix::Verbosity /*lvl*/, std::string_view msg) noexcept override
+    {
+        std::scoped_lock const lock(mutex);
+        lines.emplace_back(msg);
+    }
+
+    void logEI(const nix::ErrorInfo & /*info*/) noexcept override {}
+
+    [[nodiscard]] auto logged() -> std::vector<std::string>
+    {
+        std::scoped_lock const lock(mutex);
+        return lines;
+    }
+
+private:
+    std::mutex mutex;
+    std::vector<std::string> lines;
+};
+
+// A fetcher destroyed while a session still waits for a path cancels that
+// call itself. That ends it CANCELLED "Stream removed (CANCELLED)", which
+// the store's policy takes for a broken stream, or with a bare "CANCELLED"
+// before the stream started, which it takes for a daemon gone away
+// (retry.hh). The session gives up without retrying, or saying it does.
+void destroyedFetcherGivesUpQuietly()
+{
+    std::latch released{1};
+    Fixture fix([&](int, const auto & request, auto & writer) -> grpc::Status {
+        sendNar(writer, 0, narOf(request.paths(0)));
+        released.wait();
+        return grpc::Status::OK;
+    });
+    Recorder recorder;
+    auto * const saved = nix::logger;
+    nix::logger = &recorder;
+    auto fetcher = fix.fetcher({
+        // As the store's (store.cc).
+        .retryable = [](const grpc::Status & status) -> bool {
+            return nixgrpc::goneAway(status) || nixgrpc::streamBroken(status);
+        },
+        .budget = [] -> std::chrono::milliseconds { return retryBudget; },
+    });
+    fetcher->recordOrder({pathA(), pathB()}, {});
+    assert(fetch(*fetcher, pathA()) == narOf(std::string(pathA().to_string())));
+    fetcher.reset();
+    released.count_down();
+    nix::logger = saved;
+    assert(recorder.logged().empty());
+    assert(fix.service.calls() == 1);
+}
+
 } // namespace
 
 auto main() -> int
@@ -248,8 +326,8 @@ try {
     connectFailureIsRetried();
     midStreamBreakRefetchesUntouchedPaths();
     nonRetryableFailsAtOnce();
-    siblingFailureIsRetried();
     finishedSessionsGo();
+    destroyedFetcherGivesUpQuietly();
     return 0;
 } catch (...) {
     return 1;
