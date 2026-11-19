@@ -611,7 +611,10 @@ void no_tunnel_is_handed_over_once_stop_returned()
     std::array<int, 2> ends{};
     check(socketpair(AF_UNIX, SOCK_STREAM, 0, ends.data()) == 0, "socketpair");
     const nix::AutoCloseFD balancerEnd{ends.at(1)};
-    check(!held.tunnels.handOver(nix::AutoCloseFD{ends.at(0)}), "a tunnel is handed over after stop() returned");
+    if (held.tunnels.handOver(nix::AutoCloseFD{ends.at(0)})) {
+        check(false, "a tunnel is handed over after stop() returned");
+        return;
+    }
     check(held.taken() == before, "the owner took a tunnel after stop() returned");
     char byte = 0;
     check(recv(balancerEnd.get(), &byte, 1, 0) == 0, "the tunnel refused after stop() is closed");
