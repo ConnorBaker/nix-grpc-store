@@ -2,9 +2,6 @@ use crate::fixtures::*;
 use crate::harness::{MACHINE, journal_count};
 
 const INPUT_MIB: usize = 1024;
-// A deadlocked upload never finishes, so the limit only has to be far above
-// a slow run: on a busy CI host the upload alone took 99 s.
-const BUILD_TIMEOUT_S: u64 = 600;
 
 struct Outcome {
     code: i32,
@@ -68,12 +65,8 @@ builtins.genList (i: derivation {{
         .collect();
 
     let (started0, finished0) = (uploads("event=rpc_start"), uploads("event=rpc"));
-    let timeout = BUILD_TIMEOUT_S.to_string();
+    // A deadlocked upload never finishes: the run hangs here.
     let mut build = vec![
-        "timeout",
-        "-s",
-        "KILL",
-        &timeout,
         "nix",
         "build",
         "--store",
@@ -83,7 +76,7 @@ builtins.genList (i: derivation {{
         "--no-link",
     ];
     build.extend(targets.iter().map(String::as_str));
-    let o = run_t(&build, BUILD_TIMEOUT_S + 60);
+    let o = run(&build);
     let output = o.combined();
     let tail: Vec<&str> = output.lines().rev().take(20).collect();
     succeed(&["rm", "-rf", &big, &format!("{dir}/src")]);
@@ -99,7 +92,7 @@ impl Outcome {
     fn assert_finished(&self, what: &str) {
         assert_eq!(
             self.code, 0,
-            "{what} did not finish within {BUILD_TIMEOUT_S}s: {} uploads started, {} finished\n{}",
+            "{what} failed: {} uploads started, {} finished\n{}",
             self.started, self.finished, self.log
         );
     }

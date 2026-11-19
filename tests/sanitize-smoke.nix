@@ -22,9 +22,12 @@ package.stdenv.mkDerivation {
 
     trap 'echo === nixd.log ===; cat nixd.log; echo === daemon.log ===; cat daemon.log' EXIT
 
+    # Waits with no deadline; a daemon that exits first ends them (and the
+    # build, under set -e, with the logs from the trap).
     nix daemon --store "local?root=$TMPDIR/remote" 2> nixd.log &
-    for _ in $(seq 50); do
-      [ -e "$NIX_DAEMON_SOCKET_PATH" ] && break
+    nixd_pid=$!
+    until [ -e "$NIX_DAEMON_SOCKET_PATH" ]; do
+      kill -0 $nixd_pid
       sleep 0.2
     done
 
@@ -50,8 +53,8 @@ package.stdenv.mkDerivation {
       LD_PRELOAD=$asan_rt nix --option plugin-files "$plugin" "$@"
     }
 
-    for _ in $(seq 50); do
-      client store info --store "$store" > /dev/null 2>&1 && break
+    until client store info --store "$store" > /dev/null 2>&1; do
+      kill -0 $daemon_pid
       sleep 0.2
     done
     client store info --json --store "$store"

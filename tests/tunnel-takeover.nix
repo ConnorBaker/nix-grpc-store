@@ -32,20 +32,21 @@ let
   };
   cert = commonName: subjectAltName: { inherit commonName subjectAltName; };
 
-  # Says when it starts and runs `secs` seconds, without inputs to upload.
+  # Says when it starts and, with `hold` other than 0, runs until the test
+  # kills its inner sh (a read of a pipe it also holds open for writing),
+  # without inputs to upload.
   jobExpr = pkgs.writeText "job.nix" ''
-    { tag, secs }:
+    { tag, hold }:
     derivation {
       name = "takeover-''${tag}";
       system = builtins.currentSystem;
       builder = "/bin/sh";
-      args = [ "-c" "echo STARTED-''${tag} >&2; read -t ''${secs} x < /dev/zero; echo ''${tag} > $out" ];
+      args = [ "-c" "echo STARTED-''${tag} >&2; [ ''${hold} = 0 ] || /bin/sh -c ': | { exec 3<>/proc/self/fd/0; read x <&3; }' takeover-''${tag}-holding; echo ''${tag} > $out" ];
     }
   '';
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-tunnel-takeover";
-  globalTimeout = 900;
 
   nodes = {
     client = {
@@ -123,6 +124,9 @@ pkgs.testers.runNixOSTest {
             publicKeys = [ "farm-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=" ];
           };
           tunnel.balancers = [ "lb:${toString tunnelPort}" ];
+          # More idle tunnels per balancer thread than its route has retries:
+          # a request must never be offered a tunnel the old process cannot take.
+          tunnel.count = 32;
         };
         programs.nix-grpc-store.enable = true;
         testCerts.neededBy = [ "nix-grpc-daemon.service" ];
@@ -141,20 +145,20 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    ${import ./lib/waits.nix}
     start_all()
-    lb.wait_for_unit("niks3.service")
-    lb.wait_for_open_port(5751)
-    lb.wait_for_open_port(50051)
+    wait_unit(lb, "niks3.service")
+    wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")
     # The tunnels come from the daemon, not from its socket.
-    single.systemctl("start nix-grpc-daemon.service")
+    single.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 
-    client.wait_for_unit("test-certs.service")
+    wait_unit(client, "test-certs.service")
     certs = "/run/test-certs"
     store = f"grpc://lb:50051?client-cert={certs}/node.pem&client-key={certs}/node.key&ca-cert={certs}/ca.pem"
     unit = "nix-grpc-daemon.service"
 
-    def build(tag: str, secs: int) -> str:
-        return f"nix build -L --no-link --print-out-paths --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag {tag} --argstr secs {secs}"
+    def build(tag: str, hold: int) -> str:
+        return f"nix build -L --no-link --print-out-paths --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag {tag} --argstr hold {hold}"
 
     def stats() -> dict[str, int]:
         keys = "upstream_(rq_total|rq_5xx|rq_retry|cx_total|cx_destroy_remote_with_active_rq)"
@@ -169,21 +173,26 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the node gets its builds and queries through its tunnels"):
         # The tunnels may still be opening, so the first build can find nobody.
-        warm = client.wait_until_succeeds(build("warm", 0), timeout=180).strip()
+        warm = wait_succeeds(client, build("warm", 0)).strip()
         client.succeed(f"nix path-info --store '{store}' {warm}")
         now = stats()
         assert now["cluster.tunnelled.upstream_rq_total"] > 0, now
         assert now["cluster.tunnelled-any.upstream_rq_total"] > 0, now
 
     with subtest("after a takeover the balancer sends nothing to the old process"):
-        client.succeed(f"systemd-run --unit long --setenv=PATH=/run/current-system/sw/bin sh -c \"{build('long', 90)} > /root/long.out\"")
-        client.wait_until_succeeds("journalctl -u long | grep -q STARTED-long", timeout=120)
+        client.succeed(f"systemd-run --unit long --setenv=PATH=/run/current-system/sw/bin sh -c \"{build('long', 1)} > /root/long.out\"")
+        wait_succeeds(client, "journalctl -u long | grep -q STARTED-long", clients=[(client, "long")])
         old = main_pid()
-        handed = int(single.succeed(f"journalctl -u {unit} | grep -c event=handed_over || true"))
+        # "event=handed_over pid=": not the old process's handed_over_exit
+        handed = int(single.succeed(f"journalctl -u {unit} | grep -c 'event=handed_over pid=' || true"))
         single.succeed("/run/current-system/specialisation/next/bin/switch-to-configuration test")
-        single.wait_until_succeeds(f"[ $(journalctl -u {unit} | grep -c event=handed_over) -gt {handed} ]", timeout=60)
+        wait_journal(single, unit, "event=handed_over pid=", more_than=handed, clients=[(single, unit)])
         new = main_pid()
         assert new != old, f"no new main process: {new}"
+        # The successor says ready before its tunnels are open: the builds
+        # below go once they are.
+        tunnels = f"journalctl -a -o cat _PID={new}"
+        wait_stream(single, f"{tunnels} -f --no-tail", "event=tunnels_open ", clients=[(single, unit)], now=tunnels)
         before, old_calls = stats(), calls(old)
         for i in range(4):
             client.succeed(build(f"after{i}", 0))
@@ -193,19 +202,26 @@ pkgs.testers.runNixOSTest {
         keys = [f"cluster.{c}.upstream_{s}" for c in ["tunnelled", "tunnelled-any"] for s in ["rq_total", "rq_5xx", "rq_retry", "cx_total", "cx_destroy_remote_with_active_rq"]]
         delta = {key: after.get(key, 0) - before.get(key, 0) for key in keys}
         print(f"envoy counters during the takeover's drain: {delta}")
-        assert client.execute("systemctl is-active long")[0] == 0, "the builds after the takeover waited for the old process"
+        assert client.execute("systemctl is-active long", timeout=None)[0] == 0, "the builds after the takeover waited for the old process"
         assert calls(old) == old_calls, single.succeed(f"journalctl -o cat _PID={old}")
+        # Once handed over, the old process offers no tunnel and has none taken.
+        since = single.succeed(f"journalctl -o cat _PID={old}").split("event=handed_over pid=", 1)[1]
+        assert "event=tunnels_open" not in since and "event=tunnel_failed" not in since, since
         assert delta["cluster.tunnelled.upstream_rq_total"] >= 4, delta
         assert delta["cluster.tunnelled.upstream_rq_5xx"] == 0, delta
         assert delta["cluster.tunnelled-any.upstream_rq_5xx"] == 0, delta
 
     with subtest("the old process finishes its build and leaves"):
-        client.wait_until_succeeds("! systemctl is-active long", timeout=180)
+        single.succeed("pkill -f 'takeover-long-holdin[g]$'")
+        wait_until("long ended", lambda: ended(client, "long"))
         journal = client.succeed("journalctl -u long")
         assert client.succeed("systemctl show -P Result long").strip() == "success", journal
         assert journal.count("STARTED-long") == 1, journal
-        single.wait_until_succeeds(f"! test -d /proc/{old}", timeout=60)
-        single.succeed(f"journalctl -u {unit} | grep -q 'event=predecessor_exited pid={old}'")
+        # The successor says so once its connection to the old process ends,
+        # which may come before or after the old pid is reaped: both are
+        # waited for, each irreversible.
+        wait_journal(single, unit, f"event=predecessor_exited pid={old}( |$)", clients=[(single, unit)])
+        wait_succeeds(single, f"! test -d /proc/{old}")
         client.succeed(build("later", 0))
   '';
 }

@@ -100,12 +100,12 @@ pub fn fail(argv: &[&str]) -> String {
     harness::fail(MACHINE, argv)
 }
 
-pub fn run_t(argv: &[&str], secs: u64) -> harness::Out {
-    harness::run_t(MACHINE, argv, secs)
+pub fn run(argv: &[&str]) -> harness::Out {
+    harness::run(MACHINE, argv)
 }
 
-pub fn wait_until_succeeds(argv: &[&str], secs: u64) {
-    harness::wait_until_succeeds(MACHINE, argv, secs);
+pub fn wait_until_succeeds(argv: &[&str]) {
+    harness::wait_until_succeeds(MACHINE, argv);
 }
 
 pub fn wait_for_unit(unit: &str) {
@@ -120,6 +120,10 @@ pub fn unit_state(unit: &str) -> String {
     harness::unit_state(MACHINE, unit)
 }
 
+pub fn ended(unit: &str) -> bool {
+    harness::ended(MACHINE, unit)
+}
+
 pub fn assert_journal(unit: &str, pattern: &str) {
     harness::assert_journal(MACHINE, unit, pattern);
 }
@@ -128,8 +132,8 @@ pub fn assert_no_journal(unit: &str, pattern: &str) {
     harness::assert_no_journal(MACHINE, unit, pattern);
 }
 
-pub fn wait_journal_above(unit: &str, pattern: &str, before: u64, secs: u64) {
-    harness::wait_journal_above(MACHINE, unit, pattern, before, secs);
+pub fn wait_journal_above(unit: &str, pattern: &str, before: u64, clients: &[&str]) {
+    harness::wait_journal_above(MACHINE, unit, pattern, before, clients);
 }
 
 pub fn write_file(path: &str, content: &str) {

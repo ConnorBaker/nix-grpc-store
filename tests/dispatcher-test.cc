@@ -752,17 +752,24 @@ void testReleaseAndTheStatsSeries()
 }
 
 // A chain's build kept in the scheduler's own queue (the one slot busy) is
-// forgotten once its lease is over, and the stats thread exports that as it
-// happens: `lingering` drops to 0 with nothing else going on.
+// forgotten once its lease is over, and the round that forgets it (the stats
+// thread's, here the test's tick) exports that as it happens: `lingering`
+// drops to 0 with nothing else going on.
 void testKeptQueuedExpiryExported()
 {
     constexpr uint32_t lingerS = 600;
     constexpr double capMs = 3000;
-    // The stats thread exports a round at a time: nothing to wait on but the series.
-    constexpr auto poll = std::chrono::milliseconds(100);
     Metrics metrics{""};
+    // The test's clock, and its rounds (tick): the lease is over only once
+    // the test says so.
+    std::atomic<double> nowMs{0};
     Dispatcher disp(
-        Dispatcher::Config{.defaultSystem = "x86_64-linux", .present = {}, .lookupThreads = 0, .maxLingerMs = capMs},
+        Dispatcher::Config{
+            .defaultSystem = "x86_64-linux",
+            .present = {},
+            .lookupThreads = 0,
+            .nowMs = [&nowMs] -> double { return nowMs; },
+            .maxLingerMs = capMs},
         metrics);
     Dispatcher::Worker worker{.send = [](const SchedCmd &) -> bool { return true; }, .abort = {}, .id = {}};
     WorkerMsgs hello;
@@ -788,18 +795,14 @@ void testKeptQueuedExpiryExported()
     };
     auto const busy = follow("/nix/store/00000000000000000000000000000000-busy.drv", 0, "");
     auto const chain = follow("/nix/store/11111111111111111111111111111111-chain.drv", lingerS, "chain-1");
-    auto const left = std::chrono::steady_clock::now();
     disp.clientGone(chain);
-    // Exported within a round of the stats thread, before the cap is over.
-    while (series("lingering") != 1.0) {
-        std::this_thread::sleep_for(poll);
-    }
+    // Exported within a round (a tick), the cap not yet over.
+    disp.tick();
     assert(series("lingering") == 1.0 && series("queued") == 0.0 && series("running") == 1.0);
-    while (series("lingering") != 0.0) {
-        std::this_thread::sleep_for(poll);
-    }
+    // The round in which the cap is over exports it, with nothing else going on.
+    nowMs = capMs + 1;
+    disp.tick();
     assert(series("lingering") == 0.0 && series("queued") == 0.0);
-    assert(std::chrono::steady_clock::now() - left >= std::chrono::milliseconds(static_cast<int64_t>(capMs)));
     disp.clientGone(busy);
     disp.workerGone(worker);
 }

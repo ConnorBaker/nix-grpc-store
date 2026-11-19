@@ -5,7 +5,7 @@
 //! and a build trace the GC left behind meets a rebuild.
 
 use crate::fixtures::*;
-use crate::harness::{MACHINE, journal, strs, unit_result};
+use crate::harness::{MACHINE, journal, retry, strs, unit_result};
 
 const EXPR: &str = "/tmp/floating.nix";
 /// The client's own store, so that only the builder's /nix/store has what
@@ -15,7 +15,7 @@ const UNIT: &str = "nix-grpc-daemon-mtls.service";
 
 /// What finds `tag`'s slow build, and no other test's.
 fn slow(tag: &str) -> String {
-    format!("read -t [9]0 {tag} ")
+    format!("{tag}-holdin[g]$")
 }
 
 fn write_expr() {
@@ -40,8 +40,9 @@ rec {
     builder = "/bin/sh";
     args = [ "-c" "echo dep-${tag} > $out" ];
   };
-  # Inner sh, so pkill lets the build end at once.
-  slow = ca "floating-slow-${tag}" "read x < ${dep}; /bin/sh -c 'read -t 90 ${tag} < /dev/zero'; echo slow-${tag} > $out";
+  # Inner sh, which runs until pkill lets the build end: a read of a pipe
+  # it also holds open for writing, which never ends nor spins.
+  slow = ca "floating-slow-${tag}" "read x < ${dep}; /bin/sh -c ': | { exec 3<>/proc/self/fd/0; read x <&3; }' ${tag}-holding; echo slow-${tag} > $out";
   nondet = ca "floating-nondet-${tag}" "read u < /proc/sys/kernel/random/uuid; echo $u > $out";
   # Fails, and its log says what nix-daemon says of another derivation's
   # stale build trace.
@@ -68,18 +69,19 @@ fn spawn_slow(unit: &str, store: &str, tag: &str) {
     let mut cmd = Vec::from(["systemd-run", "--unit", unit].map(String::from));
     cmd.extend(build_argv(store, "slow", tag, ""));
     succeed(&strs(&cmd));
-    wait_until_succeeds(&["pgrep", "-f", &slow(tag)], 120);
+    retry(&[(MACHINE, unit)],"the slow build runs", || {
+        run(&["pgrep", "-f", &slow(tag)]).code == 0
+    });
 }
 
 /// Lets `tag`'s slow build, built again unless the client gave up or got
 /// it already, end, and checks that `unit`'s client got `out` into `store`.
 fn finish_slow(unit: &str, store: &str, tag: &str, out: &str) {
-    wait_until_succeeds(
-        &["sh", "-c", r#"pgrep -f "$1" || ! systemctl is-active -q "$2""#, "sh", &slow(tag), unit],
-        120,
-    );
-    run_t(&["pkill", "-f", &slow(tag)], 60);
-    wait_until_succeeds(&["sh", "-c", r#"! systemctl is-active -q "$1""#, "sh", unit], 120);
+    retry(&[], &format!("{tag} runs, or {unit} ended"), || {
+        run(&["pgrep", "-f", &slow(tag)]).code == 0 || ended(unit)
+    });
+    run(&["pkill", "-f", &slow(tag)]);
+    retry(&[], &format!("{unit} ended"), || ended(unit));
     assert_eq!(unit_result(MACHINE, unit), "success", "{}", journal(MACHINE, unit));
     assert_eq!(
         succeed(&["nix", "store", "cat", "--store", store, out]).trim(),
@@ -154,20 +156,20 @@ impl Stopped {
             "sh",
         ];
         argv.extend(self.0.iter().map(String::as_str));
-        wait_until_succeeds(&argv, 120);
+        wait_until_succeeds(&argv);
     }
 }
 
 impl Drop for Stopped {
     fn drop(&mut self) {
         for pid in &self.0 {
-            run_t(&["kill", "-CONT", pid], 60);
+            run(&["kill", "-CONT", pid]);
         }
     }
 }
 
 fn still_alive(out: &str) {
-    let gc = run_t(&["nix", "store", "delete", out], 60);
+    let gc = run(&["nix", "store", "delete", out]);
     assert_ne!(gc.code, 0, "the GC took {out}: {}", gc.combined());
     assert!(gc.combined().contains("still alive"), "{}", gc.combined());
 }
@@ -233,7 +235,9 @@ fn a_floating_output_the_gc_took_before_an_attached_client_held_it_is_built_agai
     let mut cmd = Vec::from(["systemd-run", "--unit", "floating-share-b"].map(String::from));
     cmd.extend(build_argv(other, "slow", "share", ""));
     succeed(&strs(&cmd));
-    crate::harness::retry(60, "the second client attached", || events("attached") > attached);
+    retry(&[(MACHINE, "floating-share-b")],"the second client attached", || {
+        events("attached") > attached
+    });
     // Each session's connection, the owner's opened first.
     let sessions = connections("share", "-floating-slow-share.drv");
     assert_eq!(sessions.len(), 2, "{sessions:?}");
@@ -241,10 +245,10 @@ fn a_floating_output_the_gc_took_before_an_attached_client_held_it_is_built_agai
         let stopped = Stopped::new(vec![sessions[1].clone()]);
         succeed(&["pkill", "-f", &slow("share")]);
         stopped.wait_request();
-        wait_until_succeeds(&["sh", "-c", "! systemctl is-active -q floating-share-a"], 120);
+        retry(&[], "floating-share-a ended", || ended("floating-share-a"));
         assert_eq!(unit_result(MACHINE, "floating-share-a"), "success");
         succeed(&["kill", "-KILL", &sessions[0]]);
-        wait_until_succeeds(&["nix", "store", "delete", &out], 120);
+        wait_until_succeeds(&["nix", "store", "delete", &out]);
     }
     finish_slow("floating-share-b", other, "share", &out);
     assert_journal("floating-share-b", "was garbage-collected before it was held");
@@ -263,12 +267,12 @@ fn a_rebuild_a_stale_build_trace_refuses_is_given_back() {
     for pid in connections("stale", "-floating-nondet-stale.drv") {
         succeed(&["kill", "-KILL", &pid]);
     }
-    wait_until_succeeds(&["nix", "store", "delete", first.trim()], 120);
+    wait_until_succeeds(&["nix", "store", "delete", first.trim()]);
     let before = given_back();
     // A client without the realisation asks again. With one builder it
     // gives up after asking once more.
     let again = build_argv("/root/floating-client-stale", "nondet", "stale", "&reschedule-retries=0");
-    let o = run_t(&strs(&again), 300);
+    let o = run(&strs(&again));
     assert_ne!(o.code, 0, "{}", o.combined());
     assert!(o.combined().contains("names an output it no longer has"), "{}", o.combined());
     assert!(given_back() > before);
@@ -286,7 +290,7 @@ fn a_failed_build_that_prints_what_a_stale_build_trace_says_is_not_given_back() 
     write_expr();
     let before = given_back();
     let argv = build_argv("/root/floating-client-liar", "liar", "liar", "&reschedule-retries=0");
-    let o = run_t(&strs(&argv), 300);
+    let o = run(&strs(&argv));
     assert_ne!(o.code, 0, "{}", o.combined());
     assert!(!o.combined().contains("names an output it no longer has"), "{}", o.combined());
     assert_eq!(given_back(), before);

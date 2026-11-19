@@ -19,6 +19,7 @@
 #include <sys/poll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -40,7 +41,8 @@ using Event = Offer::Event;
 namespace {
 
 constexpr std::chrono::milliseconds kStep{100};
-constexpr int kSteps = 100;
+// For Offer::makeMain: until the test's systemd has read MAINPID=.
+constexpr std::chrono::milliseconds noLimit{-1};
 // Longer than any sd_notify message these tests send.
 constexpr size_t kMessage = 256;
 
@@ -51,6 +53,9 @@ auto spawn(const std::function<bool()> & body) -> pid_t
     auto const pid = ::fork();
     assert(pid >= 0);
     if (pid == 0) {
+        // Dies with the test: a failed assert there ends the run, not waits on us.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): prctl(2) is variadic.
+        (void) ::prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
         bool held = false;
         try {
             held = body();
@@ -68,14 +73,21 @@ auto exitStatus(pid_t pid) -> int
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-auto next(Offer & offer) -> Event
+// The next event of `offer`. `peer` is to cause it: once it has exited and
+// the offer still has nothing, nothing will come.
+auto next(Offer & offer, pid_t peer) -> Event
 {
-    for (int i = 0; i < kSteps; ++i) {
+    for (;;) {
+        // <signal.h> and <sys/wait.h> provide these, through glibc's private
+        // headers, which include-cleaner does not map.
+        siginfo_t info{}; // NOLINT(misc-include-cleaner)
+        bool const exited = ::waitid(P_PID, static_cast<id_t>(peer), &info, WEXITED | WNOHANG | WNOWAIT) == 0 // NOLINT(misc-include-cleaner)
+                            && info.si_pid == peer; // NOLINT(misc-include-cleaner)
         if (auto const event = offer.wait(kStep); event != Event::none) {
             return event;
         }
+        assert(!exited);
     }
-    return Event::none;
 }
 
 void theSuccessorGetsTheSocketsAndSeesThePredecessorGo()
@@ -85,6 +97,8 @@ void theSuccessorGetsTheSocketsAndSeesThePredecessorGo()
     // Stands in for a listening socket: whatever reads it reads what we write.
     nix::Pipe listening;
     listening.create();
+    nix::Pipe sawUs;
+    sawUs.create();
     auto const child = spawn([&] -> bool {
         listening.writeSide.close();
         Predecessor pred(self);
@@ -96,19 +110,24 @@ void theSuccessorGetsTheSocketsAndSeesThePredecessorGo()
                && !nix::getEnv("LD_PRELOAD");
         pred.ready();
         held = held && pred.alive();
-        for (int i = 0; i < kSteps && pred.alive(); ++i) {
+        bool const told = ::write(sawUs.writeSide.get(), "s", 1) == 1;
+        held = held && told;
+        // Nothing to wait on from outside Predecessor: look until it is gone.
+        while (pred.alive()) {
             std::this_thread::sleep_for(kStep);
         }
-        return held && !pred.alive();
+        return held;
     });
-    assert(next(*offer) == Event::requested);
+    sawUs.writeSide.close();
+    assert(next(*offer, child) == Event::requested);
     assert(offer->peer() == child);
     assert(::write(listening.writeSide.get(), "x", 1) == 1);
     offer->send({listening.readSide.get()}, "NOTIFY_SOCKET=/run/systemd/notify\nWATCHDOG_USEC=15000000\nLD_PRELOAD=/evil.so\n");
-    assert(next(*offer) == Event::ready);
+    assert(next(*offer, child) == Event::ready);
     offer->accept();
     // The successor still sees us.
-    std::this_thread::sleep_for(3 * kStep);
+    char byte = 0;
+    assert(::read(sawUs.readSide.get(), &byte, 1) == 1);
     offer.reset(); // as when this process exits
     assert(exitStatus(child) == 0);
 }
@@ -123,9 +142,9 @@ void aSuccessorThatDiesBeforeItServesGivesTheNodeBack()
         Predecessor const pred(self);
         return true; // and gone, without ready()
     });
-    assert(next(offer) == Event::requested);
+    assert(next(offer, child) == Event::requested);
     offer.send({listening.readSide.get()}, "");
-    assert(next(offer) == Event::gone);
+    assert(next(offer, child) == Event::gone);
     offer.reject();
     assert(exitStatus(child) == 0);
     // And the next one may try.
@@ -134,9 +153,9 @@ void aSuccessorThatDiesBeforeItServesGivesTheNodeBack()
         pred.ready();
         return true;
     });
-    assert(next(offer) == Event::requested);
+    assert(next(offer, again) == Event::requested);
     offer.send({listening.readSide.get()}, "");
-    assert(next(offer) == Event::ready);
+    assert(next(offer, again) == Event::ready);
     offer.accept();
     assert(exitStatus(again) == 0);
 }
@@ -156,9 +175,9 @@ void aRejectedSuccessorDoesNotTakeOver()
         }
         return false;
     });
-    assert(next(offer) == Event::requested);
+    assert(next(offer, child) == Event::requested);
     offer.send({listening.readSide.get()}, "");
-    assert(next(offer) == Event::ready);
+    assert(next(offer, child) == Event::ready);
     offer.reject();
     assert(exitStatus(child) == 0);
 }
@@ -166,7 +185,7 @@ void aRejectedSuccessorDoesNotTakeOver()
 void noTakeoverFromAProcessThatOffersNone()
 {
     auto const sleeper = spawn([] -> bool {
-        std::this_thread::sleep_for(kStep * kSteps);
+        ::pause(); // until killed
         return true;
     });
     bool refused = false;
@@ -184,7 +203,7 @@ void noTakeoverFromAProcessThatOffersNone()
 void noTakeoverFromAnImpostor()
 {
     auto const victim = spawn([] -> bool {
-        std::this_thread::sleep_for(kStep * kSteps);
+        ::pause(); // until killed
         return true;
     });
     // takeover.cc's name for the victim's offer, taken by us.
@@ -230,9 +249,6 @@ void theReloadExitsWithTheChildsVerdict()
 auto verdictOf(nix::Pipe & said) -> char
 {
     said.writeSide.close();
-    pollfd pfd{.fd = said.readSide.get(), .events = POLLIN, .revents = 0};
-    // Well within the 30 s it would wait on its own.
-    assert(::poll(&pfd, 1, static_cast<int>((kStep * kSteps / 2).count())) == 1);
     char verdict = 0;
     assert(::read(said.readSide.get(), &verdict, 1) == 1);
     return verdict;
@@ -279,7 +295,9 @@ void aDaemonWhoseReloadWasKilledGivesUp()
     }
 }
 
-// Nor does one still waiting for the sockets when systemd kills its reload.
+// Nor does one still waiting for the sockets when systemd kills its reload:
+// the wait ends with the reload ('g'), not otherwise ('t'), as when its own
+// time runs out.
 void theWaitForTheSocketsEndsWithTheReload()
 {
     Offer offer;
@@ -291,13 +309,13 @@ void theWaitForTheSocketsEndsWithTheReload()
         char verdict = 'p';
         try {
             Predecessor const pred(self, &detached);
-        } catch (nix::Error &) {
-            verdict = 'g';
+        } catch (nix::Error & err) {
+            verdict = std::string(err.what()).contains("gave up on the reload") ? 'g' : 't';
         }
         assert(::write(said.writeSide.get(), &verdict, 1) == 1);
         ::_exit(0);
     });
-    assert(next(offer) == Event::requested);
+    assert(next(offer, reload) == Event::requested);
     ::kill(reload, SIGKILL);
     exitStatus(reload);
     assert(verdictOf(said) == 'g');
@@ -425,16 +443,18 @@ void theOldProcessKeepsTheUnitIfTheSuccessorDiesBeforeSystemdTakesIt()
             pred.ready();
             return true;
         });
-        assert(next(offer) == Event::requested);
+        assert(next(offer, child) == Event::requested);
         offer.send({listening.readSide.get()}, "");
-        assert(next(offer) == Event::ready);
-        assert(offer.makeMain(kStep * kSteps));
+        assert(next(offer, child) == Event::ready);
+        assert(offer.makeMain(noLimit));
         assert(manager.got("MAINPID=" + std::to_string(child)));
         offer.accept();
         assert(exitStatus(child) == 0);
     }
     {
         Offer offer;
+        nix::Pipe goOn;
+        goOn.create();
         auto const child = spawn([&] -> bool {
             Predecessor pred(self);
             // Says it serves, and dies before the answer.
@@ -444,14 +464,16 @@ void theOldProcessKeepsTheUnitIfTheSuccessorDiesBeforeSystemdTakesIt()
                 } catch (nix::Error &) { // NOLINT(bugprone-empty-catch): it is gone by then
                 }
             }).detach();
-            std::this_thread::sleep_for(3 * kStep);
+            char byte = 0;
+            (void) ::read(goOn.readSide.get(), &byte, 1);
             ::_exit(0);
         });
-        assert(next(offer) == Event::requested);
+        assert(next(offer, child) == Event::requested);
         offer.send({listening.readSide.get()}, "");
-        assert(next(offer) == Event::ready);
+        assert(next(offer, child) == Event::ready);
+        assert(::write(goOn.writeSide.get(), "x", 1) == 1);
         assert(exitStatus(child) == 0);
-        assert(!offer.makeMain(kStep * kSteps));
+        assert(!offer.makeMain(noLimit));
         offer.reject();
     }
 }

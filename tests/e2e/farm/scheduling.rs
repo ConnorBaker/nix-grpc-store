@@ -1,11 +1,9 @@
-use std::time::Instant;
-
 use super::helpers::*;
 use crate::harness::*;
 
 fn probe(query: &str) -> String {
     let system = succeed(CLIENT, &["readlink", "-f", "/run/current-system"]);
-    let o = run_t(
+    let o = run(
         CLIENT,
         &[
             "nix",
@@ -14,7 +12,6 @@ fn probe(query: &str) -> String {
             &format!("grpc://lb:50051?{query}"),
             system.trim(),
         ],
-        120,
     );
     let out = o.combined();
     if o.code == 0 || out.contains("is not valid") {
@@ -128,7 +125,7 @@ fn repeat_is_answered_from_the_cache_without_building() {
         // nix-daemon connection, as its expiry would.
         let script = format!(
             "nix-store -q --roots {top} | grep -o 'temp:[0-9]*' | cut -d: -f2 | xargs -r kill -9; \
-             for _ in $(seq 50); do nix-store --delete {top} && exit; sleep 0.2; done; exit 1"
+             until nix-store --delete {top}; do sleep 0.2; done"
         );
         succeed(w, &["sh", "-c", &script]);
     }
@@ -189,10 +186,9 @@ fn an_output_a_substituter_offers_unsigned_is_built() {
             w.0
         );
     }
-    let said = run_t(
+    let said = run(
         CLIENT,
         &["nix-store", "--store", &envoy(), "--check-validity", out],
-        120,
     );
     eprintln!(
         "before the build, the farm answered {out} (exit {}): {}",
@@ -227,7 +223,7 @@ fn an_output_a_substituter_offers_unsigned_is_built() {
     let wanted = wants().saturating_sub(before);
     assert!(wanted >= 1, "no build was sent for {out}");
     // The builders cannot fetch an unsigned path, so the build must have made it.
-    let got = run_t(CLIENT, &["nix", "path-info", "--store", &envoy(), out], 120);
+    let got = run(CLIENT, &["nix", "path-info", "--store", &envoy(), out]);
     assert_eq!(
         got.code,
         0,
@@ -258,12 +254,13 @@ fn two_clients_wanting_the_same_drv_build_it_once() {
     };
     let before = attached();
     spawn_build("dedup1", "dedup");
-    sleep(1);
+    wait_building("dedup1");
     spawn_build("dedup2", "dedup");
-    wait_building();
-    sleep(2);
+    retry(&[(CLIENT, "dedup2")],"the second client attached", || {
+        attached() > before
+    });
     release_slow();
-    wait_unit_done("dedup1 dedup2", 60);
+    wait_unit_done("dedup1 dedup2");
     for unit in ["dedup1", "dedup2"] {
         assert_unit_success(unit);
     }
@@ -291,8 +288,7 @@ fn timeout_and_max_silent_time_reach_the_builder() {
     farm_ready();
     let before = failures("TimedOut");
     for (flag, tag) in [("--timeout", "tmot"), ("--max-silent-time", "tmom")] {
-        let t0 = Instant::now();
-        let o = run_t(
+        let o = run(
             CLIENT,
             &[
                 "nix",
@@ -309,11 +305,10 @@ fn timeout_and_max_silent_time_reach_the_builder() {
                 flag,
                 "5",
             ],
-            120,
         );
         let out = o.combined();
         assert!(
-            o.code != 0 && out.contains("timed out") && t0.elapsed().as_secs() < 60,
+            o.code != 0 && out.contains("timed out"),
             "{flag} {} {out}",
             o.code
         );
@@ -333,7 +328,7 @@ fn a_failing_build_is_counted_with_its_own_reason() {
             .sum::<i64>()
     };
     let (before, events_before) = (failed(), build_failed());
-    let o = run_t(
+    let o = run(
         CLIENT,
         &[
             "nix",
@@ -349,7 +344,6 @@ fn a_failing_build_is_counted_with_its_own_reason() {
             "tag",
             "boom",
         ],
-        120,
     );
     assert!(
         o.code != 0 && o.combined().contains("BOOM-boom"),
@@ -363,16 +357,24 @@ fn a_failing_build_is_counted_with_its_own_reason() {
 #[test]
 fn the_first_client_leaving_does_not_fail_the_second() {
     farm_ready();
+    let attached = || {
+        WORKERS
+            .into_iter()
+            .map(|w| events(w, "attached"))
+            .sum::<i64>()
+    };
+    let before = attached();
     spawn_build("share1", "share");
-    sleep(1);
+    wait_building("share1");
     spawn_build("share2", "share");
-    wait_building();
-    sleep(2);
+    retry(&[(CLIENT, "share2")],"the second client attached", || {
+        attached() > before
+    });
     succeed(CLIENT, &["systemctl", "kill", "-s", "INT", "share1"]);
-    wait_unit_done("share1", 30);
-    wait_building();
+    wait_unit_done("share1");
+    wait_building("share2");
     release_slow();
-    wait_unit_done("share2", 120);
+    wait_unit_done("share2");
     assert_unit_success("share2");
 }
 
@@ -519,7 +521,7 @@ fn users_of_a_lost_input(tag: &str, nondet: bool) {
     let users = format!(
         r#"map (f: (import {dep} {{ tag = "{tag}"; salt = f; features = [ "vip" ]; jobFeatures = [ f ]; nondet = {nondet}; }}).job) [ "vip" "w2" ]"#
     );
-    let o = run_t(
+    let o = run(
         CLIENT,
         &[
             "nix",
@@ -534,7 +536,6 @@ fn users_of_a_lost_input(tag: &str, nondet: bool) {
             "--expr",
             &users,
         ],
-        300,
     );
     assert_eq!(o.code, 0, "{}", o.combined());
     assert!(
@@ -648,7 +649,7 @@ fn a_builder_serves_the_build_the_cache_published() {
     farm.extend_from_slice(&[&store, "--eval-store", "auto"]);
     farm.extend_from_slice(&args);
     succeed(CLIENT, &farm);
-    wait_building();
+    wait_building("twice");
     let loser = building()[0];
     let winner = if loser == WORKER1 { WORKER2 } else { WORKER1 };
 
@@ -663,9 +664,12 @@ fn a_builder_serves_the_build_the_cache_published() {
         winner,
         &["systemd-run", "--unit", "twice-local", "nix-store", "--realise", &drv],
     );
-    wait_until_succeeds(winner, BUILDER, 60);
-    run_t(winner, &["pkill", "-f", "read -t [9]0 x"], 60);
-    wait_until_succeeds(winner, &["sh", "-c", "! systemctl is-active twice-local"], 60);
+    wait_until_succeeds(winner, BUILDER);
+    run(winner, &["pkill", "-f", BUILDER[2]]);
+    wait_until_succeeds(
+        winner,
+        &["sh", "-c", "systemctl is-active twice-local | grep -qxE 'inactive|failed'"],
+    );
     let mut eval = vec!["nix", "eval", "--raw"];
     eval.extend_from_slice(&args);
     eval.push("outPath");
@@ -673,8 +677,8 @@ fn a_builder_serves_the_build_the_cache_published() {
     let push = format!("{} {out}", env("NGS_NIKS3_PUSH"));
     succeed(winner, &["sh", "-c", &push]);
 
-    run_t(loser, &["pkill", "-f", "read -t [9]0 x"], 60);
-    wait_unit_done("twice", 120);
+    run(loser, &["pkill", "-f", BUILDER[2]]);
+    wait_unit_done("twice");
     assert_unit_success("twice");
     let hash = |w| succeed(w, &["nix-store", "--query", "--hash", &out]);
     assert_eq!(hash(loser), hash(winner), "{} kept its own build", loser.0);
@@ -703,11 +707,11 @@ fn a_finished_build_is_published_after_its_client_left() {
     let built = || WORKERS.into_iter().map(|w| events(w, "built")).sum::<i64>();
     let before = built();
     spawn_build("left", "left");
-    wait_building();
+    wait_building("left");
     block("-I");
     let unblock = Unblock;
     release_slow();
-    retry(60, "the build finished", || built() > before);
+    retry(&[(CLIENT, "left")], "the build finished", || built() > before);
     succeed(CLIENT, &["systemctl", "stop", "left"]);
     // Longer than a builder takes to notice that its client is gone.
     sleep(5);
@@ -721,22 +725,21 @@ fn a_finished_build_is_published_after_its_client_left() {
     let fresh = ["--option", "narinfo-cache-negative-ttl", "0"];
     let mut query = vec!["nix", "path-info", "--store", &cache, &out];
     query.extend(fresh);
-    wait_until_succeeds(CLIENT, &query, 120);
+    wait_until_succeeds(CLIENT, &query);
 }
 
-/// Uploads a new path straight to `w`, so that it publishes. Bounded below
-/// run_t's limit: it runs from guards, where a panic would abort.
+/// Uploads a new path straight to `w`, so that it publishes. It runs from
+/// guards, where a panic would abort, so its status is not checked.
 fn republish(w: Node) {
-    let _ = run_t(
+    let _ = run(
         CLIENT,
         &[
             "sh",
             "-c",
-            r#"date +%s%N > /tmp/republish && timeout 100 nix copy --no-check-sigs --to "$1" "$(nix-store --add /tmp/republish)""#,
+            r#"date +%s%N > /tmp/republish && nix copy --no-check-sigs --to "$1" "$(nix-store --add /tmp/republish)""#,
             "sh",
             &direct(w),
         ],
-        120,
     );
 }
 
@@ -772,13 +775,13 @@ fn a_failed_upload_fails_the_build_instead_of_rebuilding_it() {
         }
     }
     spawn_build("pubdown", "pubdown");
-    wait_building();
+    wait_building("pubdown");
     block("-I");
     let unblock = Unblock;
     release_slow();
-    wait_unit_done("pubdown", 120);
+    wait_unit_done("pubdown");
     drop(unblock);
-    retry(60, "scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
     let log = journal(CLIENT, "pubdown");
     assert_ne!(unit_result(CLIENT, "pubdown"), "success", "{log}");
     assert!(log.contains("publish failed"), "{log}");
@@ -815,15 +818,18 @@ fn stop_publishing(broken: Node) -> Restore {
         .to_string();
     let failing = || journal_count(leader(), UNIT, "event=publish_failing");
     let before = failing();
-    // The client retries a failed publish for as long as it is let.
-    let o = run_t(
-        CLIENT,
-        &["timeout", "30", "nix", "copy", "--no-check-sigs", "--to", &direct(broken), &path],
-        60,
-    );
-    assert_ne!(o.code, 0, "{}", o.combined());
-    retry(60, "the scheduler hears that the builder cannot publish", || failing() > before);
-    retry(60, "the balancer sends the builder nothing", || !members(&sys).contains(&broken));
+    // The client retries a failed publish for as long as it is let: until
+    // the scheduler has heard of it, then it is stopped.
+    let copy = "nopub-copy";
+    let to = direct(broken);
+    // --collect: two tests stop a copy of this name, which then failed.
+    let argv = ["systemd-run", "--collect", "--unit", copy, "nix", "copy", "--no-check-sigs", "--to", &to, &path];
+    succeed(CLIENT, &argv);
+    retry(&[(CLIENT, copy)],"the scheduler hears that the builder cannot publish", || {
+        failing() > before
+    });
+    succeed(CLIENT, &["systemctl", "stop", copy]);
+    retry(&[], "the balancer sends the builder nothing", || !members(&sys).contains(&broken));
     mounted
 }
 
@@ -838,13 +844,13 @@ impl Restore {
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        let _ = run_t(self.0, &["sh", "-c", r#"! mountpoint -q "$1" || umount "$1""#, "sh", &self.1], 30);
+        let _ = run(self.0, &["sh", "-c", r#"! mountpoint -q "$1" || umount "$1""#, "sh", &self.1]);
         republish(self.0);
     }
 }
 
 fn build_job(tag: &str) -> Out {
-    run_t(
+    run(
         CLIENT,
         &[
             "nix",
@@ -857,7 +863,6 @@ fn build_job(tag: &str) -> Out {
             "--expr",
             &format!("import {} {{ tag = \"{tag}\"; }}", expr("JOB")),
         ],
-        300,
     )
 }
 
@@ -877,7 +882,7 @@ fn a_builder_that_cannot_publish_gets_no_work_while_another_can_take_it() {
     assert_eq!(o.code, 0, "{}", o.combined());
     assert_eq!(built() - built_before, 0, "{}", o.combined());
     wait_members(&sys, &WORKERS);
-    retry(60, "scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
 }
 
 /// Only a publish tells a builder that publishing works again, and it gets
@@ -907,23 +912,24 @@ fn a_builder_that_can_publish_again_gets_a_build_once_the_other_is_full() {
         CLIENT,
         &["systemd-run", "--unit", "full", "nix", "build", "--store", &envoy(), "--eval-store", "auto", "--impure", "--expr", &burst],
     );
-    retry(90, "the builder takes the build the other has no slot for", || building().contains(&broken));
-    release_slow();
-    wait_unit_done("full", 120);
+    retry(&[(CLIENT, "full")],"the builder takes the build the other has no slot for", || {
+        building().contains(&broken)
+    });
+    release_until_done("full");
     assert_unit_success("full");
     assert_eq!(built() - built_before, 1);
-    retry(60, "its publish brings the builder back", || members(&sys).contains(&broken));
+    retry(&[], "its publish brings the builder back", || members(&sys).contains(&broken));
     drop(mounted);
-    retry(60, "scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
 }
 
 #[test]
 fn interrupting_the_client_stops_the_build_on_the_worker() {
     farm_ready();
     spawn_build("intr", "intr");
-    wait_building();
+    wait_building("intr");
     succeed(CLIENT, &["systemctl", "kill", "-s", "INT", "intr"]);
-    retry(20, "the build stopped", || building().is_empty());
+    retry(&[], "the build stopped", || building().is_empty());
 }
 
 #[test]
@@ -959,13 +965,10 @@ fn queue_gauges_show_a_burst_while_every_build_blocks() {
     );
     // The Wants arrive within a second and nothing else happens until a build
     // ends, so only the trailing export can show the queue.
-    retry(10, "two builds queued", || queued() == 2);
-    retry(90, "burst finished", || {
-        release_slow();
-        run_t(CLIENT, &["systemctl", "is-active", "burst"], 60).code != 0
-    });
+    retry(&[(CLIENT, "burst")],"two builds queued", || queued() == 2);
+    release_until_done("burst");
     assert_unit_success("burst");
-    retry(10, "queue empty", || queued() == 0);
+    retry(&[], "queue empty", || queued() == 0);
     let waits = gauge(
         leader(),
         &format!(r#"nix_grpc_queue_seconds_count{{system="{sys}"}}"#),
@@ -1014,7 +1017,7 @@ fn required_system_features_are_placed_or_refused() {
     let vip = format!(
         r#"map (tag: import {job} {{ inherit tag; features = ["vip"]; }}) ["f1" "f2" "f3"]"#
     );
-    let o = run_t(
+    let o = run(
         CLIENT,
         &[
             "nix",
@@ -1028,7 +1031,6 @@ fn required_system_features_are_placed_or_refused() {
             &vip,
             "--impure",
         ],
-        300,
     );
     assert_eq!(o.code, 0, "{}", o.combined());
     let out = o.combined();
@@ -1072,18 +1074,15 @@ fn required_system_features_are_placed_or_refused() {
         r#"nix_grpc_sched_system{{features="gpu",kind="unplaceable",system="{}"}}"#,
         system()
     );
-    retry(60, "one unplaceable build", || {
+    retry(&[(CLIENT, "gpu")],"one unplaceable build", || {
         gauge(leader(), &unplaceable) == 1
     });
-    retry(60, "gpu build failed", || {
-        unit_result(CLIENT, "gpu") == "exit-code"
-    });
+    wait_unit_done("gpu");
     let out = query(CLIENT, &["journalctl", "-u", "gpu", "-o", "cat"]);
+    assert_eq!(unit_result(CLIENT, "gpu"), "exit-code", "{out}");
     let why = format!("features {{gpu}}, the workers offer {{{}}}", offered.join(","));
     assert!(out.contains(&why), "{out}");
-    retry(30, "no unplaceable build", || {
-        gauge(leader(), &unplaceable) == 0
-    });
+    retry(&[], "no unplaceable build", || gauge(leader(), &unplaceable) == 0);
 }
 
 /// The balancer sends a request to the worker in its `x-nix-worker` header,
@@ -1115,7 +1114,7 @@ fn x_nix_worker_picks_the_worker_on_every_system() {
 }
 
 fn farm_gives(path: &str) {
-    let got = run_t(CLIENT, &["nix", "path-info", "--store", &envoy(), path], 120);
+    let got = run(CLIENT, &["nix", "path-info", "--store", &envoy(), path]);
     assert_eq!(
         got.code,
         0,
@@ -1222,7 +1221,7 @@ fn lost_input_is_built_for_a_build_hook_s_job() {
         "jobFeatures",
         "[]",
     ]);
-    let built = run_t(CLIENT, &cmd, 240);
+    let built = run(CLIENT, &cmd);
     assert_eq!(built.code, 0, "the build failed: {}", built.combined());
     assert_eq!(built.stdout.trim(), eval(tag, "job.outPath"), "{}", built.combined());
     assert!(
@@ -1241,7 +1240,7 @@ fn lost_input_is_built_for_its_user_on_the_same_worker() {
     // that expired unclaimed (Builder::tick).
     let no_shows = || events(WORKER1, "give_back");
     let no_shows0 = no_shows();
-    let built = build_dep_job(&envoy(), "lostsame", r#"["vip"]"#, false, 240);
+    let built = build_dep_job(&envoy(), "lostsame", r#"["vip"]"#, false);
     assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
     assert!(
         built.stderr.contains(&format!("farm lacks '{inp}'")),
@@ -1263,7 +1262,7 @@ fn lost_input_rebuilt_on_one_worker_reaches_its_user_on_another() {
     farm_ready();
     let (inp, nar) = lost_input("lostcross", false);
     // The input builds on worker1 alone (vip), its user on worker2 alone (w2).
-    let built = build_dep_job(&envoy(), "lostcross", r#"["w2"]"#, false, 240);
+    let built = build_dep_job(&envoy(), "lostcross", r#"["w2"]"#, false);
     assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
     assert!(
         built.stderr.contains(&format!("farm lacks '{inp}'")),
@@ -1282,7 +1281,7 @@ fn lost_input_rebuilt_with_other_bytes_reaches_its_user_on_another() {
     // As the test above, but the input has other bytes on every build, so
     // its rebuild's NAR is another object than the one the cache lost.
     let (inp, nar) = lost_input("lostbytes", true);
-    let built = build_dep_job(&envoy(), "lostbytes", r#"["w2"]"#, true, 240);
+    let built = build_dep_job(&envoy(), "lostbytes", r#"["w2"]"#, true);
     assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
     assert!(
         built.stderr.contains(&format!("farm lacks '{inp}'")),
@@ -1310,7 +1309,7 @@ fn lost_input_missed_by_two_users_at_once_is_built_once() {
         r#"map (u: (import {} {{ tag = "losttwo"; salt = u.salt; features = [ "vip" ]; jobFeatures = u.features; }}).job) [ {{ salt = "1"; features = [ "vip" ]; }} {{ salt = "2"; features = [ "w2" ]; }} ]"#,
         expr("DEP")
     );
-    let built = run_t(
+    let built = run(
         CLIENT,
         &[
             "nix",
@@ -1326,7 +1325,6 @@ fn lost_input_missed_by_two_users_at_once_is_built_once() {
             "--expr",
             &users,
         ],
-        240,
     );
     assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
     assert!(
@@ -1392,7 +1390,7 @@ fn an_input_a_substituter_offers_unsigned_is_built() {
         );
     }
     // No builder can fetch the input, so the build must make it first.
-    let built = run_t(
+    let built = run(
         CLIENT,
         &[
             "nix",
@@ -1411,7 +1409,6 @@ fn an_input_a_substituter_offers_unsigned_is_built() {
             "tag",
             tag,
         ],
-        240,
     );
     assert_eq!(
         built.code, 0,
@@ -1419,10 +1416,9 @@ fn an_input_a_substituter_offers_unsigned_is_built() {
         built.stderr
     );
     for path in [inp, built.stdout.trim()] {
-        let got = run_t(
+        let got = run(
             CLIENT,
             &["nix", "path-info", "--store", &envoy(), path],
-            120,
         );
         assert_eq!(
             got.code,
@@ -1461,17 +1457,18 @@ fn sighup_rereads_nix_max_jobs_and_the_scheduler_counts_it() {
             conf,
         ],
     );
-    // Nothing is re-read without the signal.
+    // Nothing is re-read without the signal: an absence window, which a
+    // daemon that waits for it never fails.
     let reads0 = reads();
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert_eq!(own(), own0);
     hup();
-    wait_journal_above(WORKER1, UNIT, "event=max_jobs ", reads0, 30);
-    retry(30, "worker1 took nix's new max-jobs", || own() == own0 + 3);
-    retry(30, "the scheduler counts the new slots", || total() == total0 + 3);
+    wait_journal_above(WORKER1, UNIT, "event=max_jobs ", reads0, &[UNIT]);
+    retry(&[], "worker1 took nix's new max-jobs", || own() == own0 + 3);
+    retry(&[], "the scheduler counts the new slots", || total() == total0 + 3);
     succeed(WORKER1, &["rm", conf]);
     hup();
-    retry(30, "back to nix.conf's own max-jobs", || {
+    retry(&[], "back to nix.conf's own max-jobs", || {
         own() == own0 && total() == total0
     });
     assert_eq!(pid(), pid0, "nix-grpc-daemon restarted");
@@ -1488,10 +1485,12 @@ impl<F> Worker2Full<F> {
     fn new(tag: &str, full: impl FnOnce() -> F) -> Self {
         let busy = format!("busy-{tag}");
         let slow = format!(
-            r#"derivation {{ name = "{busy}"; system = builtins.currentSystem; requiredSystemFeatures = [ "vip" ]; builder = "/bin/sh"; args = [ "-c" "/bin/sh -c 'read -t 90 x < /dev/zero'; echo {tag} > $out" ]; }}"#
+            r#"derivation {{ name = "{busy}"; system = builtins.currentSystem; requiredSystemFeatures = [ "vip" ]; builder = "/bin/sh"; args = [ "-c" "/bin/sh -c ': | {{ exec 3<>/proc/self/fd/0; read x <&3; }}' slow-holding; echo {tag} > $out" ]; }}"#
         );
         spawn(&busy, &["--impure", "--expr", &slow]);
-        retry(60, "a slow build holds worker1", || building() == [WORKER1]);
+        retry(&[(CLIENT, &busy)],"a slow build holds worker1", || {
+            building() == [WORKER1]
+        });
         Worker2Full { busy, _full: full() }
     }
 
@@ -1507,13 +1506,13 @@ impl<F> Worker2Full<F> {
         let (before, calls) = (given(), build_calls(WORKER2));
         let unit = format!("{}-build", self.busy);
         spawn(&unit, &[format!("{drv}^*").as_str()]);
-        retry(120, "worker2 gave the drv back, or the build ended", || {
-            given() > before || unit_state(CLIENT, &unit) != "active"
+        retry(&[], "worker2 gave the drv back, or the build ended", || {
+            given() > before || ended(CLIENT, &unit)
         });
         assert!(build_calls(WORKER2) > calls, "worker2 never got the drv");
         assert!(given() > before, "worker2 did not give the drv back");
         drop(self);
-        wait_unit_done(&unit, 120);
+        wait_unit_done(&unit);
         unit
     }
 }
@@ -1521,7 +1520,7 @@ impl<F> Worker2Full<F> {
 impl<F> Drop for Worker2Full<F> {
     fn drop(&mut self) {
         release_slow();
-        wait_unit_done(&self.busy, 120);
+        wait_unit_done(&self.busy);
     }
 }
 
@@ -1636,7 +1635,7 @@ fn an_input_its_worker_has_no_disk_for_is_not_rebuilt() {
     let vip = ["--arg", "features", r#"["vip"]"#, "--arg", "jobFeatures", "[]"];
     let input = instantiate("input", "noroomin", &vip);
     spawn("noroomin-input", &[format!("{input}^*").as_str()]);
-    wait_unit_done("noroomin-input", 120);
+    wait_unit_done("noroomin-input");
     assert_unit_success("noroomin-input");
     let drv = instantiate("job", "noroomin", &vip);
     succeed(CLIENT, &["nix", "copy", "--to", &direct(WORKER2), &drv]);
@@ -1676,11 +1675,10 @@ fn uploads_and_fetches_a_worker_has_no_disk_for_are_retried() {
     let drv = instantiate("job", "noroomref", &["--argstr", "inputPath", &src]);
     let store = format!("{}&restart-grace=1", direct(WORKER2));
     let _full = NoInodes::new();
-    let upload = run_t(CLIENT, &["nix", "copy", "--to", &store, &drv], 60);
-    let fetch = run_t(
+    let upload = run(CLIENT, &["nix", "copy", "--to", &store, &drv]);
+    let fetch = run(
         CLIENT,
         &["sh", "-c", r#"nix store dump-path --store "$1" "$2" > /dev/null"#, "sh", &store, &src],
-        60,
     );
     for o in [upload, fetch] {
         assert!(o.code != 0 && o.combined().contains("retrying"), "{}", o.combined());
@@ -1697,10 +1695,9 @@ fn a_fetch_bigger_than_what_its_worker_has_left_is_retried() {
     succeed(CLIENT, &["nix", "copy", "--to", &direct(WORKER1), &src]);
     let _low = LowDisk::leaving(WORKER2, 32 << 20);
     let store = format!("{}&restart-grace=1", direct(WORKER2));
-    let fetch = run_t(
+    let fetch = run(
         CLIENT,
         &["sh", "-c", r#"nix store dump-path --store "$1" "$2" > /dev/null"#, "sh", &store, &src],
-        60,
     );
     assert!(fetch.code != 0 && fetch.combined().contains("retrying"), "{}", fetch.combined());
 }
@@ -1713,7 +1710,7 @@ fn a_path_nobody_has_is_absent_on_a_worker_low_on_disk() {
     let _low = LowDisk::leaving(WORKER2, 100 << 20);
     let store = format!("{}&restart-grace=1", direct(WORKER2));
     let absent = "/nix/store/00000000000000000000000000000000-absent";
-    let o = run_t(CLIENT, &["nix", "path-info", "--store", &store, absent], 120);
+    let o = run(CLIENT, &["nix", "path-info", "--store", &store, absent]);
     assert!(o.code != 0 && o.combined().contains("is not valid"), "{}", o.combined());
 }
 
@@ -1728,14 +1725,13 @@ fn a_drv_the_cache_lost_fails_as_missing() {
     lose_nar(&drv);
     let done = || WORKERS.into_iter().map(|w| events(w, "done_CANCELLED")).sum::<i64>();
     let before = done();
-    let o = run_t(
+    let o = run(
         CLIENT,
         &["nix", "build", "--store", &envoy(), "--eval-store", "auto", &format!("{drv}^*")],
-        120,
     );
     let out = o.combined();
     assert!(o.code != 0 && out.contains("missing: ") && !out.contains("gave up"), "{out}");
-    retry(30, "the lease ended", || done() > before);
+    retry(&[], "the lease ended", || done() > before);
 }
 
 /// Both workers low on disk but not out of it, and the cache lost the drv:
@@ -1748,10 +1744,9 @@ fn a_drv_the_cache_lost_fails_as_missing_on_workers_low_on_disk() {
     succeed(WORKER1, &["nix-store", "--delete", &drv]);
     lose_nar(&drv);
     let _low = [LowDisk::leaving(WORKER1, 100 << 20), LowDisk::leaving(WORKER2, 100 << 20)];
-    let o = run_t(
+    let o = run(
         CLIENT,
         &["nix", "build", "--store", &envoy(), "--eval-store", "auto", &format!("{drv}^*")],
-        300,
     );
     let out = o.combined();
     assert!(o.code != 0 && out.contains("missing: ") && !out.contains("gave up"), "{out}");

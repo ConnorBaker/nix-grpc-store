@@ -8,7 +8,6 @@
 #include <future>
 #include <print>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "builder.hh"
@@ -36,10 +35,6 @@ auto greetsFirst() -> bool
     return hellos == std::vector<bool>{true, false};
 }
 
-constexpr std::chrono::seconds hung{20};
-constexpr std::chrono::seconds atOnce{2}; // well below the wait for a late assignment
-constexpr std::chrono::milliseconds headStart{100};
-
 auto expectOf(uint64_t assignId, const std::string & drv = "a.drv") -> nix::remote::Expect
 {
     nix::remote::Expect exp;
@@ -55,19 +50,27 @@ auto earlyCallWaits() -> bool
     nixgrpc::Metrics metrics{""};
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     auto call = std::async(std::launch::async, [&] -> bool { return builder.claim("a.drv", 2); });
-    std::this_thread::sleep_for(headStart);
+    // Until the call waits; one that ended first did not.
+    while (metrics.eventCounter("expect_wait").Value() < 1) {
+        if (call.wait_for(std::chrono::milliseconds(1)) == std::future_status::ready) {
+            return false;
+        }
+    }
+    // The call waits Builder::expectLag (5 s) on the real clock, a product
+    // constant: a stall that long between these two lines fails this test on
+    // correct code. Kept, as the product's bound.
     builder.onExpect(expectOf(2));
-    return call.wait_for(hung) == std::future_status::ready && call.get();
+    return call.get() && metrics.eventCounter("expect_late").Value() == 1;
 }
 
-// The worker read a later assignment already, so this one is not on its way.
+// The worker read a later assignment already, so this one is not on its way:
+// the call is refused without waiting for it.
 auto staleCallIsRefusedAtOnce() -> bool
 {
     nixgrpc::Metrics metrics{""};
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     builder.onExpect(expectOf(2));
-    auto call = std::async(std::launch::async, [&] -> bool { return builder.claim("b.drv", 1); });
-    return call.wait_for(atOnce) == std::future_status::ready && !call.get();
+    return !builder.claim("b.drv", 1) && metrics.eventCounter("expect_wait").Value() == 0;
 }
 
 constexpr auto past = std::chrono::seconds(61); // Builder's expectTimeout is 60 s

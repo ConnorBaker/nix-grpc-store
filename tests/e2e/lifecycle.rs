@@ -1,19 +1,19 @@
-use std::time::{Duration, Instant};
-
 use crate::fixtures::*;
-use crate::harness::{MACHINE, query, retry, sleep};
+use crate::harness::{MACHINE, journal_count, query, retry, unit_result};
 
 #[test]
 fn idle_exit_and_socket_activation() {
     succeed(&["systemctl", "stop", "nix-grpc-daemon.service"]);
     assert_eq!(unit_state("nix-grpc-daemon.service"), "inactive");
+    let idle0 = journal_count(MACHINE, "nix-grpc-daemon", "event=idle_exit");
     let out = succeed(&["nix", "store", "info", "--json", "--store", STORE]);
     assert!(out.contains(r#""url":"grpc://127.0.0.1:50051"#), "{out}");
     assert_eq!(unit_state("nix-grpc-daemon.service"), "active");
-    retry(30, "the daemon exits when idle", || {
-        unit_state("nix-grpc-daemon.service") == "inactive"
-    });
-    assert_journal("nix-grpc-daemon", "event=idle_exit");
+    let pid = query(MACHINE, &["systemctl", "show", "-P", "MainPID", "nix-grpc-daemon.service"]);
+    // The daemon exits when idle: its line and then its process gone, which
+    // no new activation undoes, unlike the unit's state.
+    wait_journal_above("nix-grpc-daemon", "event=idle_exit", idle0, &["nix-grpc-daemon"]);
+    wait_until_succeeds(&["sh", "-c", &format!("! test -d /proc/{}", pid.trim())]);
     succeed(&["nix", "store", "info", "--store", STORE]);
 }
 
@@ -35,8 +35,9 @@ fn nix_daemon_restart_does_not_fail_the_next_rpc() {
     let pid = main_pid();
     // SIGKILL, like a crashed container: no orderly close of the pooled connections.
     succeed(&["systemctl", "kill", "-s", "KILL", "nix-daemon.service"]);
-    // Not "inactive": the gRPC daemons reconnect on their own and may socket-activate a new one first.
-    retry(30, "the killed nix-daemon is gone", || main_pid() != pid);
+    // Gone is all this waits for: every builder probes nix-daemon every 10 s,
+    // and through its socket the next probe starts a new one, maybe at once.
+    wait_until_succeeds(&["sh", "-c", &format!("! test -d /proc/{}", pid.trim())]);
     succeed(&["systemctl", "start", "nix-daemon.socket"]);
     succeed(&["nix", "path-info", "--store", STORE, p]);
     write_file("/tmp/warm", "again");
@@ -79,19 +80,28 @@ fn a_failed_connection_while_nix_daemon_is_down_does_not_poison_the_worker() {
         "nix-daemon.socket",
         "nix-daemon.service",
     ]);
-    let mut down = vec!["timeout", "6s"];
-    down.extend(build_argv(&store, "/tmp/reconnect.nix"));
-    let out = run_t(&down, 15);
-    succeed(&["systemctl", "start", "nix-daemon.socket"]);
-    assert_ne!(out.code, 0, "build succeeded with the daemon down");
+    // A client that may retry for long: it is stopped once its RPC has
+    // failed on the unavailable daemon.
+    let down = "build-while-down";
+    let mut argv = vec!["systemd-run", "--unit", down];
+    argv.extend(build_argv(&store, "/tmp/reconnect.nix"));
+    succeed(&argv);
+    let lost = "local nix-daemon connection lost";
+    retry(&[(MACHINE, down)],"the RPC reached the unavailable daemon", || {
+        journal_count(MACHINE, down, lost) > 0
+    });
+    // Still running, or ended by itself with a failure: a stopped unit
+    // would read as a success.
+    let gone = ended(down);
     assert!(
-        out.combined().contains("local nix-daemon connection lost"),
-        "RPC never reached the unavailable daemon: {}",
-        out.combined()
+        !gone || unit_result(MACHINE, down) != "success",
+        "build succeeded with the daemon down"
     );
+    run(&["systemctl", "stop", down]);
+    succeed(&["systemctl", "start", "nix-daemon.socket"]);
 
-    wait_until_succeeds(&["nix", "store", "info", "--store", "daemon"], 30);
-    wait_until_succeeds(&build_argv(&store, "/tmp/reconnect.nix"), 30);
+    wait_until_succeeds(&["nix", "store", "info", "--store", "daemon"]);
+    wait_until_succeeds(&build_argv(&store, "/tmp/reconnect.nix"));
     assert_eq!(
         pid,
         main_pid(),
@@ -115,8 +125,7 @@ fn renewed_server_certificate_is_served_without_restart() {
         "bash",
         &d,
     ]);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    retry(&[], "the server presents the renewed certificate", || {
         // s_client may exit non-zero because the server wants a client
         // certificate, so only the printed SANs count.
         let sans = succeed(&[
@@ -125,15 +134,8 @@ fn renewed_server_certificate_is_served_without_restart() {
             "openssl s_client -connect localhost:50052 </dev/null 2>/dev/null \
              | openssl x509 -noout -ext subjectAltName || true",
         ]);
-        if sans.contains("renewed.example") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the server still presents the old certificate, SANs: {sans}"
-        );
-        sleep(1);
-    }
+        sans.contains("renewed.example")
+    });
     succeed(&[
         "nix",
         "store",
@@ -164,17 +166,14 @@ fn default_client_cert_lookup() {
         &format!("{d}/client.key"),
         "/var/lib/nix-grpc-store/client.key",
     ]);
-    let out = run_t(
-        &[
-            "nix",
-            "store",
-            "add",
-            "--store",
-            &anon_store(),
-            "/etc/hello.nix",
-        ],
-        120,
-    );
+    let out = run(&[
+        "nix",
+        "store",
+        "add",
+        "--store",
+        &anon_store(),
+        "/etc/hello.nix",
+    ]);
     succeed(&["rm", "-r", "/var/lib/nix-grpc-store"]);
     assert_eq!(out.code, 0, "{}", out.combined());
 }

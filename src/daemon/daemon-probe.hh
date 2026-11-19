@@ -54,6 +54,9 @@ inline auto readBy(int sock, std::span<unsigned char> want, std::chrono::steady_
 }
 } // namespace probe
 
+// How long the coordinator gives the local nix-daemon to greet.
+constexpr std::chrono::seconds daemonPatience{5};
+
 // True if the nix-daemon listening at `socket` greets a new connection
 // within `timeout`.
 inline auto nixDaemonAnswers(const std::filesystem::path & socket, std::chrono::milliseconds timeout) -> bool

@@ -103,9 +103,23 @@ Tunnels::~Tunnels()
 
 void Tunnels::stop()
 {
-    stopping = true;
+    {
+        const std::scoped_lock lock(adopting);
+        stopping = true;
+    }
     pause.set();
     stirAll(false);
+}
+
+auto Tunnels::handOver(nix::AutoCloseFD sock) -> bool
+{
+    const std::scoped_lock lock(adopting);
+    // The balancer sees the tunnel close and tries another.
+    if (stopping) {
+        return false;
+    }
+    config.adopt(std::move(sock));
+    return true;
 }
 
 void Tunnels::setTakesWork(bool takes)
@@ -300,7 +314,10 @@ void Tunnels::hold(Slot & slot, Group & group)
     if (!watch) {
         throw nix::SysError("dup");
     }
-    config.adopt(std::move(sock));
+    if (!handOver(std::move(sock))) {
+        left = true;
+        return;
+    }
     for (;;) {
         slot.stir.clear();
         if (leaves(slot)) {
