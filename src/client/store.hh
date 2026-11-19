@@ -568,11 +568,15 @@ private:
        queryValidPaths() so the walk needs no round trip of its own per
        path or per level. Nix's walk runs on the thread that calls it, so
        the answers are this thread's, for this store, and only while that
-       queryMissing() runs: no other caller or walk sees them. */
+       queryMissing() runs: no other caller or walk sees them. So are the
+       paths topoSortPaths()'s QueryPathInfos left out (absent: neither
+       held nor substitutable), read by queryPathInfoUncached() while
+       Nix's sort runs. */
     struct AskedAhead {
       const GrpcStore * store;
       const std::map<StorePath, bool> * valid;
       std::function<void()> * ask;
+      const StorePathSet * absent;
     };
     static inline thread_local AskedAhead askedAhead{};
     void askAhead(const std::vector<DerivedPath> & targets, Store & evalStore, std::map<StorePath, bool> & valid);

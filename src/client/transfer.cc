@@ -180,7 +180,7 @@ private:
 } // namespace
 
 auto GrpcStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute) -> StorePathSet {
-  if (askedAhead.store != this || maybeSubstitute != NoSubstitute) {
+  if (askedAhead.store != this || askedAhead.valid == nullptr || maybeSubstitute != NoSubstitute) {
     return queryValidPathsRouted(paths, maybeSubstitute, {});
   }
   if (auto * ask = askedAhead.ask; ask != nullptr && *ask) {
@@ -342,14 +342,22 @@ auto GrpcStore::topoSortPaths(const StorePathSet &paths) -> StorePaths {
   // here, right before querying their info one by one; prefetch them in
   // a single RPC.
   std::map<StorePath, uint64_t> sizes;
+  StorePathSet absent = paths;
   if (!paths.empty()) {
     auto infos = queryPathInfosNative(paths);
     for (const auto & [infoPath, info] : infos) {
       sizes.emplace(infoPath, info->narSize);
+      absent.erase(infoPath);
     }
     std::scoped_lock const lock(prefetchMutex);
     prefetchedInfos.merge(infos);
   }
+  // The reply answers for every path asked: one it leaves out is absent
+  // (printMissing sorts derivations the farm does not have yet), and the
+  // sort's question about it needs no round trip of its own.
+  auto const outer = std::exchange(askedAhead, {.store = this, .absent = &absent});
+  Finally const restore([&] -> void { askedAhead = outer; });
+  debug("sorting %d paths, %d of them absent", paths.size(), absent.size());
   // copyPaths() consumes the sources in reverse topological order.
   // Record it so narFromPath() can pipeline its NAR requests.
   auto sorted = Store::topoSortPaths(paths);
@@ -396,6 +404,10 @@ void GrpcStore::runInfoBatches(const std::stop_token & stop)
 
 void GrpcStore::queryPathInfoUncached(const StorePath & path, InfoCallback callback) noexcept {
     try {
+        if (askedAhead.store == this && askedAhead.absent != nullptr && askedAhead.absent->contains(path)) {
+          callback(nullptr);
+          return;
+        }
         {
           std::scoped_lock const lock(prefetchMutex);
           if (auto const found = prefetchedInfos.find(path);

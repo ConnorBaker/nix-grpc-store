@@ -23,8 +23,15 @@
 //   deep D W: a target only that substituter has, over D levels of W
 //            derivations nobody has, each depending on all of the level
 //            below.
+//   toposort N: `nix path-info`, and printMissing's next step: the grpc
+//            store's topoSortPaths() of N derivations it does not have
+//            (only the evaluation store has them) and two paths it has,
+//            then a lookup of each; no queryMissing.
+//   toposort-probe: a path the sort found absent is added while the sort
+//            runs; the same grpc store must find it on another thread,
+//            and on this one once the sort is over.
 //
-// usage: query-missing-client <nix-grpc-store plugin> <host:port> <build> <dir> chain <N> | built <N> | mixed | deep <depth> <width> | nosubst | probe
+// usage: query-missing-client <nix-grpc-store plugin> <host:port> <build> <dir> chain <N> | built <N> | mixed | deep <depth> <width> | nosubst | probe | toposort <N> | toposort-probe
 // <build> is the root of the daemon's local store, <dir>/eval of the
 // evaluation store, and <build>-cache the substituter NIX_CONFIG must name,
 // for the client and the daemon alike: a Nix that leaves what the build
@@ -47,8 +54,10 @@
 #include "nix-compat.hh"
 
 #if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE && NIX_COMPAT_TEMPLATED_DRV
+#include <algorithm>
 #include <fstream>
 #include <functional>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -253,16 +262,17 @@ auto noSubst(Graph & graph, const std::string & buildRoot) -> std::vector<Derive
     return {out(drvPath)};
 }
 
-// Runs probe() at the first message about checking a substituter: by then
-// queryMissing has asked ahead, and is still running.
+// Runs probe() at the first message containing `at`. For queryMissing, a
+// substituter's check: by then it has asked ahead, and is still running.
 class ProbeLogger : public Logger
 {
 public:
     std::function<void()> probe;
+    std::string_view at = "checking substituter";
 
     void log(Verbosity /*lvl*/, std::string_view msg) noexcept override
     {
-        if (probe && msg.contains("checking substituter")) {
+        if (probe && msg.contains(at)) {
             std::exchange(probe, nullptr)();
         }
     }
@@ -306,6 +316,77 @@ void print(const char * label, const MissingPaths & missing)
               << label << " downloadSize: " << missing.downloadSize << " narSize: " << missing.narSize << "\n";
 }
 
+// Whether the store finds the path.
+auto finds(Store & store, const StorePath & path) -> bool
+{
+    try {
+        static_cast<void>(store.queryPathInfo(path));
+        return true;
+    } catch (InvalidPath &) {
+        return false;
+    }
+}
+
+// What `nix path-info` does through the grpc store: sort `count`
+// derivations only the evaluation store has, and two paths the farm has
+// (one referring to the other), then look up each path. Present paths keep
+// their references and infos, absent ones are InvalidPath.
+auto topoSortAbsent(const ClientArgs & args, Graph & graph, Store & build, std::size_t count) -> int
+{
+    StorePathSet asked;
+    for (std::size_t idx = 0; idx < count; ++idx) {
+        asked.insert(graph.drv("toposort-" + std::to_string(idx), {}));
+    }
+    StorePath const high{"00000000000000000000000000000007-toposort-high"};
+    StorePath const low{"00000000000000000000000000000008-toposort-low"};
+    add(build, low);
+    add(build, high, {low});
+    asked.insert(high);
+    asked.insert(low);
+    auto const grpc = openStore("grpc://" + args.target + "?insecure=true");
+    auto const sorted = grpc->topoSortPaths(asked);
+    auto const found = std::ranges::count_if(asked, [&grpc](const StorePath & path) -> bool { return finds(*grpc, path); });
+    auto const at = [&sorted](const StorePath & path) -> StorePaths::const_iterator { return std::ranges::find(sorted, path); };
+    std::cout << "SORTED " << sorted.size() << " of " << asked.size() << ", FOUND " << found << "\n";
+    return StorePathSet(sorted.begin(), sorted.end()) == asked && found == 2 && at(high) < at(low) ? 0 : differ;
+}
+
+// While the grpc store sorts a path its prefetch found absent, the path
+// becomes valid: the same store on another thread must ask the daemon, not
+// read the sort's answer, and so must this thread once the sort is over.
+auto topoSortProbe(const ClientArgs & args, Store & build) -> int
+{
+    StorePath const late{"00000000000000000000000000000009-toposort-late"};
+    auto const grpc = openStore("grpc://" + args.target + "?insecure=true");
+    auto const seen = [&grpc, &late]() -> std::string {
+        grpc->clearPathInfoCache();
+        return finds(*grpc, late) ? "live" : "STALE";
+    };
+    std::string during = "never ran";
+    ProbeLogger probeLogger;
+    probeLogger.at = "sorting";
+    probeLogger.probe = [&] -> void {
+        add(build, late);
+        std::thread thread([&] -> void { during = seen(); });
+        thread.join();
+    };
+    auto * const saved = logger;
+    auto const verbose = verbosity;
+    Finally const restore([&] -> void {
+        logger = saved;
+        verbosity = verbose;
+    });
+    verbosity = lvlDebug;
+    logger = &probeLogger;
+    static_cast<void>(grpc->topoSortPaths({late}));
+    auto const after = seen();
+    std::cout << "SORT-PROBE other thread: " << during << ", after: " << after << "\n";
+    if (during == "never ran") {
+        return broken;
+    }
+    return during == "live" && after == "live" ? 0 : differ;
+}
+
 auto run(const ClientArgs & args) -> int
 {
     auto const & scenario = args.scenario;
@@ -313,6 +394,12 @@ auto run(const ClientArgs & args) -> int
     auto const build = openStore("local?root=" + args.build);
     auto const cache = openStore("file://" + args.build + "-cache?compression=none");
     Graph graph{&*eval};
+    if (scenario == "toposort-probe" && args.rest.empty()) {
+        return topoSortProbe(args, *build);
+    }
+    if (scenario == "toposort" && args.rest.size() == 1) {
+        return topoSortAbsent(args, graph, *build, std::stoul(args.rest.front()));
+    }
     std::vector<DerivedPath> targets;
     if (scenario == "chain" && args.rest.size() == 1) {
         targets = chain(graph, std::stoul(args.rest.front()));
@@ -412,7 +499,7 @@ try {
     std::vector<std::string> const args(std::next(argSpan.begin()), argSpan.end());
     constexpr std::size_t fixed = 5;
     if (args.size() < fixed) {
-        std::cerr << "usage: query-missing-client <nix-grpc-store plugin> <host:port> <build> <dir> chain <N> | built <N> | mixed | deep <depth> <width> | nosubst | probe\n";
+        std::cerr << "usage: query-missing-client <nix-grpc-store plugin> <host:port> <build> <dir> chain <N> | built <N> | mixed | deep <depth> <width> | nosubst | probe | toposort <N> | toposort-probe\n";
         return broken;
     }
     auto arg = args.begin();
