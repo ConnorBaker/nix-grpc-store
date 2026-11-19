@@ -48,10 +48,13 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     auto lck = state.lock();
     arrived(*lck);
     auto & ent = lck->expected[exp.drv_path()];
-    if (ent.claimed) {
-        return; // re-announced across a scheduler restart, keep the live one
-    }
+    // A claimed one runs here already: placed here again (a client bounced
+    // off it), or re-announced across a scheduler restart. Its Done names
+    // the placement the scheduler holds now, the latest.
     ent.assignId = exp.assign_id();
+    if (ent.claimed) {
+        return;
+    }
     ent.since = config.now();
     metrics.event("expect");
 }
