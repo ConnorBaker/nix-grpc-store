@@ -12,7 +12,7 @@ fn idle_exit_and_socket_activation() {
     let pid = query(MACHINE, &["systemctl", "show", "-P", "MainPID", "nix-grpc-daemon.service"]);
     // The daemon exits when idle: its line and then its process gone, which
     // no new activation undoes, unlike the unit's state.
-    wait_journal_above("nix-grpc-daemon", "event=idle_exit", idle0, &[]);
+    wait_journal_above("nix-grpc-daemon", "event=idle_exit", idle0, &["nix-grpc-daemon"]);
     wait_until_succeeds(&["sh", "-c", &format!("! test -d /proc/{}", pid.trim())]);
     succeed(&["nix", "store", "info", "--store", STORE]);
 }
@@ -89,9 +89,9 @@ fn a_failed_connection_while_nix_daemon_is_down_does_not_poison_the_worker() {
     });
     // Still running, or ended by itself with a failure: a stopped unit
     // would read as a success.
-    let ended = unit_state(down) != "active";
+    let gone = ended(down);
     assert!(
-        !ended || unit_result(MACHINE, down) != "success",
+        !gone || unit_result(MACHINE, down) != "success",
         "build succeeded with the daemon down"
     );
     run(&["systemctl", "stop", down]);

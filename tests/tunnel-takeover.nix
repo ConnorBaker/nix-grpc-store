@@ -213,7 +213,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the old process finishes its build and leaves"):
         single.succeed("pkill -f 'takeover-long-holdin[g]$'")
-        wait_succeeds(client, "! systemctl is-active long")
+        wait_until("long ended", lambda: ended(client, "long"))
         journal = client.succeed("journalctl -u long")
         assert client.succeed("systemctl show -P Result long").strip() == "success", journal
         assert journal.count("STARTED-long") == 1, journal

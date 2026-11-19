@@ -130,7 +130,7 @@ fn starts(tag: &str) -> usize {
 // Waits for the build in unit `tag` and checks it ran once, succeeded, and
 // left a valid output.
 fn finished_once(tag: &str) {
-    wait_until_succeeds(&["sh", "-c", &format!("! systemctl is-active {tag}")]);
+    retry(&[], &format!("{tag} ended"), || ended(tag));
     let result = unit_result(MACHINE, tag);
     assert_eq!(
         result,
@@ -277,7 +277,7 @@ pub mod upgrade {
         release("stopped-new");
         finished_once("stopped-old");
         finished_once("stopped-new");
-        wait_until_succeeds(&["sh", "-c", &format!("! systemctl is-active {UNIT}")]);
+        retry(&[], "the stopped daemon ended", || ended(UNIT));
         assert_eq!(
             journal_count(MACHINE, UNIT, "SIGKILL"),
             kills,
@@ -327,7 +327,7 @@ pub mod upgrade {
         release("idle-long");
         finished_once("idle-long");
         // 20 s idle timeout, counted from the last call.
-        wait_until_succeeds(&["sh", "-c", &format!("! systemctl is-active {UNIT}")]);
+        retry(&[], "the daemon idled out", || ended(UNIT));
         assert!(!alive(&old) && !alive(&new));
         let log = query(MACHINE, &["journalctl", "-u", UNIT, "--no-pager"]);
         let at = |what: &str| {
@@ -410,7 +410,7 @@ pub mod failures {
         // Its client builds again: release each build until it ends.
         retry(&[], "crash-long ended", || {
             let _ = try_release("crash-long");
-            unit_state("crash-long") != "active"
+            ended("crash-long")
         });
         assert_eq!(
             unit_result(MACHINE, "crash-long"),
