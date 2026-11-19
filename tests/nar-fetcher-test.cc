@@ -221,6 +221,31 @@ void midPathBreakResumes()
     assert(asked == nar.size() / 2);
 }
 
+// A stream cut off after longer than the retry budget, twice, still resumes:
+// each cut-off attempt that delivered bytes gets the budget anew.
+void lateCutsResume()
+{
+    auto const nar = narOf(std::string(pathA().to_string()));
+    constexpr std::chrono::seconds budget{1};
+    Fixture fix([&](int call, const auto & request, auto & writer) -> grpc::Status {
+        nix::remote::NarFrame resumed;
+        resumed.set_offset(request.offset());
+        writer.Write(resumed);
+        if (call == 2) {
+            sendNar(writer, 0, nar.substr(request.offset()));
+            return grpc::Status::OK;
+        }
+        sendNar(writer, 0, nar.substr(request.offset(), 1), false);
+        std::this_thread::sleep_for(budget * 3 / 2);
+        return {grpc::StatusCode::UNAVAILABLE, "Stream removed (Socket closed)"};
+    });
+    auto fetcher = fix.fetcher({.retryable = anyUnavailable().retryable,
+                                .budget = [=] -> std::chrono::milliseconds { return budget; }});
+
+    assert(fetch(*fetcher, pathA()) == nar);
+    assert(fix.service.calls() == 3);
+}
+
 // A server that does not say it resumes, as one from before offsets, would
 // send the start again.
 void serverThatStartsOverIsRefused()
@@ -369,6 +394,7 @@ try {
     connectFailureIsRetried();
     midStreamBreakRefetchesUntouchedPaths();
     midPathBreakResumes();
+    lateCutsResume();
     serverThatStartsOverIsRefused();
     nonRetryableFailsAtOnce();
     finishedSessionsGo();
