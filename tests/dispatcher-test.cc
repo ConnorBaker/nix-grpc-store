@@ -813,12 +813,14 @@ void testKeptQueuedExpiryExported()
 // (sched-reactor.hh: afterUnlock(writeNext)). The stats thread takes its
 // Lock afresh each round, and that Lock's release runs the queue: with one
 // Lock held across rounds the queued write waited for some other thread's
-// unlock.
+// unlock. Its client's stream ends while the build is assigned, so the
+// build is also held for that client (Core::holdMs) and kept until the
+// later of the two: the wait runs past the hold.
 void testExpiryRevokeReachesAWorker()
 {
     constexpr double capMs = 1000;
     constexpr uint32_t lingerS = 600;
-    constexpr auto patience = std::chrono::seconds(10);
+    constexpr auto patience = std::chrono::milliseconds(static_cast<int64_t>(nixgrpc::sched::Core::holdMs)) + std::chrono::seconds(10);
     constexpr auto poll = std::chrono::milliseconds(100);
     Metrics metrics{""};
     Dispatcher disp(
