@@ -395,8 +395,8 @@ self_test() {
   }
   # stopped SIGNALS WHEN ARGS...: main as run does, its links exiting as $FAKE/exits says
   # (0 by default), sent each of SIGNALS once its first link (WHEN link), its first
-  # release (WHEN release) or a pause of its clock (WHEN pause) started (or main ended
-  # first), and then waited for.
+  # release (WHEN release) or a pause of its clock (WHEN pause) started, or a release was
+  # answered (WHEN acked) (or main ended first), and then waited for.
   stopped() {
     setup
     [ -s "$T/run-$k/exits" ] || echo 0 > "$T/run-$k/exits"
@@ -410,7 +410,10 @@ self_test() {
     (PATH="$T:$PATH" FAKE="$T/run-$k" main "$T/run-$k/out" "$@") > "$T/run-$k/stdout" 2>&1 &
     pid=$!
     set +m
-    until [ -s "$watch" ] || ! kill -0 "$pid" 2> /dev/null; do sleep 0.1; done
+    # WHEN acked: once a release is answered (release.tsv: exit 0, acknowledged).
+    local ready=(test -s "$watch")
+    [ "$when" = acked ] && ready=(grep -q $'\t0\t1\t' "$T/run-$k/out/release.tsv")
+    until "${ready[@]}" 2> /dev/null || ! kill -0 "$pid" 2> /dev/null; do sleep 0.1; done
     for s in $sigs; do
       kill -"$s" "$pid"
       # The signal is main's now (kill returned): a paused clock may go on.
@@ -512,18 +515,21 @@ self_test() {
     test "$RC$(status 's["release"]["acknowledged"]')" = 0False
   # Kills "in-turn-shared" (schedulers asked in turn under one RELEASE_S: the first, down,
   # uses it all and the others are never asked) and "in-turn" (in
-  # turn, each its own RELEASE_S: the last is asked only once both others gave up).
+  # turn, each its own RELEASE_S: the last is asked only once both others gave up). The
+  # dead ones are given up only by the stop, sent once alive:1 answered, so no time
+  # decides the order.
   next builders "grpc://dead:1;grpc://dead:2;grpc://alive:1"
-  RELEASE_S=3 run 0 -- x
+  RELEASE_S=600 stopped TERM acked x
+  # (The status lists the stores whose attempt ended: the dead ones' never did.)
   check "schedulers that do not answer hold up no other's release" \
-    test "$(grep -c '//alive:1' "$T/run-$k/releases")$(status 'sorted((x["store"], x["acknowledged"]) for x in s["release"]["stores"])')$(ended_before_asked alive:1)" \
-    = "1[('grpc://alive:1', True), ('grpc://dead:1', False), ('grpc://dead:2', False)]0"
+    test "$RELEASES$(grep -c '//alive:1' "$T/run-$k/releases")$(status '[(x["store"], x["acknowledged"]) for x in s["release"]["stores"]]')$(ended_before_asked alive:1)" \
+    = "31[('grpc://alive:1', True)]0"
   # The control: an answering scheduler listed first is released either way.
   next builders "grpc://alive:1;grpc://dead:1"
-  RELEASE_S=3 run 0 -- x
+  RELEASE_S=600 stopped TERM acked x
   check "a scheduler that answers is released whatever comes after it" \
-    test "$(grep -c '//alive:1' "$T/run-$k/releases")$(status 'sorted((x["store"], x["acknowledged"]) for x in s["release"]["stores"])')" \
-    = "1[('grpc://alive:1', True), ('grpc://dead:1', False)]"
+    test "$RELEASES$(grep -c '//alive:1' "$T/run-$k/releases")$(status '[(x["store"], x["acknowledged"]) for x in s["release"]["stores"]]')" \
+    = "21[('grpc://alive:1', True)]"
   # Kills "zero-is-released": an answer of 0 builds recorded as a release of the chain's
   # builds, while a build a restarted scheduler lost track of may still hold its slot.
   next answers none
