@@ -18,6 +18,7 @@
 
 #include "logfmt.hh"
 
+#include "builder.hh"
 #include "dispatcher.hh"
 #include "metrics.hh"
 #include "nix_remote.pb.h"
@@ -856,6 +857,60 @@ void testExpiryRevokeReachesAWorker()
     disp.workerGone(worker);
 }
 
+// A client whose build runs on the only worker that can build it refuses
+// that assignment (it could not reach the worker again). The scheduler
+// revokes the build there and places it there again, with a new id. The
+// builder, wired to the scheduler as coordinator.cc wires them, ends the
+// revoked build with a Done that must name the placement the scheduler
+// holds now: otherwise the Done ends nothing, and the worker's one slot
+// stays taken once the client is gone.
+void aBounceOffTheOnlyWorkerLeavesNoSlotTaken()
+{
+    constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+    constexpr auto drvB = "/nix/store/11111111111111111111111111111111-b.drv";
+    Metrics metrics{""};
+    Dispatcher disp(debugConfig(), metrics);
+    nixgrpc::Builder builder({.advertise = "w1:50051", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
+    auto const worker = disp.loopbackWorker([&](const SchedCmd & cmd) -> void {
+        if (cmd.has_expect()) {
+            builder.onExpect(cmd.expect());
+        } else if (cmd.has_revoke()) {
+            builder.onRevoke(cmd.revoke());
+        }
+    });
+    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
+        WorkerMsgs one;
+        *one.add_msgs() = msg;
+        disp.workerMsgs(*worker, one);
+        return true;
+    });
+    builder.greet();
+    std::vector<SchedMsg> toFirst;
+    auto first = disp.connectClient(recordMsgsInto(toFirst), [] -> void {});
+    disp.clientMsgs(first, wantOf(drvA));
+    assert(assigned(toFirst) == 1);
+    auto const firstId = toFirst.back().assigned().assign_id();
+    bool const claimed = builder.claim(drvA, firstId);
+    auto const admitted = builder.admit(drvA);
+    assert(claimed && admitted);
+    auto refuse = wantOf(drvA);
+    refuse.mutable_msgs(0)->mutable_want()->set_refused(firstId);
+    disp.clientMsgs(first, refuse);
+    builder.finished(drvA, nix::remote::Done::CANCELLED, {}, "");
+    builder.callEnded(drvA);
+    ClientMsgs cancel;
+    cancel.add_msgs()->mutable_cancel()->set_drv_path(drvA);
+    disp.clientMsgs(first, cancel);
+    disp.clientGone(first);
+    std::vector<SchedMsg> toNext;
+    auto next = disp.connectClient(recordMsgsInto(toNext), [] -> void {});
+    disp.clientMsgs(next, wantOf(drvB));
+    assert(assigned(toNext) == 1);
+    disp.clientGone(next);
+    disp.workerGone(*worker);
+    builder.setSend(nullptr);
+}
+
 } // namespace
 
 auto main() -> int
@@ -877,6 +932,7 @@ try {
     testReleaseAndTheStatsSeries();
     testKeptQueuedExpiryExported();
     testExpiryRevokeReachesAWorker();
+    aBounceOffTheOnlyWorkerLeavesNoSlotTaken();
     return 0;
 } catch (std::exception &) {
     return 1;
