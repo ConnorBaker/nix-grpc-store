@@ -56,8 +56,9 @@ auto earlyCallWaits() -> bool
             return false;
         }
     }
-    // The call waits Builder::expectLag on the real clock, the product's own
-    // bound: only a stall that long between these two lines fails here.
+    // The call waits Builder::expectLag (5 s) on the real clock, a product
+    // constant: a stall that long between these two lines fails this test on
+    // correct code. Kept, as the product's bound.
     builder.onExpect(expectOf(2));
     return call.get() && metrics.eventCounter("expect_late").Value() == 1;
 }
