@@ -67,6 +67,9 @@ public:
     // Opens no more tunnels and hands none over once it returns. Those in use
     // stay until their owner closes them.
     void stop();
+    // Hands an opened tunnel to its owner (Config::adopt). False, and the
+    // tunnel closed, once stop() returned.
+    auto handOver(nix::AutoCloseFD sock) -> bool;
 
 private:
     struct Slot

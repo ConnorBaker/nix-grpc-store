@@ -602,6 +602,21 @@ void stop_waits_for_a_tunnel_being_handed_over()
     balancer.join();
 }
 
+// A tunnel opened before stop() but handed over after it is closed, not taken.
+void no_tunnel_is_handed_over_once_stop_returned()
+{
+    Held held;
+    held.tunnels.stop();
+    const auto before = held.taken();
+    std::array<int, 2> ends{};
+    check(socketpair(AF_UNIX, SOCK_STREAM, 0, ends.data()) == 0, "socketpair");
+    const nix::AutoCloseFD balancerEnd{ends.at(1)};
+    check(!held.tunnels.handOver(nix::AutoCloseFD{ends.at(0)}), "a tunnel is handed over after stop() returned");
+    check(held.taken() == before, "the owner took a tunnel after stop() returned");
+    char byte = 0;
+    check(recv(balancerEnd.get(), &byte, 1, 0) == 0, "the tunnel refused after stop() is closed");
+}
+
 void a_tunnelled_builder_is_known_by_its_certificates_common_name()
 {
     using nixgrpc::tunnel::certName;
@@ -642,6 +657,7 @@ try {
         a_tunnel_that_ended_is_opened_again();
         a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself();
         stop_waits_for_a_tunnel_being_handed_over();
+        no_tunnel_is_handed_over_once_stop_returned();
     } catch (std::exception & err) {
         std::println(stderr, "FAIL: {}", err.what());
         return 1;
