@@ -1442,6 +1442,9 @@ public:
                 nix::StorePath const path(request->paths(idx));
                 substituteIfRemote(*localStore, path);
                 localStore->narFromPath(path, counting);
+                if (skip != 0) {
+                    return {grpc::StatusCode::OUT_OF_RANGE, "resume offset past the end of " + request->paths(idx)};
+                }
                 sink.flush();
                 nix::remote::NarFrame eofFrame;
                 eofFrame.set_path_index(static_cast<uint32_t>(idx));
@@ -1450,7 +1453,8 @@ public:
                     throw nix::Error("gRPC stream closed by peer");
                 }
             }
-            rpc.done({{"paths", std::to_string(request->paths_size())}, {"nar_bytes_out", std::to_string(narBytes)}});
+            rpc.done({{"paths", std::to_string(request->paths_size())}, {"offset", std::to_string(request->offset())},
+                      {"nar_bytes_out", std::to_string(narBytes)}});
             metrics.countNarBytes("out", rpc.caller.name, narBytes);
             return grpc::Status::OK;
         });
