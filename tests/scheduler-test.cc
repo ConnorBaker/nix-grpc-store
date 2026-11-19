@@ -486,6 +486,29 @@ void testGiveBackRemembersEveryGiver()
     assert(out.size() == 1 && out.at(0).worker == small);
 }
 
+// Two workers, w0 with two slots and w1 with one, each giving the drv back
+// as soon as it gets it, five times: once both have, the one that gave it
+// back last is passed over, so they take turns rather than w0 getting it
+// every time.
+void testRepeatGiveBacksTakeTurns()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 2);
+    auto const w1 = hello(shard, "w1", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    std::vector<WorkerId> placed;
+    for (int round = 0; round < 5; round++) {
+        assert(out.size() == placed.size() + 1);
+        placed.push_back(out.back().worker);
+        shard.giveBack(lease(shard, placed.back(), "a.drv"), GaveBack::drv);
+        shard.dispatch(out);
+    }
+    placed.push_back(out.back().worker);
+    assert((placed == std::vector<WorkerId>{w0, w1, w0, w1, w0, w1}));
+}
+
 // A worker that keeps failing for a reason of its own gets no work for a
 // while, longer each time, until it finishes a build.
 void testFailingWorkerRests()
@@ -794,6 +817,7 @@ try {
     testHelloAdoptsQueued();
     testGiveBack();
     testGiveBackRemembersEveryGiver();
+    testRepeatGiveBacksTakeTurns();
     testFailingWorkerRests();
     testCrossSystemPriority();
     testPlaceabilityFlips();
