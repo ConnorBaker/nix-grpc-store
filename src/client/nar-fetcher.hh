@@ -310,15 +310,28 @@ private:
         std::jthread thread;
 
     public:
-        Session(const NarFetcher & fetcher, std::vector<Pending> pending)
+        Session(NarFetcher & fetcher, std::vector<Pending> pending)
             : channelFactory(fetcher.channelFactory)
             , authority(fetcher.authority)
             , retry(fetcher.retry)
             , pending(std::move(pending))
+            , narMutex(fetcher.narMutex)
         {
         }
 
     private:
+        std::mutex & narMutex;
+
+        // At once, under the fetcher's lock: a path asked for meanwhile joins
+        // before any of them failed, or starts over after all did.
+        void failPending(const std::exception_ptr & cause)
+        {
+            std::scoped_lock const lock(narMutex);
+            for (const auto & item : pending) {
+                item.spool->fail(cause);
+            }
+        }
+
         void cancel()
         {
             thread.request_stop();
@@ -398,17 +411,13 @@ private:
                         retrying = !stop.stop_requested();
                     }
                     if (!retrying) {
-                        for (const auto & item : pending) {
-                            item.spool->fail(cause);
-                        }
+                        failPending(cause);
                         return;
                     }
                 }
             } catch (...) {
                 releaseCall();
-                for (const auto & item : pending) {
-                    item.spool->fail(std::current_exception());
-                }
+                failPending(std::current_exception());
             }
         }
     };
