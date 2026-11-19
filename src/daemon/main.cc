@@ -1419,8 +1419,20 @@ public:
             TaggingWriter tagged(writer);
             nixgrpc::ZstdWriterSink<TaggingWriter, nix::remote::NarFrame> sink(tagged);
 
+            // The client has this much of the first NAR already.
+            uint64_t skip = request->offset();
+            if (skip != 0) {
+                nix::remote::NarFrame resumed;
+                resumed.set_offset(skip);
+                if (!writer->Write(resumed)) {
+                    throw nix::Error("gRPC stream closed by peer");
+                }
+            }
             uint64_t narBytes = 0;
             nix::LambdaSink counting([&](std::string_view data) -> void {
+                auto const skipped = std::min<uint64_t>(skip, data.size());
+                skip -= skipped;
+                data.remove_prefix(skipped);
                 sink(data);
                 narBytes += data.size();
             });

@@ -179,9 +179,24 @@ pkgs.testers.runNixOSTest {
         client.succeed(f"systemd-run --unit long --setenv=PATH=/run/current-system/sw/bin sh -c \"{build('long', 90)} > /root/long.out\"")
         client.wait_until_succeeds("journalctl -u long | grep -q STARTED-long", timeout=120)
         old = main_pid()
+        # A copy through the tunnels for any builder, slowed down to run across the takeover. Once
+        # at full speed first: publishing the path to the cache is not what is tested.
+        big = single.succeed("head -c 16M /dev/urandom > /root/big && nix-store --add /root/big").strip()
+        client.succeed(f"nix copy --no-check-sigs --from '{store}' {big} && nix store delete {big}")
+        fetches = int(single.succeed(f"journalctl -o cat _PID={old} | grep -c 'event=rpc_start method=FetchNars' || true"))
+        single.succeed("tc qdisc add dev eth1 root tbf rate 4mbit burst 32kbit latency 400ms")
+        client.succeed(f"systemd-run --unit fetch --setenv=PATH=/run/current-system/sw/bin sh -c \"nix copy --no-check-sigs --from '{store}' {big}\"")
+        single.wait_until_succeeds(f"[ $(journalctl -o cat _PID={old} | grep -c 'event=rpc_start method=FetchNars') -gt {fetches} ]", timeout=120)
         handed = int(single.succeed(f"journalctl -u {unit} | grep -c event=handed_over || true"))
         single.succeed("/run/current-system/specialisation/next/bin/switch-to-configuration test")
         single.wait_until_succeeds(f"[ $(journalctl -u {unit} | grep -c event=handed_over) -gt {handed} ]", timeout=60)
+        single.succeed("tc qdisc del dev eth1 root")
+        client.wait_until_succeeds("! systemctl is-active -q fetch", timeout=180)
+        fetched = client.succeed("journalctl -o cat -u fetch")
+        assert client.succeed("systemctl show -P Result fetch").strip() == "success", fetched
+        # The takeover cut the copy off, and it went on where it ended.
+        assert "retrying 1 paths" in fetched, fetched
+        client.succeed(f"nix path-info {big}")
         new = main_pid()
         assert new != old, f"no new main process: {new}"
         before, old_calls = stats(), calls(old)

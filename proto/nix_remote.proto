@@ -104,6 +104,9 @@ message StoreInfoReply {
 message FetchNarsRequest {
   // Store paths to send, streamed back in this order.
   repeated string paths = 1;
+  // How much of the first path's NAR the client already has, from a call
+  // that was cut off: the server sends the rest.
+  uint64 offset = 2;
 }
 
 // One frame of a NAR download. The concatenation of all `data` fields in one
@@ -117,6 +120,9 @@ message NarFrame {
   uint32 path_index = 1;
   bytes data = 2;
   bool eof = 3;
+  // The request's `offset`, in a first frame without data, so a client knows
+  // the server resumes there rather than at the start.
+  uint64 offset = 4;
 }
 
 // Build log of a derivation built on the server. `drv_path` is a store path
