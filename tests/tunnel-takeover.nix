@@ -202,6 +202,7 @@ pkgs.testers.runNixOSTest {
         assert client.succeed("systemctl show -P Result fetch").strip() == "success", fetched
         # The takeover cut the copy off, and it went on where it ended.
         assert "retrying 1 paths" in fetched, fetched
+        single.succeed(f"journalctl -o cat -u {unit} | grep -E 'method=FetchNars .*paths=1 offset=[1-9]'")
         client.succeed(f"nix path-info {big}")
         new = main_pid()
         assert new != old, f"no new main process: {new}"

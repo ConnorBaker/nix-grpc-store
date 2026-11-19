@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <set>
 #include <span>
@@ -396,10 +397,22 @@ private:
 
         void attempts(const std::stop_token & stop)
         {
-            Backoff backoff(fetcher.retry.budget());
+            // As GrpcStore::retryingWithProgress: the budget counts from the
+            // first failure, and anew after an attempt that delivered bytes:
+            // the server was reachable.
+            std::optional<Backoff> backoff;
+            auto const received = [&] -> uint64_t {
+                return std::ranges::fold_left(
+                    pending | std::views::transform([](const Pending & item) -> uint64_t { return item.spool->received(); }),
+                    uint64_t{0}, std::plus{});
+            };
             try {
                 for (;;) {
+                    auto const before = received();
                     auto const status = fetchOnce(stop);
+                    if (!backoff || received() > before) {
+                        backoff.emplace(fetcher.retry.budget());
+                    }
                     releaseCall();
                     if (!status.ok()) {
                         nix::checkInterrupt(); // our own cancel; the handler below passes it on
@@ -414,7 +427,7 @@ private:
                     std::erase_if(pending, [](const Pending & item) -> bool { return item.spool->delivered(); });
                     auto const later = std::ranges::subrange(pending.begin() + (pending.empty() ? 0 : 1), pending.end());
                     auto const cutOff = std::ranges::stable_partition(later, &NarSpool::untouched, &Pending::spool);
-                    if (pending.empty() || stop.stop_requested() || !fetcher.retry.shouldRetry(status, backoff)) {
+                    if (pending.empty() || stop.stop_requested() || !fetcher.retry.shouldRetry(status, *backoff)) {
                         failAll(pending, cause);
                         return;
                     }
@@ -428,7 +441,7 @@ private:
                     std::mutex sleepMutex;
                     std::unique_lock sleepLock(sleepMutex);
                     // Returns early only when the fetcher shuts down.
-                    wake.wait_for(sleepLock, stop, backoff.next(), [] -> bool { return false; });
+                    wake.wait_for(sleepLock, stop, backoff->next(), [] -> bool { return false; });
                     if (stop.stop_requested()) {
                         failAll(pending, cause);
                         return;
