@@ -282,8 +282,7 @@ public:
       return queryValidPathsRouted(paths, maybeSubstitute, {});
     }
 
-    // RemoteStore would tunnel this. One RPC, with a fallback to the
-    // client-side walk for servers without QueryMissing.
+    // RemoteStore would tunnel this. One RPC.
 #if NIX_COMPAT_HAS_QUERY_MISSING_EVAL_STORE
     auto queryMissing(const std::vector<DerivedPath> & targets, Store * evalStore = nullptr)
         -> MissingPaths override;
