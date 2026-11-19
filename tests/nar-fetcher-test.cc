@@ -190,6 +190,49 @@ void midStreamBreakRefetchesUntouchedPaths()
     assert(requests.at(1) == std::vector<std::string>{std::string(pathB().to_string())});
 }
 
+// Half of a NAR, then the stream breaks; `rest` answers the next call.
+auto cutHalfway(const std::string & nar, std::function<void(const nix::remote::FetchNarsRequest &, grpc::ServerWriter<nix::remote::NarFrame> &)> rest) -> Handler
+{
+    return [nar, rest = std::move(rest)](int call, const auto & request, auto & writer) -> grpc::Status {
+        if (call == 0) {
+            sendNar(writer, 0, nar.substr(0, nar.size() / 2), false);
+            return {grpc::StatusCode::UNAVAILABLE, "Stream removed (Socket closed)"};
+        }
+        rest(request, writer);
+        return grpc::Status::OK;
+    };
+}
+
+// A path cut off mid-NAR goes on where it ended.
+void midPathBreakResumes()
+{
+    auto const nar = narOf(std::string(pathA().to_string()));
+    std::atomic<uint64_t> asked = 0;
+    Fixture fix(cutHalfway(nar, [&](const auto & request, auto & writer) -> void {
+        asked = request.offset();
+        nix::remote::NarFrame resumed;
+        resumed.set_offset(request.offset());
+        writer.Write(resumed);
+        sendNar(writer, 0, nar.substr(request.offset()));
+    }));
+    auto fetcher = fix.fetcher(anyUnavailable());
+
+    assert(fetch(*fetcher, pathA()) == nar);
+    assert(asked == nar.size() / 2);
+}
+
+// A server that does not say it resumes, as one from before offsets, would
+// send the start again.
+void serverThatStartsOverIsRefused()
+{
+    auto const nar = narOf(std::string(pathA().to_string()));
+    Fixture fix(cutHalfway(nar, [&](const auto &, auto & writer) -> void { sendNar(writer, 0, nar); }));
+    auto fetcher = fix.fetcher(anyUnavailable());
+
+    assert(fetchFails(*fetcher, pathA()));
+    assert(fix.service.calls() == 2);
+}
+
 void nonRetryableFailsAtOnce()
 {
     Fixture fix([](int, const auto &, auto &) -> grpc::Status {
@@ -345,6 +388,8 @@ try {
     failedFetchIsRetried();
     connectFailureIsRetried();
     midStreamBreakRefetchesUntouchedPaths();
+    midPathBreakResumes();
+    serverThatStartsOverIsRefused();
     nonRetryableFailsAtOnce();
     rerecordedPathIsFetchedOnce();
     finishedSessionsGo();

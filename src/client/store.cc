@@ -100,8 +100,8 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
       narFetcher{
           [this] -> std::shared_ptr<grpc::Channel> { return makeChannel(true); },
           config->authority.to_string(), config->narConnections,
-          // Only paths with nothing received are fetched again, so a broken
-          // stream is as safe to retry as a failed connect.
+          // A path cut off resumes where it ended, so a broken stream is as
+          // safe to retry as a failed connect.
           nixgrpc::RetryPolicy{
               .retryable = [](const grpc::Status & status) -> bool {
                 return nixgrpc::goneAway(status) || nixgrpc::streamBroken(status);
