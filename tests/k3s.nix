@@ -348,11 +348,23 @@ pkgs.testers.runNixOSTest {
         # Complete as `rollout status` judges it (its spec seen, every
         # replica updated and available, none old), without its progress
         # deadline. The chart's helm-install Job creates it first.
+        # A container of its pods that exited (restarted, or crash looping)
+        # never makes it complete: that fails it, after dump().
         fields = "{.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.replicas} {.status.updatedReplicas} {.status.availableReplicas}"
+        labels = "{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}"
+        restarts = "{.items[*].status.containerStatuses[*].restartCount}"
         def complete() -> bool:
             status, out = machine.execute(f"kubectl -n farm get deployment {deployment} -o jsonpath='{fields}'", timeout=None)
             f = out.split()
-            return status == 0 and len(f) == 6 and f[0] == f[1] and f[2] == f[3] == f[4] == f[5]
+            if status == 0 and len(f) == 6 and f[0] == f[1] and f[2] == f[3] == f[4] == f[5]:
+                return True
+            status, sel = machine.execute(f"kubectl -n farm get deployment {deployment} -o go-template='{labels}'", timeout=None)
+            if status == 0 and sel.strip(","):
+                out = machine.execute(f"kubectl -n farm get pods -l {sel.strip(',')} -o jsonpath='{restarts}'", timeout=None)[1]
+                if any(int(n) > 0 for n in out.split()):
+                    dump()
+                    raise RequestedAssertionFailed(f"a container of deployment {deployment} exited before it rolled out: restarts {out}")
+            return False
         wait_until(f"deployment {deployment} rolled out", complete)
     def dump() -> None:
         machine.execute(
@@ -370,12 +382,8 @@ pkgs.testers.runNixOSTest {
     kubectl("create secret generic farm-ca --from-file=ca.crt=${certs}/ca.crt")
 
     with subtest("chart deploys and workers become Ready"):
-        try:
-            for d in ["lb", "scheduler", "worker-${groupName}"]:
-                rollout(f"nix-grpc-farm-{d}")
-        except Exception:
-            dump()
-            raise
+        for d in ["lb", "scheduler", "worker-${groupName}"]:
+            rollout(f"nix-grpc-farm-{d}")
         wait_unit(machine, "niks3.service")
         # envoy has health-checked both workers and the scheduler
         lb_ip = pod_ip("-l app.kubernetes.io/component=lb")

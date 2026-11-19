@@ -274,10 +274,10 @@ in
         # [g]: pgrep must not match the shell that runs it
         return f"pgrep -f '{name}-marker-runnin[g]'"
 
-    def release(name):
+    def release(name, unit):
         # a held build ends: its builder takes SIGUSR1 (the leading space:
-        # `chain` must not match `qchain`)
-        wait_succeeds(worker, f"pkill -USR1 -f ' {name}-marker-runnin[g]'")
+        # `chain` must not match `qchain`); `unit` on the client waits for it
+        wait_succeeds(worker, f"pkill -USR1 -f ' {name}-marker-runnin[g]'", clients=[(client, unit)])
 
     def end_link(path, unit, n, user="alice"):
         # The running link ends as its CLIENT_S bound would end it, by
@@ -420,7 +420,7 @@ in
             end_gap("/home/alice", "qchain-chain", gap)
             wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-qchain", clients=[(client, "qchain-chain")])
             # the next slot frees with the chain's link back
-            release("rival")
+            release("rival", "rival")
             wait_succeeds(client, f"test -s {qchain}/status.json", clients=[(client, "qchain-chain")])
             status = json.loads(client.succeed(f"cat {qchain}/status.json"))
             q, late = first("tribuchet-hub", hub, "queueing build", "qchain"), first("tribuchet-hub", hub, "queueing build", "late")
@@ -473,7 +473,7 @@ in
             # revoke reaches the builder that logs it: the daemon writes the line
             wait_journal(hub, "nix-grpc-daemon", "event=revoked_running ", "tt-stopme", clients=[(hub, "nix-grpc-daemon")])
             took = time.monotonic() - stopped_at
-            wait_succeeds(client, f"test -s {stop}/status.json")
+            wait_succeeds(client, f"test -s {stop}/status.json", clients=[(client, "stopme-chain")])
             status = json.loads(client.succeed(f"cat {stop}/status.json"))
             released = lines(hub, "nix-grpc-daemon", "event=released", f"lease={lease[:8]}")
             check(not lines(hub, "nix-grpc-daemon", lease), "the scheduler logged the lease id in full")
@@ -550,8 +550,10 @@ in
             check(gap1["started"] == 1, f"the queued build did not get the slot that freed in the gap: {gap1}")
             check(not gap1["followed_idle_s"], f"the next client was back before the slot freed, no gap tested: {gap1}")
             # and the chain's build has the slot
+            # hold2, staged on the worker, runs once hold1's slot freed
+            wait_succeeds(worker, running("hold2"), clients=[(hub, "hold2")])
             hub.succeed("systemctl kill --signal=SIGKILL hold2")
-            wait_succeeds(worker, "pkill -KILL -f 'hold2-marker-runnin[g]'")
+            worker.execute("pkill -KILL -f 'hold2-marker-runnin[g]'", timeout=None)
             end_gap("/home/alice", "chain", gap)
             wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-chain", clients=[(client, "chain")])
 
@@ -570,7 +572,7 @@ in
             restart_hub()
             end_gap("/home/alice", "chain", gap)
             wait_journal(hub, "nix-grpc-daemon", "event=linger_followed ", "tt-chain", more_than=1, clients=[(client, "chain")])
-            release("chain")
+            release("chain", "chain")
             wait_succeeds(client, f"test -s {chain}/status.json", clients=[(client, "chain")])
             status = json.loads(client.succeed(f"cat {chain}/status.json"))
             clients = client.succeed(f"cat {chain}/clients.jsonl")
