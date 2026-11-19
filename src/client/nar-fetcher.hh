@@ -77,11 +77,21 @@ class NarSpool
     uint64_t written = 0;
     bool eof = false;
     std::exception_ptr failure;
+    std::string narHash; // only the session's reader thread uses it
 
 public:
     explicit NarSpool(std::shared_ptr<SpoolFile> file)
         : file(std::move(file))
     {
+    }
+
+    // A resumed path must go on with the NAR it started with.
+    void identify(const std::string & hash)
+    {
+        if (written != 0 && hash != narHash) {
+            throw nix::Error("gRPC FetchNars resumed with NAR %s instead of %s", hash, narHash);
+        }
+        narHash = hash;
     }
 
     void append(std::string_view data)
@@ -206,13 +216,21 @@ inline void demuxNarFrames(Reader & reader, const std::vector<std::shared_ptr<Na
     bool first = true;
     while (reader.Read(&frame)) {
         // A server that starts over would add the NAR's start a second time.
-        if (std::exchange(first, false) && frame.offset() != offset) {
-            throw nix::Error("gRPC FetchNars resumed at byte %d instead of %d", frame.offset(), offset);
+        if (std::exchange(first, false)) {
+            if (frame.offset() != offset) {
+                throw nix::Error("gRPC FetchNars resumed at byte %d instead of %d", frame.offset(), offset);
+            }
+            if (offset != 0) {
+                targets.front()->identify(frame.nar_hash());
+            }
         }
         if (frame.path_index() >= targets.size()) {
             throw nix::Error("gRPC FetchNars sent path index %d for %d requested paths", frame.path_index(), targets.size());
         }
         const auto & target = targets.at(frame.path_index());
+        if (!frame.nar_hash().empty()) {
+            target->identify(frame.nar_hash());
+        }
         ZSTD_inBuffer zin{.src = frame.data().data(), .size = frame.data().size(), .pos = 0};
         while (true) {
             ZSTD_outBuffer zout{.dst = out.data(), .size = out.size(), .pos = 0};

@@ -69,6 +69,7 @@
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/file-system.hh>
+#include <nix/util/hash.hh>
 #include <nix/util/ref.hh>
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
@@ -1440,6 +1441,7 @@ public:
             {
                 NarFrameWriter * writer;
                 uint32_t pathIndex = 0;
+                std::string narHash; // for the path's first frame
 
             public:
                 explicit TaggingWriter(NarFrameWriter * writer)
@@ -1447,14 +1449,16 @@ public:
                 {
                 }
 
-                void setPathIndex(uint32_t index)
+                void setPath(uint32_t index, std::string hash)
                 {
                     pathIndex = index;
+                    narHash = std::move(hash);
                 }
 
                 auto Write(nix::remote::NarFrame & frame) -> bool
                 {
                     frame.set_path_index(pathIndex);
+                    frame.set_nar_hash(std::exchange(narHash, {}));
                     return writer->Write(frame);
                 }
             };
@@ -1462,15 +1466,7 @@ public:
             TaggingWriter tagged(writer);
             nixgrpc::ZstdWriterSink<TaggingWriter, nix::remote::NarFrame> sink(tagged);
 
-            // The client has this much of the first NAR already.
             uint64_t skip = request->offset();
-            if (skip != 0) {
-                nix::remote::NarFrame resumed;
-                resumed.set_offset(skip);
-                if (!writer->Write(resumed)) {
-                    throw nix::Error("gRPC stream closed by peer");
-                }
-            }
             uint64_t narBytes = 0;
             nix::LambdaSink counting([&](std::string_view data) -> void {
                 auto const skipped = std::min<uint64_t>(skip, data.size());
@@ -1481,9 +1477,18 @@ public:
             });
 
             for (int idx = 0; idx < request->paths_size(); ++idx) {
-                tagged.setPathIndex(static_cast<uint32_t>(idx));
                 nix::StorePath const path(request->paths(idx));
                 substituteIfRemote(*localStore, path);
+                tagged.setPath(
+                    static_cast<uint32_t>(idx), localStore->queryPathInfo(path)->narHash.to_string(nix::HashFormat::SRI, true));
+                if (skip != 0) { // path 0 only: past it, skip is 0
+                    // The client has this much of the NAR already.
+                    nix::remote::NarFrame resumed;
+                    resumed.set_offset(skip);
+                    if (!tagged.Write(resumed)) {
+                        throw nix::Error("gRPC stream closed by peer");
+                    }
+                }
                 localStore->narFromPath(path, counting);
                 if (skip != 0) {
                     return {grpc::StatusCode::OUT_OF_RANGE, "resume offset past the end of " + request->paths(idx)};
