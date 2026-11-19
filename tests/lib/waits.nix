@@ -19,7 +19,9 @@
       with log.nested(f"waiting for {what}"):
           while not cond():
               for m, unit in clients:
-                  if m.execute(f"systemctl is-active -q {unit}", timeout=None)[0] != 0 and not (last or cond)():
+                  if m.execute(f"systemctl is-active -q {unit}", timeout=None)[0] != 0:
+                      if (last or cond)():
+                          return
                       journal = m.execute(f"journalctl -a --no-pager -u {unit}", timeout=None)[1]
                       raise RequestedAssertionFailed(f"{unit} on {m.name} ended while waiting for {what}:\n{journal}")
               time.sleep(1)
@@ -65,20 +67,20 @@
       )
       match = f"awk -v k={more_than + 1} {shlex.quote(awk)} {' '.join(shlex.quote(x) for x in patterns)}"
       done = f"/tmp/wait-stream-{next(streams)}"
+      # (the driver's shell has set -eu: every status is caught)
       m.succeed(
-          f"{{ coproc S {{ exec {cmd} 2>/dev/null </dev/null; }}; p=$S_PID; {match}"
-          + ' <&"''${S[0]}"; echo $? > '
-          + f'{done}.new; mv {done}.new {done}; kill "$p"; }} >/dev/null 2>&1 &'
+          f"{{ r=0; mkfifo {done}.io; {cmd} > {done}.io 2>/dev/null </dev/null & p=$!; {match} < {done}.io || r=$?;"
+          + f" kill $p 2>/dev/null || true; echo $r > {done}.new; mv {done}.new {done}; }} >/dev/null 2>&1 &"
       )
 
       def seen():
-          status, out = m.execute(f"cat {done}", timeout=None)
+          status, out = m.execute(f"cat {done} 2>/dev/null", timeout=None)
           if status == 0 and out.strip() != "0":
               raise RequestedAssertionFailed(f"{cmd} on {m.name} ended before line {more_than + 1} with {patterns}")
           return status == 0
 
       def seen_now():
-          return seen() or m.execute(f"{now} | {match}", timeout=None)[0] == 0
+          return seen() or m.execute(f"{match} < <({now})", timeout=None)[0] == 0
 
       wait_until(f"line {more_than + 1} with {patterns} from {cmd} on {m.name}", seen, clients, seen_now if now else None)
 
