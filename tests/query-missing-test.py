@@ -23,6 +23,8 @@
 #     substituter is corrupt; Nix never asks for it.
 #   probe: while the client's queryMissing runs, what it asked ahead must
 #     not answer another grpc store, or the same one on another thread.
+#   toposort-probe: what topoSortPaths found absent must not answer
+#     another thread while the sort runs, or any lookup after it.
 # Each time the client's answer must be what Nix's own walk answers over the
 # same store.
 #
@@ -46,10 +48,10 @@ SETUP_S = 30
 CLIENT_S = 120
 
 
-def calls(port):
+def calls(port, method="QueryValidPaths"):
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as resp:
         text = resp.read().decode()
-    pattern = re.compile(r'^nix_grpc_rpcs_total\{[^}]*method="QueryValidPaths"[^}]*\}\s+(\S+)$')
+    pattern = re.compile(rf'^nix_grpc_rpcs_total\{{[^}}]*method="{method}"[^}}]*\}}\s+(\S+)$')
     return sum(float(m.group(1)) for m in map(pattern.match, text.splitlines()) if m)
 
 
@@ -88,6 +90,23 @@ def main():
             return 2
         port, mport = ports
         verdicts = []
+        # printMissing then sorts the derivations to build on the grpc store,
+        # which has none of them, and `nix path-info` sorts, then looks up
+        # each path: one QueryPathInfos for all, not one per absent path.
+        work = os.path.join(tmp, "toposort")
+        os.makedirs(work)
+        before = calls(mport, "QueryPathInfos")
+        run = subprocess.run(
+            [client, plugin, f"127.0.0.1:{port}", build, work, "toposort", str(BUILT)],
+            env=nix_env(work), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=CLIENT_S,
+        )
+        made = calls(mport, "QueryPathInfos") - before
+        ok = run.returncode == 0 and made <= 1
+        print(f"--- toposort: exit {run.returncode}, {made:.0f} QueryPathInfos ---\n{run.stdout}")
+        if run.returncode == 77:
+            return 77
+        print(f"{'PASS' if ok else 'FAIL'}: toposort, {made:.0f} QueryPathInfos (at most 1)")
+        verdicts.append(ok)
         for name, limit, substituters, scenario in (
             ("chain", -(-CHAIN // BUDGET) + 1, None, ("chain", str(CHAIN))),
             ("built", 1, None, ("built", str(BUILT))),
@@ -96,6 +115,7 @@ def main():
             ("mixed-own", None, "", ("mixed",)),
             ("nosubst", None, None, ("nosubst",)),
             ("probe", None, None, ("probe",)),
+            ("toposort-probe", None, None, ("toposort-probe",)),
         ):
             work = os.path.join(tmp, name)
             os.makedirs(work)
