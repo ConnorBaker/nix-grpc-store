@@ -4,6 +4,7 @@
 // NIX_COMPAT_VERSION_{MAJOR,MINOR} come from meson (version of the
 // `nix-store` pkg-config dependency).
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <filesystem>
@@ -386,14 +387,15 @@ public:
 // max-jobs as Nix's configuration says now, not as nix::settings read it at
 // startup: fresh settings filled by Nix's own loader (nix.conf and its
 // includes, the user files, NIX_CONFIG). Only the WorkerSettings base is
-// instantiated, so no other setting's parser runs (or warns).
+// instantiated, so no other setting's parser runs (or warns). 0 (nix: no local
+// builds) still takes one.
 inline auto configuredMaxBuildJobs() -> unsigned {
   using Worker = std::remove_cvref_t<decltype(nix::settings.getWorkerSettings())>;
   // WorkerSettings' constructor is protected. Its bases are Nix's.
   struct Fresh : Worker {}; // NOLINT(misc-multiple-inheritance)
   Fresh fresh;
   nix::loadConfFile(fresh);
-  return fresh.maxBuildJobs;
+  return std::max<unsigned>(fresh.maxBuildJobs, 1U);
 }
 
 // The worker's own `cores`.

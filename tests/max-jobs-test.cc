@@ -42,8 +42,10 @@ try {
     write(dir / "nix.conf", "max-jobs = 2\n!include fragment.conf\n");
     assert(nixcompat::configuredMaxBuildJobs() == 2);
 
-    write(fragment, "max-jobs = 7\n");
-    assert(nixcompat::configuredMaxBuildJobs() == 7);
+    write(fragment, "max-jobs = 128\n");
+    assert(nixcompat::configuredMaxBuildJobs() == 128);
+    write(fragment, "max-jobs = 0\n");
+    assert(nixcompat::configuredMaxBuildJobs() == 1);
     write(fragment, "build-max-jobs = 5\n");
     assert(nixcompat::configuredMaxBuildJobs() == 5);
     write(fragment, "max-jobs = auto\n");
