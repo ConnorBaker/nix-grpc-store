@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <ranges>
+#include <set>
 #include <nix/store/path.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
@@ -233,8 +234,10 @@ public:
     void recordOrder(std::vector<nix::StorePath> order, std::map<nix::StorePath, uint64_t> sizes)
     {
         std::scoped_lock const lock(narMutex);
+        // `nix store make-content-addressed` records its paths, then their closure.
+        std::set<nix::StorePath> queued(pending.begin(), pending.end());
         for (auto & path : order) {
-            if (!live(path)) {
+            if (!live(path) && queued.insert(path).second) {
                 pending.push_back(std::move(path));
             }
         }
