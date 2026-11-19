@@ -10,6 +10,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -173,6 +174,172 @@ public:
         place(idx, last);
         siftUp(idx);
         siftDown(pos.at(last.second));
+    }
+};
+
+// How many placed drvs each client waits for.
+using Served = absl::flat_hash_map<ClientId, uint32_t>;
+
+// The wait queue of one system. The next drv is taken from the client that
+// waits for the fewest placed ones, so a client with a long queue cannot keep
+// another one waiting behind it. A client's own drvs go by key. A drv several
+// clients wait for is queued with each. One set with no client (kept for a
+// client that will be back) counts but is listed under none. A follower that
+// cancelled it may still list it, so it can reach the top once: Core's
+// dispatchHead skips it there and sets it again with no client.
+//
+// A drv is not searched for when it leaves: its items lose their stamp and are
+// dropped when they reach the front of a client's heap.
+class WaitQueue
+{
+    struct Item
+    {
+        double key = 0;
+        DrvId drv = 0;
+        uint64_t stamp = 0;
+        auto operator>(const Item & other) const -> bool
+        {
+            return std::pair(key, drv) > std::pair(other.key, other.drv);
+        }
+    };
+    struct Line
+    {
+        uint32_t served = 0;
+        std::vector<Item> heap; // smallest key first
+        // As listed in `turn`, if it is.
+        std::optional<std::pair<uint32_t, double>> listed;
+    };
+    absl::flat_hash_map<ClientId, Line> lines;
+    // (served, key of the client's first item, client). The first client's
+    // first item is always a queued drv; others may be stale, which can only
+    // list a client too early.
+    std::set<std::tuple<uint32_t, double, ClientId>> turn;
+    std::vector<uint64_t> stamps; // by drv; 0 when not queued
+    uint64_t lastStamp = 0;
+    size_t queued = 0;
+
+    [[nodiscard]] auto stale(const Item & item) const -> bool
+    {
+        return stamps.at(item.drv) != item.stamp;
+    }
+
+    void relist(ClientId client, Line & line)
+    {
+        auto const now = line.heap.empty() ? std::nullopt : std::optional(std::pair(line.served, line.heap.front().key));
+        if (line.listed == now) {
+            return;
+        }
+        if (line.listed) {
+            turn.erase({line.listed->first, line.listed->second, client});
+        }
+        if (now) {
+            turn.emplace(now->first, now->second, client);
+        }
+        line.listed = now;
+    }
+
+    // Drops stale items until the first client's first item is a queued drv.
+    void settle()
+    {
+        while (!turn.empty()) {
+            auto const client = std::get<2>(*turn.begin());
+            auto const iter = lines.find(client);
+            auto & line = iter->second;
+            if (!stale(line.heap.front())) {
+                return;
+            }
+            while (!line.heap.empty() && stale(line.heap.front())) {
+                std::ranges::pop_heap(line.heap, std::greater{});
+                line.heap.pop_back();
+            }
+            relist(client, line);
+            if (line.heap.empty()) {
+                lines.erase(iter);
+            }
+        }
+    }
+
+public:
+    // Fewest placed drvs first, then the key.
+    using Rank = std::pair<uint32_t, double>;
+
+    [[nodiscard]] auto size() const -> size_t
+    {
+        return queued;
+    }
+
+    [[nodiscard]] auto top() const -> std::optional<DrvId>
+    {
+        if (turn.empty()) {
+            return std::nullopt;
+        }
+        return lines.at(std::get<2>(*turn.begin())).heap.front().drv;
+    }
+
+    [[nodiscard]] auto topKey() const -> std::optional<Rank>
+    {
+        if (turn.empty()) {
+            return std::nullopt;
+        }
+        return Rank{std::get<0>(*turn.begin()), std::get<1>(*turn.begin())};
+    }
+
+    void set(DrvId drv, double key, const std::vector<ClientId> & clients, const Served & served)
+    {
+        if (drv >= stamps.size()) {
+            stamps.resize(size_t{drv} + 1, 0);
+        }
+        if (stamps.at(drv) == 0) {
+            queued++;
+        }
+        stamps.at(drv) = ++lastStamp;
+        for (auto const client : clients) {
+            auto const [iter, fresh] = lines.try_emplace(client);
+            auto & line = iter->second;
+            if (fresh) {
+                auto const count = served.find(client);
+                line.served = count == served.end() ? 0 : count->second;
+            }
+            line.heap.push_back({.key = key, .drv = drv, .stamp = lastStamp});
+            std::ranges::push_heap(line.heap, std::greater{});
+            relist(client, line);
+        }
+        settle();
+    }
+
+    void erase(DrvId drv)
+    {
+        if (drv >= stamps.size() || stamps.at(drv) == 0) {
+            return;
+        }
+        stamps.at(drv) = 0;
+        queued--;
+        settle();
+    }
+
+    // The client now waits for `served` placed drvs.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then how many.
+    void serving(ClientId client, uint32_t served)
+    {
+        auto const iter = lines.find(client);
+        if (iter == lines.end()) {
+            return;
+        }
+        iter->second.served = served;
+        relist(client, iter->second);
+        settle();
+    }
+
+    void forget(ClientId client)
+    {
+        auto const iter = lines.find(client);
+        if (iter == lines.end()) {
+            return;
+        }
+        iter->second.heap.clear();
+        relist(client, iter->second);
+        lines.erase(iter);
+        settle();
     }
 };
 
@@ -460,6 +627,9 @@ public:
         if (std::ranges::find(slot->followers, client) == slot->followers.end()) {
             slot->followers.push_back(client);
             follows[client].push_back(drv);
+            if (slot->worker != noWorker) {
+                serve(client, 1);
+            }
         }
         // A client back for a build kept for it: it follows the build again.
         std::optional<double> idleMs;
@@ -483,7 +653,7 @@ public:
         if (slot->worker != noWorker) {
             return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId), .bouncedOff = {}, .idleMs = idleMs};
         }
-        sys(slot->system).queue.set(drv, prio(*slot));
+        enqueue(drv);
         return {.drv = drv, .assigned = {}, .bouncedOff = bouncedOff, .idleMs = idleMs};
     }
 
@@ -519,6 +689,9 @@ public:
             } else if (left.kept) {
                 kept.push_back(drv);
             }
+        }
+        for (auto & [name, state] : systems) {
+            state.queue.forget(client);
         }
         releasedClients.erase(client);
     }
@@ -655,7 +828,7 @@ public:
             } else if (slot->worker == noWorker && !slot->followers.empty()) {
                 superseded.push_back({.drv = drv});
             }
-            slot->worker = wid;
+            place(*slot, wid);
             slot->assignId = assignId;
             sys(slot->system).queue.erase(drv);
             if (std::ranges::find(wkr.running, drv) == wkr.running.end()) {
@@ -719,7 +892,7 @@ public:
         if (!slot || slot->worker != wid) {
             return;
         }
-        slot->worker = noWorker;
+        place(*slot, noWorker);
         // Latest last: a worker that gives it back again is the one passed over.
         std::erase(slot->avoid, wid);
         slot->avoid.push_back(wid);
@@ -727,7 +900,7 @@ public:
         if (slot->followers.empty() && !slot->idleSinceMs) {
             retire(drv);
         } else {
-            sys(slot->system).queue.set(drv, prio(*slot));
+            enqueue(drv);
         }
     }
 
@@ -776,11 +949,11 @@ public:
             if (!slot || slot->worker != wid) {
                 continue;
             }
-            slot->worker = noWorker;
+            place(*slot, noWorker);
             if (slot->followers.empty() && !slot->idleSinceMs) {
                 retire(drv);
             } else {
-                sys(slot->system).queue.set(drv, prio(*slot));
+                enqueue(drv);
             }
         }
     }
@@ -788,10 +961,10 @@ public:
     // Across systems, so the most urgent drv wins.
     void dispatch(std::vector<Assign> & out)
     {
-        std::vector<Skipped> skipped;
+        std::vector<DrvId> skipped; // off the queue until the pass ends
         for (;;) {
             std::string const * best = nullptr;
-            double bestKey = 0;
+            WaitQueue::Rank bestKey;
             for (const auto & [name, state] : systems) {
                 auto const key = state.queue.topKey();
                 if (key && state.free.maxFree() > 0 && (best == nullptr || *key < bestKey)) {
@@ -804,8 +977,8 @@ public:
             }
             dispatchHead(std::string(*best), out, skipped);
         }
-        for (const auto & skip : skipped) {
-            sys(skip.system).queue.set(skip.drv, skip.key);
+        for (auto const drv : skipped) {
+            enqueue(drv);
         }
     }
 
@@ -983,7 +1156,7 @@ private:
     size_t workersUp_ = 0;
     struct SystemState
     {
-        IndexedHeap queue;
+        WaitQueue queue;
         FreeIndex free; // a worker sits in each of its systems' index with the same count
     };
     std::unordered_map<std::string, SystemState> systems;
@@ -1006,6 +1179,35 @@ private:
     PathMap<std::pair<WorkerId, uint64_t>> lastBuilder;
     uint64_t lastAssignId = 0;
     size_t faultyCount = 0; // workers with `faulty` set
+    Served served;
+
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then +1 or -1.
+    void serve(ClientId client, int delta)
+    {
+        auto const iter = served.try_emplace(client).first;
+        auto const before = iter->second;
+        auto const after = static_cast<uint32_t>(static_cast<int64_t>(before) + delta);
+        for (auto & [name, state] : systems) {
+            state.queue.serving(client, after);
+        }
+        if (after == 0) {
+            served.erase(iter);
+        } else {
+            iter->second = after;
+        }
+    }
+
+    // The one place an entry gains or loses its worker, so `served` follows.
+    void place(Entry & ent, WorkerId wid)
+    {
+        auto const delta = static_cast<int>(wid != noWorker) - static_cast<int>(ent.worker != noWorker);
+        ent.worker = wid;
+        if (delta != 0) {
+            for (auto const client : ent.followers) {
+                serve(client, delta);
+            }
+        }
+    }
 
     struct Leave
     {
@@ -1037,9 +1239,12 @@ private:
             return {};
         }
         auto held = unhold(drv, *slot, client, nowMs, why);
+        if (slot->worker != noWorker) {
+            serve(client, -1);
+        }
         if (!slot->followers.empty()) {
             if (slot->worker == noWorker) {
-                sys(slot->system).queue.set(drv, prio(*slot));
+                enqueue(drv);
             }
             return {};
         }
@@ -1217,6 +1422,7 @@ private:
         while (!slot->leases.empty()) {
             dropLease(drv, *slot, slot->leases.begin());
         }
+        place(*slot, noWorker);
         auto const iter = systems.find(slot->system);
         if (iter != systems.end()) {
             iter->second.queue.erase(drv);
@@ -1253,14 +1459,14 @@ private:
         return systems.try_emplace(name).first->second;
     }
 
-    struct Skipped
+    void enqueue(DrvId drv)
     {
-        std::string system;
-        DrvId drv;
-        double key;
-    };
+        if (const auto & slot = entries.at(drv)) {
+            sys(slot->system).queue.set(drv, prio(*slot), slot->followers, served);
+        }
+    }
 
-    void dispatchHead(const std::string & system, std::vector<Assign> & out, std::vector<Skipped> & skipped)
+    void dispatchHead(const std::string & system, std::vector<Assign> & out, std::vector<DrvId> & skipped)
     {
         auto & queue = sys(system).queue;
         auto const drv = queue.top().value_or(0);
@@ -1268,7 +1474,7 @@ private:
         auto & slot = entries.at(drv);
         if (slot && slot->followers.empty() && slot->worker == noWorker && slot->idleSinceMs) {
             // Kept for a client that will be back: in its place, not placed.
-            skipped.push_back({.system = system, .drv = drv, .key = prio(*slot)});
+            skipped.push_back(drv);
             return;
         }
         if (!slot || slot->followers.empty() || slot->worker != noWorker) {
@@ -1279,10 +1485,10 @@ private:
         }
         auto wid = pick(*slot);
         if (!wid) {
-            skipped.push_back({.system = system, .drv = drv, .key = prio(*slot)});
+            skipped.push_back(drv);
             return;
         }
-        slot->worker = *wid;
+        place(*slot, *wid);
         slot->assignId = ++lastAssignId;
         workers.at(*wid).running.push_back(drv);
         refreshFree(*wid);

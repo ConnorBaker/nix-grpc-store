@@ -7,9 +7,12 @@
 #include <exception>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -881,6 +884,29 @@ void testLingerKeepsAQueuedPlace()
     assert(revokes.empty() && !shard.findDrv("gone.drv"));
 }
 
+// A drv kept for a gone client's lease whose last follower cancels stays
+// listed under that follower, so it reaches the top of the queue: it is
+// skipped there and stays kept, not retired.
+void testKeptDrvAtTheTopStaysKept()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1);
+    shard.want(7, lingerWant("busy.drv", 0), 0);
+    shard.dispatch(out);
+    shard.want(1, lingerWant("d.drv", 600e3), 1000);
+    shard.want(2, lingerWant("d.drv", 0), 1000);
+    std::vector<std::pair<DrvId, WorkerId>> revokes;
+    std::vector<DrvId> kept;
+    shard.clientGone(1, 2000, revokes, kept);
+    shard.cancel(2, "d.drv", 3000);
+    auto const drv = shard.findDrv("d.drv");
+    assert(drv && shard.entry(*drv)->idleSinceMs && shard.queued() == 1);
+    shard.done(w0, "busy.drv", {});
+    shard.dispatch(out);
+    assert(shard.findDrv("d.drv") == drv && shard.queued() == 1 && out.size() == 1);
+}
+
 // Assigned and kept, a drv whose Expect runs out (Done NO_SHOW: its client
 // left before sending the build) or whose worker goes goes back to its place
 // in the queue, not away; a worker that comes back running it has it again,
@@ -1228,11 +1254,124 @@ void testReleaseKeepsAnotherClientsGrace()
     assert(revokes.size() == 1 && revokes[0].second == w0);
 }
 
+// A client with a long queue does not keep a later one waiting behind it.
+void testLeastServedClientFirst()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const wid = hello(shard, "w", 2);
+    for (auto const * name : {"big0.drv", "big1.drv", "big2.drv", "big3.drv"}) {
+        shard.want(1, {.drvPath = name, .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    }
+    shard.dispatch(out);
+    assert(out.size() == 2);
+    shard.want(2, {.drvPath = "small.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 1000);
+    shard.done(wid, shard.entry(out[0].drv)->drvPath, {});
+    shard.dispatch(out);
+    assert(out.size() == 3 && shard.entry(out[2].drv)->drvPath == "small.drv");
+
+    // A drv two clients wait for counts for both: clients 1 and 2 have one
+    // placed each, so client 3 goes first.
+    shard.want(1, {.drvPath = "small.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 1000);
+    shard.want(2, {.drvPath = "more.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 1000);
+    shard.want(3, {.drvPath = "late.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 2000);
+    shard.done(wid, shard.entry(out[1].drv)->drvPath, {});
+    shard.dispatch(out);
+    assert(out.size() == 4 && shard.entry(out[3].drv)->drvPath == "late.drv");
+}
+
+// Across systems too: a free slot of a worker offering both goes to the client
+// with fewer placed, before a more urgent drv of one with more.
+void testLeastServedClientFirstAcrossSystems()
+{
+    Core shard;
+    std::vector<Assign> out;
+    std::vector<Core::Superseded> ignored;
+    shard.hello({.addr = "w", .systems = {"x", "y"}, .features = {}, .maxJobs = 2, .running = {}}, ignored);
+    shard.want(1, {.drvPath = "a0.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    shard.want(1, {.drvPath = "a1.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 1e9}, 0);
+    shard.want(2, {.drvPath = "b.drv", .inputs = {}, .system = "y", .features = {}, .cpHintMs = 0}, 1000);
+    shard.dispatch(out);
+    assert(out.size() == 2 && shard.entry(out[1].drv)->drvPath == "b.drv");
+}
+
+// The queue against a plain model of it, over random operations. A drv
+// set with no client (kept for one) counts, but is listed under no client.
+void testWaitQueueMatchesModel()
+{
+    struct Queued
+    {
+        double key = 0;
+        std::set<ClientId> clients;
+    };
+    std::mt19937 rng(7); // NOLINT(cert-msc32-c,cert-msc51-cpp,bugprone-random-generator-seed): reproducible
+    auto const upTo = [&](uint32_t max) -> uint32_t { return std::uniform_int_distribution<uint32_t>(0, max)(rng); };
+    WaitQueue queue;
+    Served served;
+    std::map<DrvId, Queued> model;
+    for (int step = 0; step < 20000; step++) {
+        auto const drv = upTo(40);
+        auto const client = ClientId{upTo(5)};
+        switch (upTo(5)) {
+        case 0:
+        case 1: {
+            std::set<ClientId> clients{client};
+            if (upTo(3) == 0) {
+                clients.insert(upTo(5));
+            }
+            if (upTo(7) == 0) {
+                clients.clear();
+            }
+            auto const key = static_cast<double>(upTo(8));
+            queue.set(drv, key, {clients.begin(), clients.end()}, served);
+            model[drv] = {.key = key, .clients = clients};
+            break;
+        }
+        case 2:
+        case 3:
+            queue.erase(drv);
+            model.erase(drv);
+            break;
+        case 4: {
+            auto const count = upTo(3);
+            served[client] = count;
+            queue.serving(client, count);
+            break;
+        }
+        default:
+            queue.forget(client);
+            for (auto & [id, entry] : model) {
+                entry.clients.erase(client);
+            }
+        }
+        std::optional<std::tuple<uint32_t, double, ClientId, DrvId>> first;
+        for (const auto & [id, entry] : model) {
+            for (auto const who : entry.clients) {
+                auto const rank = std::tuple(served[who], entry.key, who, id);
+                // A client's place is that of its first drv.
+                if (!first || rank < *first) {
+                    first = rank;
+                }
+            }
+        }
+        assert(queue.size() == model.size());
+        assert(queue.top().has_value() == first.has_value());
+        if (first) {
+            assert(queue.topKey() == WaitQueue::Rank(std::get<0>(*first), std::get<1>(*first)));
+            assert(queue.top() == std::get<3>(*first));
+        }
+    }
+}
+
 } // namespace
 // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length)
 
 auto main() -> int
 try {
+    testLeastServedClientFirst();
+    testLeastServedClientFirstAcrossSystems();
+    testWaitQueueMatchesModel();
     testHeapAgainstMap();
     testFreeIndex();
     testAssignAndDedup();
@@ -1252,6 +1391,7 @@ try {
     testLingerLongestAndDone();
     testLingerKeepsAQueuedPlace();
     testLingerOutlivesNoShowAndWorkerLoss();
+    testKeptDrvAtTheTopStaysKept();
     testKeptBuildPlacedOnlyForAClient();
     testStaleDoneLeavesAKeptPlacement();
     testLingerStats();

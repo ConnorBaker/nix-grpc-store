@@ -82,6 +82,16 @@ struct LeaseInvariants // NOLINT(misc-use-internal-linkage): Core names it as it
                 }
             }
         }
+        // How many placed drvs each client follows, none listed at zero.
+        Served placed;
+        for (auto const & slot : core.entries) {
+            for (auto const client : slot && slot->worker != noWorker ? slot->followers : std::vector<ClientId>{}) {
+                ++placed.try_emplace(client).first->second;
+            }
+        }
+        if (placed != core.served) {
+            fail("served disagrees with the placed followers");
+        }
         for (auto const & [id, drvs] : core.leaseDrvs) {
             std::set<DrvId> const seen(drvs.begin(), drvs.end());
             if (seen.size() != drvs.size()) {
