@@ -808,7 +808,8 @@ void testKeptQueuedExpiryExported()
 // (sched-reactor.hh: afterUnlock(writeNext)). The stats thread takes its
 // Lock afresh each round, and that Lock's release runs the queue: with one
 // Lock held across rounds the queued write waited for some other thread's
-// unlock.
+// unlock. No reconnect grace, so that the 1 s cap is what runs out, well
+// within the wait.
 void testExpiryRevokeReachesAWorker()
 {
     constexpr double capMs = 1000;
@@ -817,7 +818,8 @@ void testExpiryRevokeReachesAWorker()
     constexpr auto poll = std::chrono::milliseconds(100);
     Metrics metrics{""};
     Dispatcher disp(
-        Dispatcher::Config{.defaultSystem = "x86_64-linux", .present = {}, .lookupThreads = 0, .maxLingerMs = capMs},
+        Dispatcher::Config{
+            .defaultSystem = "x86_64-linux", .present = {}, .lookupThreads = 0, .maxLingerMs = capMs, .departedGraceMs = 0},
         metrics);
     std::atomic<int> written{0};
     Dispatcher::Worker worker{
