@@ -50,8 +50,11 @@ inline auto goneAway(const grpc::Status & status) -> bool
     case grpc::StatusCode::UNAVAILABLE:
         return transportError(msg) || !tlsRejected(msg);
     case grpc::StatusCode::CANCELLED:
-        // Empty: the daemon shut down before a handler took the call.
-        return msg.empty() || msg.contains("Cancelling all calls");
+        // The daemon shut down, exiting idle or handing over to its
+        // successor, before a handler took the call. gRPC words that with
+        // no message or with its default "CANCELLED", as it does our own
+        // cancel: callers rule that out first.
+        return msg.empty() || msg == "CANCELLED" || msg.contains("Cancelling all calls");
     default:
         return false;
     }
