@@ -123,6 +123,9 @@ message NarFrame {
   // The request's `offset`, in a first frame without data, so a client knows
   // the server resumes there rather than at the start.
   uint64 offset = 4;
+  // The NAR's hash, in each path's first frame: a resumed path must come from
+  // the same NAR as its start, and a balancer may send the retry elsewhere.
+  string nar_hash = 5;
 }
 
 // Build log of a derivation built on the server. `drv_path` is a store path

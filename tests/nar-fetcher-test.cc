@@ -105,7 +105,18 @@ auto sendNar(grpc::ServerWriter<nix::remote::NarFrame> & writer, uint32_t index,
     frame.set_path_index(index);
     frame.set_data(compressed);
     frame.set_eof(eof);
+    frame.set_nar_hash("sha256-one");
     writer.Write(frame);
+}
+
+// The first frame of a stream that resumes, from the NAR `hash`.
+auto resumeAt(const nix::remote::FetchNarsRequest & request, grpc::ServerWriter<nix::remote::NarFrame> & writer,
+              const std::string & hash = "sha256-one") -> void
+{
+    nix::remote::NarFrame resumed;
+    resumed.set_offset(request.offset());
+    resumed.set_nar_hash(hash);
+    writer.Write(resumed);
 }
 
 auto narOf(const std::string & path) -> std::string { return "nar of " + path; }
@@ -210,15 +221,30 @@ void midPathBreakResumes()
     std::atomic<uint64_t> asked = 0;
     Fixture fix(cutHalfway(nar, [&](const auto & request, auto & writer) -> void {
         asked = request.offset();
-        nix::remote::NarFrame resumed;
-        resumed.set_offset(request.offset());
-        writer.Write(resumed);
+        resumeAt(request, writer);
         sendNar(writer, 0, nar.substr(request.offset()));
     }));
     auto fetcher = fix.fetcher(anyUnavailable());
 
     assert(fetch(*fetcher, pathA()) == nar);
     assert(asked == nar.size() / 2);
+}
+
+// The retry may reach another builder, with another NAR of the path, or not
+// say which it has: its rest must not be joined to the start.
+void otherNarIsRefused()
+{
+    auto const nar = narOf(std::string(pathA().to_string()));
+    for (std::string const hash : {"sha256-two", ""}) {
+        Fixture fix(cutHalfway(nar, [&](const auto & request, auto & writer) -> void {
+            resumeAt(request, writer, hash);
+            sendNar(writer, 0, nar.substr(request.offset()));
+        }));
+        auto fetcher = fix.fetcher(anyUnavailable());
+
+        assert(fetchFails(*fetcher, pathA()));
+        assert(fix.service.calls() == 2);
+    }
 }
 
 // A stream cut off after longer than the retry budget, twice, still resumes:
@@ -228,9 +254,7 @@ void lateCutsResume()
     auto const nar = narOf(std::string(pathA().to_string()));
     constexpr std::chrono::seconds budget{1};
     Fixture fix([&](int call, const auto & request, auto & writer) -> grpc::Status {
-        nix::remote::NarFrame resumed;
-        resumed.set_offset(request.offset());
-        writer.Write(resumed);
+        resumeAt(request, writer);
         if (call == 2) {
             sendNar(writer, 0, nar.substr(request.offset()));
             return grpc::Status::OK;
@@ -415,6 +439,7 @@ try {
     midStreamBreakRefetchesUntouchedPaths();
     midPathBreakResumes();
     lateCutsResume();
+    otherNarIsRefused();
     serverThatStartsOverIsRefused();
     nonRetryableFailsAtOnce();
     rerecordedPathIsFetchedOnce();
