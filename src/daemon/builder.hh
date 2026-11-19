@@ -49,9 +49,23 @@ struct Expected
         std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along, or nobody wants it
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
-        // Written before `finished`.
+        static constexpr uint64_t checkMode = 2; // nix::bmCheck
+
+        // The build mode and limits it ran with, and whether it built. Written before `finished`.
         std::array<uint64_t, 3> settings{};
+        bool built = false;
         LogSpill spill; // the owner's build log, replayed to whoever attaches
+
+        // Whether a caller asking with `want` may take this result. Outputs are
+        // valid whatever limits built them, and Nix reuses them too, except in
+        // check mode, where a caller with other limits runs its own check. A
+        // failure (a timeout) under other limits, or another mode's result, is
+        // not that caller's: it retries and builds with its own settings.
+        [[nodiscard]] auto serves(const std::array<uint64_t, 3> & want) const -> bool
+        {
+            auto const mode = std::get<0>(want);
+            return want == settings || (built && mode == std::get<0>(settings) && mode != checkMode);
+        }
 
         // Owner only. Waking under the lock keeps an attacher that just
         // checked `written()` from sleeping through this record.

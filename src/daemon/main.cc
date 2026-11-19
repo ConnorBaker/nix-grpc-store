@@ -1033,8 +1033,7 @@ public:
         if (wire->empty()) {
             return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to did not finish, retry"};
         }
-        // Its result (a timeout, or no check) is not ours. Retrying after it finished builds anew.
-        if (shared.settings != settings) {
+        if (!shared.serves(settings)) {
             return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to ran with other mode or limits, retry"};
         }
         if (!done.ParseFromString(*wire)) {
@@ -1156,6 +1155,7 @@ public:
             metrics.event("unexpected_build");
             return {grpc::StatusCode::FAILED_PRECONDITION, "not scheduled here: " + drvName};
         }
+        static_assert(nixgrpc::Expected::Shared::checkMode == nix::bmCheck);
         std::array<uint64_t, 3> const settings{static_cast<uint64_t>(mode), limits.buildTimeout, limits.maxSilentTime};
         if (adm->attach) {
             return attached(caller, *adm->shared, settings, done);
