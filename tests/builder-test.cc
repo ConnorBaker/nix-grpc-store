@@ -2,10 +2,12 @@
 // scheduler it takes builds again only when the last one is gone, and its
 // metric shows which ones hold.
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <future>
+#include <optional>
 #include <print>
 #include <string>
 #include <vector>
@@ -182,8 +184,50 @@ auto uploadKeepsTheClaim() -> bool
     return quiet.dones.size() == 1 && builder.holding() == 0;
 }
 
+constexpr uint64_t silent = 1800; // the build's --max-silent-time
+constexpr uint64_t otherSilent = 1200;
+constexpr uint64_t check = nixgrpc::Expected::Shared::checkMode;
+
+// A second caller attaches to a running build, with the given mode and
+// limits. Does it take the result of the build, run in `mode` and ended with
+// `outcome`?
+auto attacherTakes(nix::remote::Done::Outcome outcome, const std::array<uint64_t, 3> & want, uint64_t mode = 0) -> bool
+{
+    nixgrpc::Metrics metrics{""};
+    Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
+    builder.onExpect(expectOf(1));
+    auto const owner = builder.claim("a.drv", 1) ? builder.admit("a.drv") : std::nullopt;
+    if (!owner) {
+        return false;
+    }
+    owner->shared->settings = {mode, 0, silent};
+    auto const attacher = builder.admit("a.drv");
+    builder.finished("a.drv", outcome, {}, "result");
+    return attacher && attacher->attach && attacher->shared->serves(want);
+}
+
 auto run() -> int
 {
+    if (!attacherTakes(nix::remote::Done::BUILT, {0, 0, otherSilent})) {
+        std::println("FAIL a caller with other limits does not take the outputs a build made");
+        return EXIT_FAILURE;
+    }
+    if (attacherTakes(nix::remote::Done::FAILED, {0, 0, otherSilent})) {
+        std::println("FAIL a caller with other limits takes a failure it might not have had");
+        return EXIT_FAILURE;
+    }
+    if (!attacherTakes(nix::remote::Done::FAILED, {0, 0, silent})) {
+        std::println("FAIL a caller with the same limits does not take the build's failure");
+        return EXIT_FAILURE;
+    }
+    if (attacherTakes(nix::remote::Done::BUILT, {check, 0, silent})) {
+        std::println("FAIL a caller asking for a check takes a build that checked nothing");
+        return EXIT_FAILURE;
+    }
+    if (attacherTakes(nix::remote::Done::BUILT, {check, 0, otherSilent}, check)) {
+        std::println("FAIL a caller asking for a check with other limits takes another caller's check");
+        return EXIT_FAILURE;
+    }
     if (!earlyCallWaits()) {
         std::println("FAIL a call that arrives before its assignment is not served once the assignment arrives");
         return EXIT_FAILURE;

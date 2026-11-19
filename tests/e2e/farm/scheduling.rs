@@ -283,6 +283,54 @@ fn two_clients_wanting_the_same_drv_build_it_once() {
     assert_eq!(attached() - before, 1);
 }
 
+// A client attached to a build that ran with other limits takes its outputs,
+// valid whatever limits built them, and does not ask the scheduler again.
+#[test]
+fn a_client_with_other_limits_takes_the_outputs_of_the_build_it_attached_to() {
+    farm_ready();
+    let attached = || {
+        WORKERS
+            .into_iter()
+            .map(|w| events(w, "attached"))
+            .sum::<i64>()
+    };
+    let before = attached();
+    spawn_build("limits1", "limits");
+    wait_building("limits1");
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "limits2",
+            "nix",
+            "build",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("SLOW"),
+            "--argstr",
+            "tag",
+            "limits",
+            "--max-silent-time",
+            "1200",
+        ],
+    );
+    retry(&[(CLIENT, "limits2")], "the second client attached", || {
+        attached() > before
+    });
+    release_slow();
+    wait_unit_done("limits1 limits2");
+    for unit in ["limits1", "limits2"] {
+        assert_unit_success(unit);
+    }
+    assert_eq!(attached() - before, 1);
+    let log = query(CLIENT, &["journalctl", "-u", "limits2"]);
+    assert!(!log.contains("asking the scheduler again"), "{log}");
+}
+
 #[test]
 fn timeout_and_max_silent_time_reach_the_builder() {
     farm_ready();
