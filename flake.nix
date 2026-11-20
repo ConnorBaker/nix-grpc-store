@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     # Build farm mode (PLAN.md). Only the NixOS test uses it.
-    niks3.url = "github:Mic92/niks3";
+    niks3.url = "github:ConnorBaker/niks3/4d2fd84ced4e25476fcf310e751f82159897eeee";
     niks3.inputs.nixpkgs.follows = "nixpkgs";
     # The lease checks' hub and worker. Only those checks use it, in its own
     # package set: the Nix its hub patches.
