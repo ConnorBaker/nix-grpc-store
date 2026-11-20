@@ -1,9 +1,9 @@
 //! tests/handover.nix: a node that is its own scheduler's only builder,
 //! reloaded mid-build into other configurations (its specialisations).
-use std::time::{Duration, Instant};
-
 use crate::fixtures::*;
-use crate::harness::{MACHINE, env, journal_count, query, retry, sleep, unit_result};
+use crate::harness::{
+    MACHINE, env, journal, journal_count, query, retry, unit_result,
+};
 
 const UNIT: &str = "nix-grpc-daemon.service";
 const CGROUP_PROCS: &str = "/sys/fs/cgroup/system.slice/nix-grpc-daemon.service/cgroup.procs";
@@ -21,7 +21,7 @@ fn exe(pid: &str) -> String {
 }
 
 fn alive(pid: &str) -> bool {
-    run_t(&["test", "-d", &format!("/proc/{pid}")], 60).code == 0
+    run(&["test", "-d", &format!("/proc/{pid}")]).code == 0
 }
 
 // The processes of the unit, main and others. None once it has stopped.
@@ -56,7 +56,7 @@ fn store() -> String {
     format!("{STORE}&restart-grace=20")
 }
 
-fn build_argv<'a>(store: &'a str, slow: &'a str, tag: &'a str, secs: &'a str) -> Vec<&'a str> {
+fn build_argv<'a>(store: &'a str, slow: &'a str, tag: &'a str, hold: bool) -> Vec<&'a str> {
     vec![
         "nix",
         "build",
@@ -72,14 +72,15 @@ fn build_argv<'a>(store: &'a str, slow: &'a str, tag: &'a str, secs: &'a str) ->
         "--argstr",
         "tag",
         tag,
-        "--argstr",
-        "secs",
-        secs,
+        "--arg",
+        "hold",
+        if hold { "true" } else { "false" },
     ]
 }
 
-// A build of `secs` seconds through gRPC in unit `tag`; returns once it runs.
-fn start_build(tag: &str, secs: &str) {
+// A build through gRPC in unit `tag` that runs until `release`d; returns
+// once it runs.
+fn start_build(tag: &str) {
     let slow = env("NGS_SLOW_EXPR");
     let store = store();
     let out = format!(r#""$@" > /root/{tag}.out"#);
@@ -94,16 +95,29 @@ fn start_build(tag: &str, secs: &str) {
         &out,
         "sh",
     ];
-    argv.extend(build_argv(&store, &slow, tag, secs));
+    argv.extend(build_argv(&store, &slow, tag, true));
     succeed(&argv);
-    wait_until_succeeds(
-        &[
-            "sh",
-            "-c",
-            &format!("journalctl -u {tag} | grep -q SLOW-STARTED-{tag}"),
-        ],
-        120,
-    );
+    retry(&[(MACHINE, tag)],"the build started", || starts(tag) > 0);
+}
+
+// Lets the running build of `tag` end: its builder reads a line from the
+// fifo in its build directory. Nix starts a builder with its base name as
+// argv[0], so the command line is `sh -c mkfifo ...`. The ssh shell's own
+// command line does not start as the builder's does, so pgrep finds the
+// builder alone. The fifo is opened without blocking: with no reader (the
+// builder not there yet, or gone) the open fails, ENXIO, instead of
+// waiting for a reader that may never come.
+fn try_release(tag: &str) -> bool {
+    let script = r#"p=$(pgrep -f "^sh -c mkfifo release; echo SLOW-STARTED-$1 ") && python3 -c '
+import os, sys
+os.write(os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK), b"\n")' "/proc/$p/cwd/release""#;
+    run(&["sh", "-c", script, "sh", tag]).code == 0
+}
+
+// Releases the build of `tag` once its builder reads the fifo; its client
+// ending first fails the wait.
+fn release(tag: &str) {
+    retry(&[(MACHINE, tag)],&format!("{tag} released"), || try_release(tag));
 }
 
 fn starts(tag: &str) -> usize {
@@ -115,8 +129,8 @@ fn starts(tag: &str) -> usize {
 
 // Waits for the build in unit `tag` and checks it ran once, succeeded, and
 // left a valid output.
-fn finished_once(tag: &str, secs: u64) {
-    wait_until_succeeds(&["sh", "-c", &format!("! systemctl is-active {tag}")], secs);
+fn finished_once(tag: &str) {
+    retry(&[], &format!("{tag} ended"), || ended(tag));
     let result = unit_result(MACHINE, tag);
     assert_eq!(
         result,
@@ -133,20 +147,13 @@ fn finished_once(tag: &str, secs: u64) {
     assert_eq!(succeed(&["cat", &out]).trim(), tag);
 }
 
-// A short build, which has to succeed within 30 s.
+// A short build, which has to succeed: one the daemon refuses fails once
+// the store's restart-grace has run out.
 fn quick_build(tag: &str) {
     let slow = env("NGS_SLOW_EXPR");
     let store = store();
-    let started = Instant::now();
-    let out = run_t(&build_argv(&store, &slow, tag, "1"), 120);
-    let took = started.elapsed();
-    assert_eq!(
-        out.code,
-        0,
-        "build {tag} failed after {took:?}:\n{}",
-        out.combined()
-    );
-    assert!(took < Duration::from_secs(30), "build {tag} took {took:?}");
+    let out = run(&build_argv(&store, &slow, tag, false));
+    assert_eq!(out.code, 0, "build {tag} failed:\n{}", out.combined());
 }
 
 fn system(name: &str) -> String {
@@ -174,17 +181,18 @@ fn other(a: &'static str, b: &'static str) -> &'static str {
 
 fn switch_to(name: &str) -> crate::harness::Out {
     let bin = format!("{}/bin/switch-to-configuration", system(name));
-    run_t(&["timeout", "120", &bin, "test"], 150)
+    run(&[&bin, "test"])
 }
 
 // A reload into configuration `name` with a different daemon: returns the
 // main process after it.
 fn take_over_into(name: &str) -> String {
     let old = main_pid();
-    let handed = journal_count(MACHINE, UNIT, "event=handed_over");
+    // " pid=": not handed_over_exit, the old process's last line.
+    let handed = journal_count(MACHINE, UNIT, "event=handed_over pid=");
     let out = switch_to(name);
     assert_eq!(out.code, 0, "switch to {name}:\n{}", out.combined());
-    wait_journal_above(UNIT, "event=handed_over", handed, 30);
+    wait_journal_above(UNIT, "event=handed_over pid=", handed, &[UNIT]);
     let new = main_pid();
     assert_ne!(new, old, "no new main process after the switch to {name}");
     new
@@ -204,7 +212,7 @@ pub mod upgrade {
         warm("warm-reload");
         let target = other("next", "base");
         // 1. A long build through gRPC.
-        start_build("long", "75");
+        start_build("long");
         let old = main_pid();
         let old_exe = exe(&old);
         let draining = journal_count(MACHINE, UNIT, "event=draining");
@@ -215,7 +223,7 @@ pub mod upgrade {
 
         // 3. A build while the old generation drains, as builds arrived when
         // this node refused them, is taken while the first one still runs.
-        wait_journal_above(UNIT, "event=draining", draining, 30);
+        wait_journal_above(UNIT, "event=draining", draining, &[UNIT]);
         quick_build("after");
         assert_eq!(
             unit_state("long"),
@@ -224,10 +232,11 @@ pub mod upgrade {
         );
 
         // 4. The first build completes, once, and its output is valid.
-        finished_once("long", 180);
+        release("long");
+        finished_once("long");
 
         // 5. The old process is gone and the new generation serves.
-        retry(60, "the old generation exited", || !alive(&old));
+        retry(&[], "the old generation exited", || !alive(&old));
         let new = main_pid();
         assert_ne!(new, old);
         let new_exe = exe(&new);
@@ -235,8 +244,10 @@ pub mod upgrade {
         if target == "next" {
             assert!(new_exe.contains("nix-grpc-daemon-next"), "{new_exe}");
         }
-        assert_journal(UNIT, &format!("event=handed_over pid={new}"));
-        assert_journal(UNIT, &format!("event=predecessor_exited pid={old}"));
+        assert_journal(UNIT, &format!("event=handed_over pid={new}$"));
+        // Written once the successor has seen its predecessor go, which can
+        // come after the pid is gone: the line is the event.
+        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={old}$"), 0, &[UNIT]);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("later");
     }
@@ -247,27 +258,26 @@ pub mod upgrade {
     #[test]
     fn a_stop_after_a_takeover_drains_and_the_running_builds_complete_once() {
         warm("warm-stop");
-        start_build("stopped-old", "45");
+        start_build("stopped-old");
         let old = main_pid();
         let new = take_over_into(other("next", "base"));
         println!("after the takeover: {}", main_pid_dump());
-        start_build("stopped-new", "40");
+        start_build("stopped-new");
         let kills = journal_count(MACHINE, UNIT, "SIGKILL");
         succeed(&["systemctl", "stop", "--no-block", UNIT]);
-        sleep(5);
-        assert_eq!(
-            unit_state(UNIT),
-            "deactivating",
-            "5 s after the stop the unit is not draining; journal since:\n{}",
-            query(
-                MACHINE,
-                &["journalctl", "-u", UNIT, "-n", "40", "--no-pager"]
-            )
-        );
+        // The stop drains: had it killed the held builds, they would not
+        // finish once below, and the journal would count a SIGKILL.
+        retry(&[], "the stop drains", || match unit_state(UNIT).as_str() {
+            "deactivating" => true,
+            "active" => false,
+            s => panic!("the stop did not drain: {s}\n{}", journal(MACHINE, UNIT)),
+        });
         assert!(alive(&old) && alive(&new), "a generation did not drain");
-        finished_once("stopped-old", 120);
-        finished_once("stopped-new", 120);
-        wait_until_succeeds(&["sh", "-c", &format!("! systemctl is-active {UNIT}")], 60);
+        release("stopped-old");
+        release("stopped-new");
+        finished_once("stopped-old");
+        finished_once("stopped-new");
+        retry(&[], "the stopped daemon ended", || ended(UNIT));
         assert_eq!(
             journal_count(MACHINE, UNIT, "SIGKILL"),
             kills,
@@ -283,7 +293,7 @@ pub mod upgrade {
     #[test]
     fn two_reloads_in_a_row_chain_and_every_build_completes_once() {
         warm("warm-chain");
-        start_build("chain", "60");
+        start_build("chain");
         let first = main_pid();
         let second = take_over_into(other("next", "base"));
         quick_build("chain-second");
@@ -295,12 +305,13 @@ pub mod upgrade {
             "the long build was over too soon"
         );
         assert!(alive(&first) && alive(&second), "a predecessor left early");
-        finished_once("chain", 120);
-        retry(60, "both predecessors exited", || {
+        release("chain");
+        finished_once("chain");
+        retry(&[], "both predecessors exited", || {
             !alive(&first) && !alive(&second)
         });
         assert_eq!(main_pid(), third);
-        assert_journal(UNIT, &format!("event=predecessor_exited pid={second}"));
+        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={second}$"), 0, &[UNIT]);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("chain-later");
     }
@@ -310,17 +321,18 @@ pub mod upgrade {
     #[test]
     fn idle_exit_after_a_takeover_waits_for_the_predecessor() {
         warm("warm-idle");
-        start_build("idle-long", "30");
+        start_build("idle-long");
         let old = main_pid();
         let new = take_over_into("idle");
-        finished_once("idle-long", 90);
+        release("idle-long");
+        finished_once("idle-long");
         // 20 s idle timeout, counted from the last call.
-        wait_until_succeeds(&["sh", "-c", &format!("! systemctl is-active {UNIT}")], 90);
+        retry(&[], "the daemon idled out", || ended(UNIT));
         assert!(!alive(&old) && !alive(&new));
         let log = query(MACHINE, &["journalctl", "-u", UNIT, "--no-pager"]);
         let at = |what: &str| {
             log.lines()
-                .position(|l| l.contains(&format!("nix-grpc-daemon[{new}]:")) && l.contains(what))
+                .position(|l| l.contains(&format!("nix-grpc-daemon[{new}]:")) && l.trim_end().ends_with(what))
                 .unwrap_or_else(|| panic!("no {what} from {new}:\n{log}"))
         };
         assert!(
@@ -341,7 +353,7 @@ pub mod failures {
     #[test]
     fn a_takeover_that_fails_leaves_the_old_generation_serving() {
         warm("warm-broken");
-        start_build("broken-long", "30");
+        start_build("broken-long");
         let old = main_pid();
         let failed = journal_count(MACHINE, UNIT, "event=takeover_failed");
         let out = switch_to("broken");
@@ -352,7 +364,8 @@ pub mod failures {
         assert!(journal_count(MACHINE, UNIT, "event=takeover_failed") > failed);
         assert_eq!(main_pid(), old);
         quick_build("broken-after");
-        finished_once("broken-long", 90);
+        release("broken-long");
+        finished_once("broken-long");
         assert_eq!(unit_pids(), vec![old]);
     }
 
@@ -362,26 +375,25 @@ pub mod failures {
     fn a_reload_that_systemd_times_out_leaves_the_old_generation_serving() {
         warm("warm-timeout");
         let old = main_pid();
+        let unanswered = journal_count(MACHINE, UNIT, "sent no sockets");
         // The old process answers nothing, so the successor waits.
         succeed(&["kill", "-STOP", &old]);
         let out = switch_to("quick-timeout");
         let timed_out = query(MACHINE, &["journalctl", "-u", UNIT, "--no-pager"])
             .contains("Reload operation timed out");
         let others: Vec<String> = unit_pids().into_iter().filter(|p| *p != old).collect();
-        // Within 10 s of systemd's 5 s: its own wait for the sockets is 30 s.
-        let started = Instant::now();
-        let mut left = others.clone();
-        while !left.is_empty() && started.elapsed() < Duration::from_secs(10) {
-            sleep(1);
-            left.retain(|p| alive(p));
-        }
+        // Gone because systemd gave up on the reload, not after its own wait
+        // for the sockets (30 s), which ends in "sent no sockets": by what
+        // it says, not by when.
+        retry(&[], "the successors exited", || others.iter().all(|p| !alive(p)));
         succeed(&["kill", "-CONT", &old]);
+        assert_eq!(
+            journal_count(MACHINE, UNIT, "sent no sockets"),
+            unanswered,
+            "the successor left on its own wait, not with the reload: {others:?}"
+        );
         assert_ne!(out.code, 0, "the reload succeeded:\n{}", out.combined());
         assert!(timed_out, "systemd did not time the reload out");
-        assert!(
-            left.is_empty(),
-            "the successor outlived the reload: {left:?} of {others:?}"
-        );
         assert_eq!(main_pid(), old);
         quick_build("timeout-after");
         assert_eq!(unit_pids(), vec![old]);
@@ -392,10 +404,14 @@ pub mod failures {
     #[test]
     fn a_crash_of_the_new_generation_is_recovered_from() {
         warm("warm-crash");
-        start_build("crash-long", "30");
+        start_build("crash-long");
         let new = take_over_into(other("next", "base"));
         succeed(&["kill", "-KILL", &new]);
-        wait_until_succeeds(&["sh", "-c", "! systemctl is-active crash-long"], 180);
+        // Its client builds again: release each build until it ends.
+        retry(&[], "crash-long ended", || {
+            let _ = try_release("crash-long");
+            ended("crash-long")
+        });
         assert_eq!(
             unit_result(MACHINE, "crash-long"),
             "success",
@@ -413,7 +429,7 @@ pub mod failures {
         let refusals = journal_count(MACHINE, UNIT, "event=takeover_refused");
         let script = format!(
             "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET); \
-             s.connect(b'\\0nix-grpc-daemon/takeover/{pid}'); s.settimeout(10); \
+             s.connect(b'\\0nix-grpc-daemon/takeover/{pid}'); \
              print('received', len(s.recv(8192)))"
         );
         let out = succeed(&[

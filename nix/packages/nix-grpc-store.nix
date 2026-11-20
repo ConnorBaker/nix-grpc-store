@@ -60,6 +60,7 @@ stdenv.mkDerivation {
         ../../tests/farm-mock.py
         ../../tests/keepalive-test.py
         ../../tests/testdaemon.py
+        ../../tests/built-here-test.py
         ../../tests/client-keepalive-test.py
         ../../tests/keepalive-client.cc
         ../../tests/load-plugin.hh

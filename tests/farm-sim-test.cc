@@ -68,7 +68,7 @@ struct SimWorker
     Builder builder;
     std::unique_ptr<Dispatcher::Worker> session;
     std::deque<nix::remote::SchedCmd> down;
-    std::deque<nix::remote::WorkerMsg> up;
+    std::deque<nix::remote::WorkerMsgs> up;
     std::set<std::string> building; // a client's call runs the build
     std::set<std::string> stopping; // of those, the ones a Revoke reached
     bool daemonDown = false;        // local nix-daemon not answering: takes no builds
@@ -260,8 +260,8 @@ private:
             },
             .abort = [] -> void {},
             .id = {}});
-        wkr.builder.setSend([&wkr](const nix::remote::WorkerMsg & msg) -> bool {
-            wkr.up.push_back(msg);
+        wkr.builder.setSend([&wkr](const nix::remote::WorkerMsgs & msgs) -> bool {
+            wkr.up.push_back(msgs);
             return true;
         });
         wkr.builder.greet();
@@ -390,8 +390,7 @@ private:
             }
             if (!wkr.up.empty()) {
                 add(steps, "scheduler reads from " + wkr.addr, [this, &wkr] -> void {
-                                     nix::remote::WorkerMsgs msgs;
-                                     *msgs.add_msgs() = wkr.up.front();
+                                     auto const msgs = std::move(wkr.up.front());
                                      wkr.up.pop_front();
                                      disp->workerMsgs(*wkr.session, msgs);
                                  });
@@ -444,9 +443,11 @@ private:
         bool const twice = std::ranges::any_of(workers, [&](const auto & other) -> bool {
             return other.get() != &wkr
                    && (other->building.contains(drv)
-                       || std::ranges::any_of(other->up, [&](const nix::remote::WorkerMsg & msg) -> bool {
-                              return msg.has_done() && msg.done().drv_path() == drv
-                                     && msg.done().outcome() == nix::remote::Done::BUILT;
+                       || std::ranges::any_of(other->up, [&](const nix::remote::WorkerMsgs & msgs) -> bool {
+                              return std::ranges::any_of(msgs.msgs(), [&](const nix::remote::WorkerMsg & msg) -> bool {
+                                  return msg.has_done() && msg.done().drv_path() == drv
+                                         && msg.done().outcome() == nix::remote::Done::BUILT;
+                              });
                           }));
         });
         bool const awaited = std::ranges::any_of(clients, [&](const auto & cli) -> bool {

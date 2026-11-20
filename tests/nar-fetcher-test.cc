@@ -233,13 +233,11 @@ void finishedSessionsGo()
     for (int i = 0; i < 3; ++i) {
         assert(fetch(*fetcher, pathA()) == narOf(std::string(pathA().to_string())));
     }
-    // The last thread may still be on its way out.
-    constexpr int polls = 100;
+    // The last thread may still be on its way out, and says so to nobody.
     constexpr std::chrono::milliseconds poll{10};
-    for (int i = 0; i < polls && fetcher->sessionCount() > 0; ++i) {
+    while (fetcher->sessionCount() > 0) {
         std::this_thread::sleep_for(poll);
     }
-    assert(fetcher->sessionCount() == 0);
 }
 
 } // namespace

@@ -29,9 +29,11 @@ pkgs.stdenv.mkDerivation {
     # Parallel builds on one Darwin host share the network namespace.
     port=$((20000 + RANDOM % 20000))
     trap 'rc=$?; kill %1 %2 2>/dev/null || true; [ $rc = 0 ] || cat nixd.log daemon.log' EXIT
+    # Waits with no deadline; a daemon that exits first ends them (and the
+    # build, through the trap, with its log).
     nix daemon --store "local?root=$TMPDIR/remote" 2> nixd.log &
-    for _ in $(seq 50); do
-      [ -e "$NIX_DAEMON_SOCKET_PATH" ] && break
+    until [ -e "$NIX_DAEMON_SOCKET_PATH" ]; do
+      kill -0 %1
       sleep 0.2
     done
     nix-grpc-daemon --listen 127.0.0.1:$port \
@@ -43,8 +45,8 @@ pkgs.stdenv.mkDerivation {
     store="grpc://127.0.0.1:$port?ca-cert=$PWD/ca.pem"
     client() { nix --option plugin-files "$plugin" store info --store "$store" "$@"; }
 
-    for _ in $(seq 50); do
-      client > /dev/null 2>&1 && break
+    until client > /dev/null 2>&1; do
+      kill -0 %2
       sleep 0.2
     done
     client

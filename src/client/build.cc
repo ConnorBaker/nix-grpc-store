@@ -301,6 +301,12 @@ struct GrpcStore::Run {
     for (const auto & feat : nixcompat::requiredSystemFeatures(store, job.drv)) {
       want->add_required_features(feat);
     }
+    // nix asks ca-derivations of an impure derivation too, which builders
+    // offer for floating content-addressed ones but turn impure ones down.
+    // Asking for a feature none offers keeps it unplaceable.
+    if (nixcompat::isImpure(job.drv)) {
+      want->add_required_features("impure-derivations");
+    }
     want->set_cp_hint_ms(job.cpHintMs);
     want->set_build_mode(static_cast<uint32_t>(job.mode));
     want->set_system(job.drv.platform);
@@ -336,6 +342,8 @@ struct GrpcStore::Run {
       auto * msg = batch.add_msgs();
       fillWant(msg->mutable_want(), *byId.at(jid));
       msg->mutable_want()->set_refused(exe.refused(jid));
+      msg->mutable_want()->set_bounced_assign_id(exe.refused(jid));
+      msg->mutable_want()->set_running_on(exe.runningOn(jid));
       bytes += msg->ByteSizeLong();
       sent.push_back(jid);
       if (bytes >= maxBatchBytes) {

@@ -9,7 +9,7 @@
   module,
   mockOidc,
   e2eTests,
-  # "main" or "upload"
+  # "main", "upload" or "floating"
   phase ? "main",
 }:
 
@@ -48,7 +48,6 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-${phase}";
-  globalTimeout = 600;
 
   # The Rust tests in tests/e2e run on the driver host and drive the VM over
   # the vsock ssh backdoor, so independent tests overlap.
@@ -271,8 +270,9 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
-    machine.wait_for_unit("nix-daemon.socket")
-    machine.wait_for_unit("nix-grpc-daemon.socket")
+    ${import ./lib/waits.nix}
+    wait_unit(machine, "nix-daemon.socket")
+    wait_unit(machine, "nix-grpc-daemon.socket")
 
     env = {
         "NGS_CERT_DIR": "${certDir}",
@@ -305,5 +305,8 @@ pkgs.testers.runNixOSTest {
   '' + pkgs.lib.optionalString (phase == "upload") ''
     with subtest("concurrent uploads of one input"):
         run_e2e({"machine": machine}, env, "upload::", "--test-threads=1")
+  '' + pkgs.lib.optionalString (phase == "floating") ''
+    with subtest("floating content-addressed builds without a cache"):
+        run_e2e({"machine": machine}, env, "floating::", "--test-threads=1")
   '';
 }

@@ -12,13 +12,17 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include <absl/base/thread_annotations.h>
 
 #include "logfmt.hh"
 
+#include "builder.hh"
 #include "dispatcher.hh"
+#include "executor.hh"
 #include "metrics.hh"
 #include "nix_remote.pb.h"
 #include "scheduler.hh"
@@ -62,13 +66,18 @@ struct Farm
         disp.workerMsgs(session, msgs);
     }
 
-    void want(const std::string & drv, uint64_t refused = 0)
+    // `older`: as a client that names the refused assignment in field 8.
+    void want(const std::string & drv, uint64_t refused = 0, bool older = false)
     {
         nix::remote::ClientMsgs msgs;
         auto * wnt = msgs.add_msgs()->mutable_want();
         wnt->set_drv_path(drv);
         wnt->set_system("x");
-        wnt->set_refused(refused);
+        if (older) {
+            wnt->set_bounced_assign_id(refused);
+        } else {
+            wnt->set_refused(refused);
+        }
         disp.clientMsgs(client, msgs);
     }
 };
@@ -217,8 +226,9 @@ void aFailingWorkerIsRested()
     farm.disp.workerGone(sick.conn);
 }
 
-// A client that cannot reach the worker it was sent to is sent to another.
-void aClientThatCannotReachItsWorkerIsSentElsewhere()
+// A client that cannot reach the worker it was sent to is sent to another,
+// also one that says so the older way.
+void aClientThatCannotReachItsWorkerIsSentElsewhere(bool older)
 {
     Farm farm;
     Session unreachable;
@@ -229,7 +239,7 @@ void aClientThatCannotReachItsWorkerIsSentElsewhere()
     farm.want("a.drv");
     assert(farm.sentTo == std::vector<std::string>{"w:1"});
 
-    farm.want("a.drv", unreachable.lastAssignId);
+    farm.want("a.drv", unreachable.lastAssignId, older);
     assert((farm.sentTo == std::vector<std::string>{"w:1", "w:2"}));
     assert(unreachable.revoked == std::vector<std::string>{"a.drv"});
     assert(other.expected == std::vector<std::string>{"a.drv"});
@@ -745,17 +755,24 @@ void testReleaseAndTheStatsSeries()
 }
 
 // A chain's build kept in the scheduler's own queue (the one slot busy) is
-// forgotten once its lease is over, and the stats thread exports that as it
-// happens: `lingering` drops to 0 with nothing else going on.
+// forgotten once its lease is over, and the round that forgets it (the stats
+// thread's, here the test's tick) exports that as it happens: `lingering`
+// drops to 0 with nothing else going on.
 void testKeptQueuedExpiryExported()
 {
     constexpr uint32_t lingerS = 600;
     constexpr double capMs = 3000;
-    // The stats thread exports a round at a time: nothing to wait on but the series.
-    constexpr auto poll = std::chrono::milliseconds(100);
     Metrics metrics{""};
+    // The test's clock, and its rounds (tick): the lease is over only once
+    // the test says so.
+    std::atomic<double> nowMs{0};
     Dispatcher disp(
-        Dispatcher::Config{.defaultSystem = "x86_64-linux", .present = {}, .lookupThreads = 0, .maxLingerMs = capMs},
+        Dispatcher::Config{
+            .defaultSystem = "x86_64-linux",
+            .present = {},
+            .lookupThreads = 0,
+            .nowMs = [&nowMs] -> double { return nowMs; },
+            .maxLingerMs = capMs},
         metrics);
     Dispatcher::Worker worker{.send = [](const SchedCmd &) -> bool { return true; }, .abort = {}, .id = {}};
     WorkerMsgs hello;
@@ -781,18 +798,14 @@ void testKeptQueuedExpiryExported()
     };
     auto const busy = follow("/nix/store/00000000000000000000000000000000-busy.drv", 0, "");
     auto const chain = follow("/nix/store/11111111111111111111111111111111-chain.drv", lingerS, "chain-1");
-    auto const left = std::chrono::steady_clock::now();
     disp.clientGone(chain);
-    // Exported within a round of the stats thread, before the cap is over.
-    while (series("lingering") != 1.0) {
-        std::this_thread::sleep_for(poll);
-    }
+    // Exported within a round (a tick), the cap not yet over.
+    disp.tick();
     assert(series("lingering") == 1.0 && series("queued") == 0.0 && series("running") == 1.0);
-    while (series("lingering") != 0.0) {
-        std::this_thread::sleep_for(poll);
-    }
+    // The round in which the cap is over exports it, with nothing else going on.
+    nowMs = capMs + 1;
+    disp.tick();
     assert(series("lingering") == 0.0 && series("queued") == 0.0);
-    assert(std::chrono::steady_clock::now() - left >= std::chrono::milliseconds(static_cast<int64_t>(capMs)));
     disp.clientGone(busy);
     disp.workerGone(worker);
 }
@@ -847,6 +860,284 @@ void testExpiryRevokeReachesAWorker()
     disp.workerGone(worker);
 }
 
+// A client whose build runs on the only worker that can build it refuses
+// that assignment (it could not reach the worker again). The scheduler
+// revokes the build there and places it there again, with a new id. The
+// builder, wired to the scheduler as coordinator.cc wires them, ends the
+// revoked build with a Done that must name the placement the scheduler
+// holds now: otherwise the Done ends nothing, and the worker's one slot
+// stays taken once the client is gone.
+void aBounceOffTheOnlyWorkerLeavesNoSlotTaken()
+{
+    constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+    constexpr auto drvB = "/nix/store/11111111111111111111111111111111-b.drv";
+    Metrics metrics{""};
+    Dispatcher disp(debugConfig(), metrics);
+    nixgrpc::Builder builder({.advertise = "w1:50051", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
+    auto const worker = disp.loopbackWorker([&](const SchedCmd & cmd) -> void {
+        if (cmd.has_expect()) {
+            builder.onExpect(cmd.expect());
+        } else if (cmd.has_revoke()) {
+            builder.onRevoke(cmd.revoke());
+        }
+    });
+    builder.setSend([&](const WorkerMsgs & msgs) -> bool {
+        disp.workerMsgs(*worker, msgs);
+        return true;
+    });
+    builder.greet();
+    std::vector<SchedMsg> toFirst;
+    auto first = disp.connectClient(recordMsgsInto(toFirst), [] -> void {});
+    disp.clientMsgs(first, wantOf(drvA));
+    assert(assigned(toFirst) == 1);
+    auto const firstId = toFirst.back().assigned().assign_id();
+    bool const claimed = builder.claim(drvA, firstId);
+    auto const admitted = builder.admit(drvA);
+    assert(claimed && admitted);
+    auto refuse = wantOf(drvA);
+    refuse.mutable_msgs(0)->mutable_want()->set_refused(firstId);
+    disp.clientMsgs(first, refuse);
+    builder.finished(drvA, nix::remote::Done::CANCELLED, {}, "");
+    builder.callEnded(drvA);
+    ClientMsgs cancel;
+    cancel.add_msgs()->mutable_cancel()->set_drv_path(drvA);
+    disp.clientMsgs(first, cancel);
+    disp.clientGone(first);
+    std::vector<SchedMsg> toNext;
+    auto next = disp.connectClient(recordMsgsInto(toNext), [] -> void {});
+    disp.clientMsgs(next, wantOf(drvB));
+    assert(assigned(toNext) == 1);
+    disp.clientGone(next);
+    disp.workerGone(*worker);
+    builder.setSend(nullptr);
+}
+
+// A takeover, seen from the successor: the scheduler that took over from
+// one that placed a.drv on node n:1, whose old process still builds it for
+// the client. One slot on n:1; b.drv waits for it.
+struct Successor
+{
+    nixgrpc::exec::Executor exe{
+        {.threads = 2, .rescheduleRetries = nixgrpc::exec::Executor::defaultRescheduleRetries, .keepGoing = true}};
+    nixgrpc::exec::JobId jobA = exe.add(2, {});
+    nixgrpc::exec::JobId jobB = exe.add(1, {});
+    std::vector<std::string> drvOf{"a.drv", "b.drv"};
+    Metrics metrics{""};
+    Dispatcher disp{[] -> Dispatcher::Config {
+                        Dispatcher::Config cfg;
+                        cfg.defaultSystem = "x";
+                        cfg.lookupThreads = 0;
+                        return cfg;
+                    }(),
+                    metrics};
+    std::vector<SchedCmd> toNode;
+    Dispatcher::Worker node{.send = recordInto(toNode), .abort = {}, .id = {}};
+    Dispatcher::ClientPtr client;
+
+    Successor()
+    {
+        exe.connected();
+        assert((exe.takeWants() == std::vector<nixgrpc::exec::JobId>{jobA, jobB}));
+        // The predecessor placed a.drv on n:1 and the client called it there.
+        constexpr uint64_t predecessorsAssignId = 7;
+        exe.onAssigned(jobA, {.addr = "n:1", .assignId = predecessorsAssignId, .system = {}});
+        auto const call = exe.next();
+        assert(call && call->first == jobA);
+        // Its Restarting ended the stream; the client is back, on the successor.
+        exe.disconnected();
+        WorkerMsgs hello;
+        auto * hel = hello.add_msgs()->mutable_hello();
+        hel->set_addr("n:1");
+        hel->add_systems("x");
+        hel->set_max_jobs(1);
+        disp.workerMsgs(node, hello);
+        client = disp.connectClient(
+            [this](const SchedMsg & msg) -> bool {
+                if (msg.has_assigned()) {
+                    exe.onAssigned(
+                        msg.assigned().drv_path() == "a.drv" ? jobA : jobB,
+                        {.addr = msg.assigned().worker_addr(), .assignId = msg.assigned().assign_id(), .system = {}});
+                }
+                return true;
+            },
+            {});
+        exe.connected();
+        flush();
+    }
+
+    Successor(const Successor &) = delete;
+    Successor(Successor &&) = delete;
+    auto operator=(const Successor &) -> Successor & = delete;
+    auto operator=(Successor &&) -> Successor & = delete;
+
+    ~Successor()
+    {
+        disp.clientGone(client);
+        disp.workerGone(node);
+    }
+
+    // The client's Wants, as GrpcStore's flushLocked sends them.
+    void flush()
+    {
+        ClientMsgs wants;
+        for (auto const jid : exe.takeWants()) {
+            auto * want = wants.add_msgs()->mutable_want();
+            want->set_drv_path(drvOf.at(jid));
+            want->set_system("x");
+            want->set_refused(exe.refused(jid));
+            want->set_bounced_assign_id(exe.refused(jid));
+            want->set_running_on(exe.runningOn(jid));
+        }
+        if (wants.msgs_size() > 0) {
+            disp.clientMsgs(client, wants);
+        }
+    }
+
+    [[nodiscard]] auto expected() const -> std::vector<std::string>
+    {
+        std::vector<std::string> out;
+        for (const auto & cmd : toNode) {
+            if (cmd.has_expect()) {
+                out.push_back(cmd.expect().drv_path());
+            }
+        }
+        return out;
+    }
+
+    [[nodiscard]] auto assignIdOf(const std::string & drv) const -> uint64_t
+    {
+        uint64_t last = 0;
+        for (const auto & cmd : toNode) {
+            if (cmd.has_expect() && cmd.expect().drv_path() == drv) {
+                last = cmd.expect().assign_id();
+            }
+        }
+        return last;
+    }
+};
+
+// The client Wants a.drv again (Executor::connected) and leaves alone an
+// Assigned to the address it builds on already (Executor::onAssigned).
+// Nobody would claim such a placement, so it must not take the node's one
+// slot from b.drv.
+void aBuildInFlightOnThePredecessorTakesNoSlotHere()
+{
+    Successor const suc;
+    assert(std::holds_alternative<nixgrpc::exec::state::Running>(suc.exe.at(suc.jobA)));
+    // The intended assertion: the node's slot goes to the build that can use it.
+    assert(suc.expected() == std::vector<std::string>{"b.drv"});
+}
+
+// Its build on the predecessor is lost: the client gives that call up
+// (Executor::bounced) and Wants a.drv again, now not running anywhere. It
+// must be placed here once the node has a slot.
+void aBuildLostWithThePredecessorIsPlacedHere()
+{
+    Successor suc;
+    suc.exe.bounced(suc.jobA, nixgrpc::exec::Clock::now(), {.refused = false, .left = true});
+    suc.flush();
+    if (suc.assignIdOf("b.drv") != 0) {
+        suc.disp.workerMsgs(suc.node, doneOf("b.drv", suc.assignIdOf("b.drv"), nix::remote::Done::BUILT));
+    }
+    auto const got = suc.expected();
+    assert(std::ranges::contains(got, std::string("a.drv")));
+}
+
+// The phantom an old client leaves after a takeover, seen whole: it re-Wants
+// a build it runs through the predecessor and never calls here, sending no
+// Want.running_on. The node's one slot holds that placement; once the
+// predecessor has built it into the node's store, the builder finishes it
+// as BUILT (Builder::checkBuiltWith) and the slot goes to the next drv. Given
+// back instead, it would only be placed again for its client.
+void aPhantomWhoseOutputsTheNodeHasFreesItsSlot()
+{
+    constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+    constexpr auto drvB = "/nix/store/11111111111111111111111111111111-b.drv";
+    Metrics metrics{""};
+    Dispatcher disp(debugConfig(), metrics);
+    auto now = std::chrono::steady_clock::now();
+    nixgrpc::Builder builder(
+        {.advertise = "w1:50051",
+         .systems = {"x86_64-linux"},
+         .features = {},
+         .maxJobs = 1,
+         .now = [&now] -> std::chrono::steady_clock::time_point { return now; }},
+        metrics);
+    bool aBuilt = false;
+    builder.checkBuiltWith([&](const std::string & drv) -> std::optional<std::vector<std::pair<std::string, uint64_t>>> {
+        if (drv == drvA && aBuilt) {
+            return std::vector<std::pair<std::string, uint64_t>>{{"/nix/store/22222222222222222222222222222222-a", 1}};
+        }
+        return std::nullopt;
+    });
+    auto const worker = disp.loopbackWorker([&](const SchedCmd & cmd) -> void {
+        if (cmd.has_expect()) {
+            builder.onExpect(cmd.expect());
+        } else if (cmd.has_revoke()) {
+            builder.onRevoke(cmd.revoke());
+        }
+    });
+    builder.setSend([&](const WorkerMsgs & msgs) -> bool {
+        disp.workerMsgs(*worker, msgs);
+        return true;
+    });
+    builder.greet();
+    std::vector<SchedMsg> toClient;
+    auto client = disp.connectClient(recordMsgsInto(toClient), [] -> void {});
+    disp.clientMsgs(client, wantOf(drvA));
+    disp.clientMsgs(client, wantOf(drvB));
+    assert(assigned(toClient) == 1); // a, never claimed
+    constexpr auto probeAfter = std::chrono::seconds(10); // Builder::probeAfter
+    now += probeAfter;
+    builder.finishBuiltHere();
+    assert(assigned(toClient) == 1 && builder.holding() == 1); // still building there
+    // The predecessor's build of a ends.
+    aBuilt = true;
+    now += probeAfter;
+    builder.finishBuiltHere();
+    assert(assigned(toClient) == 2 && toClient.back().assigned().drv_path() == drvB);
+    disp.clientGone(client);
+    disp.workerGone(*worker);
+    builder.setSend(nullptr);
+}
+
+// The node's daemon starts while its nix-daemon hangs: the builder greets
+// draining (Coordinator::start after askLocalDaemon), and builds are wanted.
+// The scheduler in the same process must place none on it. Each would come
+// straight back and be placed there again, inside greet(), which the
+// daemon's readiness waits for. Past `cut` Expects that loop is cut here, so
+// that it fails the count instead of hanging.
+void aBuilderThatGreetsDrainingIsPlacedNothing()
+{
+    constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+    constexpr size_t cut = 100;
+    Metrics metrics{""};
+    Dispatcher disp(debugConfig(), metrics);
+    nixgrpc::Builder builder({.advertise = "w1:50051", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 2}, metrics);
+    size_t expects = 0;
+    auto const worker = disp.loopbackWorker([&](const SchedCmd & cmd) -> void {
+        if (cmd.has_expect() && ++expects <= cut) {
+            builder.onExpect(cmd.expect());
+        }
+    });
+    builder.setSend([&](const WorkerMsgs & msgs) -> bool {
+        disp.workerMsgs(*worker, msgs);
+        return true;
+    });
+    std::vector<SchedMsg> toClient;
+    auto client = disp.connectClient(recordMsgsInto(toClient), [] -> void {});
+    disp.clientMsgs(client, wantOf(drvA));
+    builder.setUnavailable(nixgrpc::Builder::Unavailable::localDaemonDown, true);
+    assert(builder.greet());
+    assert(expects == 0 && assigned(toClient) == 0);
+    // Its nix-daemon answers again: the build goes there.
+    builder.setUnavailable(nixgrpc::Builder::Unavailable::localDaemonDown, false);
+    assert(expects == 1 && assigned(toClient) == 1);
+    disp.clientGone(client);
+    disp.workerGone(*worker);
+    builder.setSend(nullptr);
+}
+
 } // namespace
 
 auto main() -> int
@@ -857,7 +1148,8 @@ try {
     testLateFirstHelloEndsInAReconnect();
     loadRestoresSlotsAfterDrainingHello();
     aSystemWithoutBuildersGetsEveryBuilder();
-    aClientThatCannotReachItsWorkerIsSentElsewhere();
+    aClientThatCannotReachItsWorkerIsSentElsewhere(false);
+    aClientThatCannotReachItsWorkerIsSentElsewhere(true);
     aWorkerThatRestedGetsItsDerivationBack();
     aFailingWorkerIsRested();
     loopbackWorkerMayAnswerACommand();
@@ -867,6 +1159,11 @@ try {
     testReleaseAndTheStatsSeries();
     testKeptQueuedExpiryExported();
     testExpiryRevokeReachesAWorker();
+    aBounceOffTheOnlyWorkerLeavesNoSlotTaken();
+    aBuildInFlightOnThePredecessorTakesNoSlotHere();
+    aBuildLostWithThePredecessorIsPlacedHere();
+    aPhantomWhoseOutputsTheNodeHasFreesItsSlot();
+    aBuilderThatGreetsDrainingIsPlacedNothing();
     return 0;
 } catch (std::exception &) {
     return 1;

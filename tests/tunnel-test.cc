@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -29,7 +30,6 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
-#include <sys/time.h> // NOLINT(misc-include-cleaner): timeval.
 #include <unistd.h>
 
 #include <openssl/bio.h>
@@ -198,9 +198,6 @@ struct Seen
 auto greet(int conn, const Pki & pki, const std::string & cert, const std::string & status) -> Seen
 {
         Seen seen;
-        // A builder that stays silent fails the test instead of hanging it.
-        const timeval patience{.tv_sec = 2, .tv_usec = 0};
-        setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof patience);
         SSL_CTX * ctx = SSL_CTX_new(TLS_server_method());
         SSL_CTX_use_certificate_chain_file(ctx, pki.file(cert + ".pem").c_str());
         SSL_CTX_use_PrivateKey_file(ctx, pki.file(cert + ".key").c_str(), SSL_FILETYPE_PEM);
@@ -331,11 +328,7 @@ void a_balancer_that_goes_away_inside_a_ping_is_noticed()
 {
     const Fixture fix;
     auto peer = balancer(fix.lis, fix.pki, "lb", "200 OK", [](int conn, Seen &) -> void { (void) send(conn, "RPI", 3, 0); });
-    auto opening = std::async(std::launch::async, [&] -> std::string { return fix.fails(); });
-    const bool noticed = opening.wait_for(3s) == std::future_status::ready;
-    fix.stop.set();
-    check(noticed, "open() returns");
-    check(opening.get().contains("closed the tunnel"), "the closed tunnel is reported");
+    check(fix.fails().contains("closed the tunnel"), "open() returns, and reports the closed tunnel");
     (void) peer.get();
 }
 
@@ -421,7 +414,7 @@ struct Pair
 constexpr std::string_view unread = "unread";
 
 // What the watcher of a connection reports when `act` happens while it waits.
-auto watching(const std::function<void(Pair &, const Wake &)> & act) -> std::optional<End>
+auto watching(const std::function<void(Pair &, const Wake &)> & act) -> End
 {
     Pair pair;
     const Wake stop;
@@ -429,11 +422,6 @@ auto watching(const std::function<void(Pair &, const Wake &)> & act) -> std::opt
     auto result = std::async(std::launch::async, [&] -> End { return nixgrpc::tunnel::waitClosed(watch.get(), stop); });
     std::this_thread::sleep_for(100ms);
     act(pair, stop);
-    if (result.wait_for(2s) != std::future_status::ready) {
-        stop.set();
-        (void) result.get();
-        return std::nullopt;
-    }
     return result.get();
 }
 
@@ -485,7 +473,10 @@ struct Held
     Pki pki;
     Listener lis;
     std::mutex mutex;
+    std::condition_variable adoptedMore;
     std::vector<nix::AutoCloseFD> adopted;
+    // Runs inside the hand-over of the next tunnel, once.
+    std::function<void()> during;
     nixgrpc::tunnel::Tunnels tunnels{{
         .balancers = {{.host = "lb.test", .port = lis.port}},
         .tls = {.cert = pki.file("b1.pem"), .key = pki.file("b1.key"), .ca = pki.file("ca.pem")},
@@ -493,8 +484,14 @@ struct Held
         .instance = "pod-7",
         .perSet = 1,
         .adopt = [this](nix::AutoCloseFD sock) -> void {
-            const std::scoped_lock lock(mutex);
+            std::unique_lock lock(mutex);
+            if (auto run = std::exchange(during, nullptr)) {
+                lock.unlock();
+                run();
+                lock.lock();
+            }
             adopted.push_back(std::move(sock));
+            adoptedMore.notify_all();
         },
         .resolve = [](const std::string &) -> std::vector<std::string> { return {"127.0.0.1"}; },
     }};
@@ -505,11 +502,12 @@ struct Held
         return adopted.size();
     }
 
-    // The next tunnel the builder opens, with a request started on it.
-    auto next(std::chrono::milliseconds patience = 3s) -> std::optional<Tunnel>
+    // The next tunnel the builder opens, with a request started on it. With
+    // `within`, none if the builder opens none in that time.
+    auto next(std::optional<std::chrono::milliseconds> within = std::nullopt) -> std::optional<Tunnel>
     {
         pollfd pfd{.fd = lis.sock.get(), .events = POLLIN, .revents = 0};
-        if (poll(&pfd, 1, static_cast<int>(patience.count())) <= 0) {
+        if (poll(&pfd, 1, within ? static_cast<int>(within->count()) : -1) <= 0) {
             return std::nullopt;
         }
         Tunnel tunnel{.conn = nix::AutoCloseFD{accept(lis.sock.get(), nullptr, nullptr)}, .protocol = "", .request = ""};
@@ -518,11 +516,9 @@ struct Held
         tunnel.request = std::move(seen.request);
         const auto before = taken();
         (void) send(tunnel.conn.get(), unread.data(), unread.size(), 0);
-        constexpr int limit = 300;
-        for (int tries = 0; taken() == before && tries < limit; tries++) {
-            std::this_thread::sleep_for(10ms);
-        }
-        check(taken() > before, "the builder takes the tunnel into use");
+        // The builder takes the tunnel into use.
+        std::unique_lock lock(mutex);
+        adoptedMore.wait(lock, [&] -> bool { return adopted.size() > before; });
         return tunnel;
     }
 
@@ -580,6 +576,50 @@ void a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself()
     check(back && back->protocol == "nix-tunnel-any", "taking work again opens it again");
 }
 
+// A takeover stops the tunnels, then shuts the server down: once stop()
+// returns, no tunnel may be handed over any more, so it waits for one being
+// handed over. That it waits is an absence, seen for `window`: a stall that
+// long can only hide a stop() that does not wait, never fail one that does.
+void stop_waits_for_a_tunnel_being_handed_over()
+{
+    constexpr auto window = 500ms;
+    Held held;
+    std::promise<void> entered;
+    std::promise<void> release;
+    {
+        const std::scoped_lock lock(held.mutex);
+        held.during = [&, released = release.get_future().share()] -> void {
+            entered.set_value();
+            released.wait();
+        };
+    }
+    std::thread balancer([&] -> void { (void) held.next(); });
+    entered.get_future().wait();
+    auto stopped = std::async(std::launch::async, [&] -> void { held.tunnels.stop(); });
+    check(stopped.wait_for(window) == std::future_status::timeout, "stop() waits for the tunnel being handed over");
+    release.set_value();
+    stopped.get();
+    balancer.join();
+}
+
+// A tunnel opened before stop() but handed over after it is closed, not taken.
+void no_tunnel_is_handed_over_once_stop_returned()
+{
+    Held held;
+    held.tunnels.stop();
+    const auto before = held.taken();
+    std::array<int, 2> ends{};
+    check(socketpair(AF_UNIX, SOCK_STREAM, 0, ends.data()) == 0, "socketpair");
+    const nix::AutoCloseFD balancerEnd{ends.at(1)};
+    if (held.tunnels.handOver(nix::AutoCloseFD{ends.at(0)})) {
+        check(false, "a tunnel is handed over after stop() returned");
+        return;
+    }
+    check(held.taken() == before, "the owner took a tunnel after stop() returned");
+    char byte = 0;
+    check(recv(balancerEnd.get(), &byte, 1, 0) == 0, "the tunnel refused after stop() is closed");
+}
+
 void a_tunnelled_builder_is_known_by_its_certificates_common_name()
 {
     using nixgrpc::tunnel::certName;
@@ -619,6 +659,8 @@ try {
         builders_sharing_a_certificate_are_told_apart_by_instance();
         a_tunnel_that_ended_is_opened_again();
         a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself();
+        stop_waits_for_a_tunnel_being_handed_over();
+        no_tunnel_is_handed_over_once_stop_returned();
     } catch (std::exception & err) {
         std::println(stderr, "FAIL: {}", err.what());
         return 1;

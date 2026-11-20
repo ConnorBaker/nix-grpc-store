@@ -580,6 +580,9 @@ struct Entry
     bool unplaceable = false; // as last told to the followers
     double holdDueMs = 0;     // when its latest hold ends
     std::vector<WorkerId> givers; // could not run it, latest last
+    // Followers whose build of it runs where another scheduler placed it
+    // (Want.running_on). Not queued while there are any.
+    std::vector<ClientId> elsewhere;
     // Its last follower gone at this time while a lease on it was live:
     // kept, queued or assigned, until keptUntilMs (and not before its hold,
     // holdDueMs, is over). Queued, it keeps its place
@@ -606,6 +609,9 @@ struct Worker
     // Give-backs for a failure of its own since it last finished a build.
     uint32_t failures = 0;
     std::optional<double> restsUntilMs;
+    // Its last publish to the cache failed: it gets builds only while no
+    // other worker has a slot, until it reports that publishing works again.
+    bool faulty = false;
     std::vector<DrvId> running;
 
     // A worker that says Hello with max_jobs 0 is up but runs nothing.
@@ -717,6 +723,7 @@ public:
         double cpHintMs = 0;
         double lingerMs = 0;      // see Want.linger_s, capped by the caller
         std::string_view leaseId; // see Want.lease_id
+        bool runsElsewhere = false; // see Want.running_on
     };
 
     // Caller handled the cache-hit case already.
@@ -766,6 +773,11 @@ public:
         slot->cpHint = std::max(slot->cpHint, cpHintMs);
         if (slot->worker != noWorker) {
             return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId), .idleMs = idleMs};
+        }
+        // Its build runs on a worker that another scheduler placed it on.
+        std::erase(slot->elsewhere, client);
+        if (info.runsElsewhere) {
+            slot->elsewhere.push_back(client);
         }
         enqueue(drv);
         return {.drv = drv, .assigned = {}, .idleMs = idleMs};
@@ -941,6 +953,7 @@ public:
         std::vector<std::string> features;
         uint32_t maxJobs = 0;
         std::vector<std::pair<std::string_view, uint64_t>> running; // running + expecting, with assignId
+        bool faulty = false;
     };
 
     // A reported drv that followers wait for: the caller sends them a fresh
@@ -964,6 +977,7 @@ public:
         wkr.up = true;
         workersUp_++;
         wkr.draining = false;
+        setFaulty(wid, info.faulty);
         wkr.systems = info.systems;
         for (const auto & name : wkr.systems) {
             sys(name).free.push(wid);
@@ -1091,6 +1105,13 @@ public:
     {
         workers.at(wid).draining = draining;
         refreshFree(wid);
+    }
+
+    void setFaulty(WorkerId wid, bool faulty)
+    {
+        if (std::exchange(workers.at(wid).faulty, faulty) != faulty) {
+            faulty ? faultyCount++ : faultyCount--;
+        }
     }
 
     // Capacity changed while connected. Below what runs, free goes negative
@@ -1343,6 +1364,7 @@ private:
     std::vector<Worker> workers;
     size_t workersUp_ = 0;
     size_t resting_ = 0;
+    size_t faultyCount = 0; // workers with `faulty` set
     struct SystemState
     {
         WaitQueue queue;
@@ -1457,6 +1479,7 @@ private:
         if (slot->worker != noWorker) {
             serve(client, -1);
         }
+        std::erase(slot->elsewhere, client);
         auto held = unhold(drv, *slot, client, nowMs, why);
         if (!slot->followers.empty()) {
             if (slot->worker == noWorker) {
@@ -1745,8 +1768,14 @@ private:
     void enqueue(DrvId drv)
     {
         if (const auto & slot = entries.at(drv)) {
-            sys(slot->system).queue.set(drv, prio(*slot), slot->featureKey, slot->followers,
-                                        [this](ClientId client) -> Share { return shareOf(client); });
+            auto & queue = sys(slot->system).queue;
+            // Built elsewhere for now: queued once nobody's build runs there.
+            if (!slot->elsewhere.empty()) {
+                queue.erase(drv, slot->featureKey);
+                return;
+            }
+            queue.set(drv, prio(*slot), slot->featureKey, slot->followers,
+                      [this](ClientId client) -> Share { return shareOf(client); });
         }
     }
 
@@ -1854,8 +1883,9 @@ private:
                   });
     }
 
-    // Most free among workers offering system and features. O(1) without
-    // features, O(workers) with.
+    // Most free among workers offering system and features, a faulty one
+    // only if no other has a slot. O(1) without features while no worker is
+    // faulty, O(workers) otherwise.
     [[nodiscard]] auto emptiestFor(const Entry & ent) const -> std::optional<WorkerId>
     {
         auto const iter = systems.find(ent.system);
@@ -1863,17 +1893,19 @@ private:
             return std::nullopt;
         }
         const auto & fidx = iter->second.free;
-        if (ent.features.empty()) {
+        if (ent.features.empty() && faultyCount == 0) {
             return fidx.emptiest();
         }
         std::optional<WorkerId> best;
+        std::optional<WorkerId> faulty;
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
-            if (workers.at(wid).up && fidx.get(wid) > 0 && offers(workers.at(wid), ent)
-                && (!best || fidx.get(wid) > fidx.get(*best))) {
-                best = wid;
+            const auto & wkr = workers.at(wid);
+            auto & pick = wkr.faulty ? faulty : best;
+            if (wkr.up && fidx.get(wid) > 0 && offers(wkr, ent) && (!pick || fidx.get(wid) > fidx.get(*pick))) {
+                pick = wid;
             }
         }
-        return best;
+        return best ? best : faulty;
     }
 
     static auto gave(const Entry & ent, WorkerId wid) -> bool
@@ -1881,13 +1913,14 @@ private:
         return std::ranges::find(ent.givers, wid) != ent.givers.end();
     }
 
-    // Givers are passed over while another worker can run the drv now. If
-    // none can, only the latest giver is, as long as someone else offers it.
+    // Givers are passed over while another worker can run the drv now, and
+    // among each, faulty ones while another has a slot. If none can, only the
+    // latest giver is, as long as someone else offers it.
     [[nodiscard]] auto sparing(const Entry & ent) const -> std::optional<WorkerId>
     {
         auto const latest = ent.givers.back();
-        std::optional<WorkerId> fresh;
-        std::optional<WorkerId> giver;
+        // Fresh, fresh but faulty, giver, faulty giver: the first one wins.
+        std::array<std::optional<WorkerId>, 4> bests;
         bool others = false;
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
             const auto & wkr = workers.at(wid);
@@ -1895,13 +1928,15 @@ private:
                 continue;
             }
             others = true;
-            auto & best = gave(ent, wid) ? giver : fresh;
+            auto & best = bests.at((gave(ent, wid) ? 2 : 0) + (wkr.faulty ? 1 : 0));
             if (freeOf(wid) > 0 && (!best || freeOf(wid) > freeOf(*best))) {
                 best = wid;
             }
         }
-        if (fresh || giver) {
-            return fresh ? fresh : giver;
+        for (auto const best : bests) {
+            if (best) {
+                return best;
+            }
         }
         if (others || freeOf(latest) <= 0) {
             return std::nullopt;
@@ -1929,8 +1964,8 @@ private:
                 continue;
             }
             auto [wid, size] = iter->second;
-            if (wid >= workers.size() || gave(ent, wid) || !workers.at(wid).up || freeOf(wid) <= 0
-                || !offers(workers.at(wid), ent)) {
+            if (wid >= workers.size() || gave(ent, wid) || !workers.at(wid).up || workers.at(wid).faulty
+                || freeOf(wid) <= 0 || !offers(workers.at(wid), ent)) {
                 continue;
             }
             auto const cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });

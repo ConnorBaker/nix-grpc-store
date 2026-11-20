@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -69,8 +70,9 @@ struct Expected
 class Builder
 {
 public:
-    // Delivers a message to the scheduler. False if no session is up.
-    using SendFn = std::function<bool(const nix::remote::WorkerMsg &)>;
+    // Delivers messages to the scheduler, which takes them in one go: it
+    // places nothing between them. False if no session is up.
+    using SendFn = std::function<bool(const nix::remote::WorkerMsgs &)>;
 
     // What the worker tells the scheduler about itself.
     struct Config
@@ -149,10 +151,25 @@ public:
     }
     // The capacity changed (nix's max-jobs read anew): tell the scheduler.
     void setMaxJobs(uint32_t maxJobs);
+    // Every publish to the cache reports how it went. The scheduler hears
+    // when that changes, see Load.publish_failing.
+    void published(bool works);
 
     // Give back Expects nobody came for, or whose client went quiet. Called
     // from the serve loop.
     void tick();
+
+    // The outputs of a drv, all valid in this node's store, with their NAR
+    // sizes; nullopt if any is not. It asks the node's nix-daemon, which may
+    // not answer: never from the serve loop, which pets the watchdog.
+    using BuiltHere = std::function<std::optional<std::vector<std::pair<std::string, uint64_t>>>(const std::string &)>;
+    // Before the builder serves.
+    void checkBuiltWith(BuiltHere built);
+    // Finishes the Expects nobody claimed whose outputs this node's store
+    // has (see builder.cc), until `stop`. On a thread of its own.
+    void probeBuiltHere(const std::stop_token & stop);
+    // One round of that, at the builder's now(): for tests.
+    void finishBuiltHere();
     // A call that claimed `drvPath` returns, however it went.
     void callEnded(const std::string & drvPath);
 
@@ -191,6 +208,7 @@ public:
     // Swapped by the session thread on every (re)connect.
     void setSend(SendFn send);
     auto send(const nix::remote::WorkerMsg & msg) const -> bool;
+    auto send(const nix::remote::WorkerMsgs & msgs) const -> bool;
 
 private:
     Config config;
@@ -206,6 +224,7 @@ private:
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<uint8_t> unavailable_{0};
     std::atomic<uint32_t> maxJobs_;
+    std::atomic<bool> publishFailing_{false};
     // Orders the Load messages of concurrent setUnavailable() and
     // setMaxJobs() calls, and keeps them behind the Hello of their session.
     std::mutex unavailableMutex;
@@ -216,6 +235,11 @@ private:
     // worker has not read yet.
     static constexpr std::chrono::seconds expectLag{5};
     std::condition_variable expectArrived;
+    BuiltHere builtHere;
+    void settleBuiltHere(const std::string & drv, uint64_t assignId);
+    // An Expect nobody claimed for this long is asked about (builtHere): a
+    // client's own call claims it sooner.
+    static constexpr std::chrono::seconds probeAfter{10};
 
     // Draining and capacity. Under unavailableMutex.
     [[nodiscard]] auto load() const -> nix::remote::WorkerMsg;

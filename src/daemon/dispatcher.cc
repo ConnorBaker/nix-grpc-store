@@ -290,7 +290,9 @@ void Dispatcher::membershipChangedLocked()
             continue;
         }
         for (const auto & system : wkr.systems) {
-            (*next)[system].push_back({.addr = wkr.addr, .draining = !wkr.takesWork()});
+            // A worker that cannot publish fails uploads and queries too. Builds
+            // still reach it, the balancer routes those by name.
+            (*next)[system].push_back({.addr = wkr.addr, .draining = !wkr.takesWork() || wkr.faulty});
         }
     }
     {
@@ -692,7 +694,8 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
         client.send(reply);
         return;
     }
-    if (auto const wid = core.refuse(client.id, want.drv_path(), want.refused())) {
+    if (auto const wid =
+            core.refuse(client.id, want.drv_path(), want.refused() != 0 ? want.refused() : want.bounced_assign_id())) {
         revokeOn(*wid, want.drv_path());
         metrics.event("refused");
     }
@@ -706,7 +709,8 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
          .lingerMs = want.lease_id().size() > maxLeaseIdLen
                          ? 0
                          : std::min(static_cast<double>(want.linger_s()) * msPerSecond, config.maxLingerMs),
-         .leaseId = want.lease_id()},
+         .leaseId = want.lease_id(),
+         .runsElsewhere = !want.running_on().empty()},
         nowMs());
     if (res.idleMs) {
         logLine(
@@ -852,7 +856,8 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
          .systems = std::move(systems),
          .features = {hel.features().begin(), hel.features().end()},
          .maxJobs = hel.max_jobs(),
-         .running = std::move(running)},
+         .running = std::move(running),
+         .faulty = hel.publish_failing()},
         superseded);
     workers[*worker.id] = &worker;
     membershipChangedLocked();
@@ -936,6 +941,13 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
         if (load.has_max_jobs()) {
             core.setMaxJobs(*worker.id, load.max_jobs());
         }
+        if (load.publish_failing() != core.worker(*worker.id).faulty) {
+            logLine(
+                LogLevel::info,
+                {{"event", load.publish_failing() ? "publish_failing" : "publishing"},
+                 {"worker", core.worker(*worker.id).addr}});
+        }
+        core.setFaulty(*worker.id, load.publish_failing());
         membershipChangedLocked();
         placeabilityChangedLocked();
     }

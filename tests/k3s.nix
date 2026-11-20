@@ -79,7 +79,9 @@ let
       name = "slow-''${tag}";
       system = builtins.currentSystem;
       builder = "/bin/sh";
-      args = [ "-c" "read -t 20 x < /dev/zero; echo > $out" ];
+      # Runs until the test kills its inner sh: a read of a pipe it also
+      # holds open for writing, which never ends nor spins.
+      args = [ "-c" "/bin/sh -c ': | { exec 3<>/proc/self/fd/0; read x <&3; }' slow-''${tag}-holding; echo > $out" ];
     }
   '';
   groupName = lib.replaceStrings [ "_" ] [ "-" ] system;
@@ -211,15 +213,12 @@ let
       };
     };
     logLevel = "debug";
-    # Above the slow build (20 s) so a pod delete can drain it.
-    terminationGracePeriodSeconds = 60;
   };
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm-k3s";
   # checks.helm lints these without booting a VM.
   passthru = { inherit chartValues; };
-  globalTimeout = 1200;
 
   nodes.machine =
     { config, ... }:
@@ -277,17 +276,14 @@ pkgs.testers.runNixOSTest {
         after = [ "k3s.service" ];
         serviceConfig.ExecStartPre = [
           "+${pkgs.writeShellScript "k8s-token" ''
-            for i in $(seq 120); do
-              ${pkgs.kubectl}/bin/kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml -n kube-system create token default > /run/niks3-k8s-token 2>/dev/null \
+            until ${pkgs.kubectl}/bin/kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml -n kube-system create token default > /run/niks3-k8s-token 2>/dev/null \
                 && [ -s /run/niks3-k8s-token ] \
-                && install -m0644 /var/lib/rancher/k3s/server/tls/server-ca.crt /run/niks3-k8s-ca.crt \
-                && exit 0
+                && install -m0644 /var/lib/rancher/k3s/server/tls/server-ca.crt /run/niks3-k8s-ca.crt; do
               sleep 2
             done
-            exit 1
           ''}"
         ];
-        serviceConfig.TimeoutStartSec = 300;
+        serviceConfig.TimeoutStartSec = "infinity";
       };
 
       services.k3s = {
@@ -335,17 +331,41 @@ pkgs.testers.runNixOSTest {
     };
 
   testScript = ''
-    import shlex
-    from datetime import timedelta
-    def sec(n: int) -> timedelta:
-        return timedelta(seconds=n)
-
+    ${import ./lib/waits.nix}
     def kubectl(args: str) -> str:
         return machine.succeed("kubectl -n farm " + args)
+    def release(tag: str, in_pods: list[str], unit: str) -> None:
+        # Kills the held build's inner sh in whichever of in_pods runs it
+        # (pgrep and the shell's kill: the image need not have pkill), until
+        # one does; unit, the client, ending first fails the wait.
+        kill = shlex.quote(f"kill $(pgrep -f '{tag}-holdin[g]$')")
+        def released() -> bool:
+            return any(machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- sh -c {kill}", timeout=None)[0] == 0 for p in in_pods)
+        wait_until(f"the held build {tag} released", released, clients=[(machine, unit)])
     def pod_ip(selector: str) -> str:
         return kubectl(f"get pod {selector} -o jsonpath='{{.items[0].status.podIP}}{{.status.podIP}}'").strip()
     def rollout(deployment: str) -> None:
-        machine.wait_until_succeeds(f"kubectl -n farm rollout status deployment {deployment} --timeout=10s", timeout=sec(420))
+        # Complete as `rollout status` judges it (its spec seen, every
+        # replica updated and available, none old), without its progress
+        # deadline. The chart's helm-install Job creates it first.
+        # A container of its pods that exited (restarted, or crash looping)
+        # never makes it complete: that fails it, after dump().
+        fields = "{.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.replicas} {.status.updatedReplicas} {.status.availableReplicas}"
+        labels = "{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}"
+        restarts = "{.items[*].status.containerStatuses[*].restartCount}"
+        def complete() -> bool:
+            status, out = machine.execute(f"kubectl -n farm get deployment {deployment} -o jsonpath='{fields}'", timeout=None)
+            f = out.split()
+            if status == 0 and len(f) == 6 and f[0] == f[1] and f[2] == f[3] == f[4] == f[5]:
+                return True
+            status, sel = machine.execute(f"kubectl -n farm get deployment {deployment} -o go-template='{labels}'", timeout=None)
+            if status == 0 and sel.strip(","):
+                out = machine.execute(f"kubectl -n farm get pods -l {sel.strip(',')} -o jsonpath='{restarts}'", timeout=None)[1]
+                if any(int(n) > 0 for n in out.split()):
+                    dump()
+                    raise RequestedAssertionFailed(f"a container of deployment {deployment} exited before it rolled out: restarts {out}")
+            return False
+        wait_until(f"deployment {deployment} rolled out", complete)
     def dump() -> None:
         machine.execute(
             "{ kubectl get pods -A; kubectl get events -A --sort-by=.lastTimestamp | tail -40;"
@@ -354,31 +374,27 @@ pkgs.testers.runNixOSTest {
             " kubectl -n farm logs -l app.kubernetes.io/component=worker --all-containers --prefix --tail=30;"
             " kubectl -n farm logs -l app.kubernetes.io/component=scheduler --tail=30; } >&2")
 
-    machine.wait_for_unit("k3s.service")
+    wait_unit(machine, "k3s.service")
     # Pods wait in ContainerCreating until these exist.
-    machine.wait_until_succeeds("kubectl get ns farm", timeout=sec(180))
+    wait_succeeds(machine, "kubectl get ns farm")
     kubectl("create secret tls farm-lb-tls --cert=${certs}/lb.crt --key=${certs}/lb.key")
     kubectl("create secret tls farm-worker-tls --cert=${certs}/worker.crt --key=${certs}/worker.key")
     kubectl("create secret generic farm-ca --from-file=ca.crt=${certs}/ca.crt")
 
     with subtest("chart deploys and workers become Ready"):
-        try:
-            for d in ["lb", "scheduler", "worker-${groupName}"]:
-                rollout(f"nix-grpc-farm-{d}")
-        except Exception:
-            dump()
-            raise
-        machine.wait_for_unit("niks3.service")
+        for d in ["lb", "scheduler", "worker-${groupName}"]:
+            rollout(f"nix-grpc-farm-{d}")
+        wait_unit(machine, "niks3.service")
         # envoy has health-checked both workers and the scheduler
         lb_ip = pod_ip("-l app.kubernetes.io/component=lb")
-        machine.wait_until_succeeds(
+        wait_succeeds(
+            machine,
             f"test $(curl -sf {lb_ip}:9901/stats/prometheus | grep -v '^#' | grep '^envoy_cluster_membership_healthy' | grep -v 'envoy_cluster_name=\"admin\"' | awk '{{s+=$2}} END {{print s+0}}') -ge 3",
-            timeout=sec(120),
         )
         # The admin API is not reachable from the pod network.
         machine.fail(f"curl -sf {lb_ip}:9901/clusters")
         sched_ip = pod_ip("-l app.kubernetes.io/component=scheduler")
-        machine.wait_until_succeeds(f"curl -sf http://{sched_ip}:9464/metrics | grep -qx 'nix_grpc_sched{{kind=\"workers\"}} 2'", timeout=sec(120))
+        wait_succeeds(machine, f"curl -sf http://{sched_ip}:9464/metrics | grep -qx 'nix_grpc_sched{{kind=\"workers\"}} 2'")
 
     pods = kubectl("get pods -l app.kubernetes.io/component=worker --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'").split()
     assert len(pods) == 2, pods
@@ -405,7 +421,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("kubectl apply -f ${ciJob}")
         try:
             # Complete or Failed, whichever comes first.
-            machine.wait_until_succeeds("kubectl -n ci get job ci -o jsonpath='{.status.conditions[*].type}' | grep -qE 'Complete|Failed'", timeout=sec(180))
+            wait_succeeds(machine, "kubectl -n ci get job ci -o jsonpath='{.status.conditions[*].type}' | grep -qE 'Complete|Failed'")
             machine.succeed("kubectl -n ci get job ci -o jsonpath='{.status.succeeded}' | grep -qx 1")
         finally:
             machine.execute("kubectl -n ci logs job/ci >&2")
@@ -415,11 +431,11 @@ pkgs.testers.runNixOSTest {
         kubectl("create secret tls farm-lb-tls --cert=${certs}/lb-renewed.crt --key=${certs}/lb-renewed.key --dry-run=client -o yaml | kubectl -n farm apply -f -")
         # kubelet syncs Secret volumes about once a minute.
         lb_pod = kubectl("get pods -l app.kubernetes.io/component=lb -o jsonpath='{.items[0].metadata.name}'")
-        machine.wait_until_succeeds(f"kubectl -n farm exec {lb_pod} -- cat /etc/envoy/tls/lb/tls.crt | openssl x509 -noout -ext subjectAltName | grep -q renewed.example", timeout=sec(120))
-        machine.wait_until_succeeds(
+        wait_succeeds(machine, f"kubectl -n farm exec {lb_pod} -- cat /etc/envoy/tls/lb/tls.crt | openssl x509 -noout -ext subjectAltName | grep -q renewed.example")
+        wait_succeeds(
+            machine,
             "openssl s_client -connect 127.0.0.1:${toString nodePort} </dev/null 2>/dev/null "
             "| openssl x509 -noout -ext subjectAltName | grep -q renewed.example",
-            timeout=sec(20),
         )
         build("${jobExpr}", "t-renewed")
 
@@ -434,8 +450,9 @@ pkgs.testers.runNixOSTest {
         # Garbage for gc to find, then leave ~1G free: below ensureFree (2G).
         avail = int(sh("gc", "df -B1 /nix/store | awk 'NR==2 {print $4}'"))
         sh("nix-daemon", "for i in 1 2 3; do echo $i > /tmp/g$i; nix-store --add /tmp/g$i; done")
+        runs = int(kubectl(f"logs {pod} -c gc | grep -c 'store paths deleted' || true"))
         sh("gc", f"fallocate -l {avail - 1024**3} /nix/fill")
-        machine.wait_until_succeeds(f"kubectl -n farm logs {pod} -c gc --since=30s | grep -q 'store paths deleted'", timeout=sec(60))
+        wait_stream(machine, f"kubectl -n farm logs -f {pod} -c gc", "store paths deleted", more_than=runs)
         sh("gc", "rm /nix/fill")
         ready = kubectl(f"get pod {pod} -o jsonpath='{{.status.conditions[?(@.type==\"Ready\")].status}}'").strip()
         assert ready == "True", ready
@@ -443,23 +460,30 @@ pkgs.testers.runNixOSTest {
 
     with subtest("losing the balancer mid-build: the client reconnects and the build succeeds"):
         machine.succeed(f"systemd-run --unit vialb nix build -L --store '{store}' --eval-store auto -f ${slowExpr} --argstr tag lb1")
-        machine.wait_until_succeeds("journalctl -u vialb | grep -q \"building '/nix/store/.*-slow-lb1.drv'\"", timeout=sec(120))
-        kubectl("delete pod -l app.kubernetes.io/component=lb --wait=false")
-        machine.wait_until_succeeds("! systemctl is-active vialb", timeout=sec(180))
-        machine.succeed("systemctl show -p Result --value vialb | grep -qx success || { journalctl -u vialb >&2; false; }")
+        wait_succeeds(machine, "journalctl -u vialb | grep -q \"building '/nix/store/.*-slow-lb1.drv'\"", clients=[(machine, "vialb")])
+        lb_pod = kubectl("get pods -l app.kubernetes.io/component=lb -o jsonpath='{.items[0].metadata.name}'")
+        kubectl(f"delete pod {lb_pod} --wait=false")
+        # the balancer gone and back while the build runs; then it may end
+        wait_succeeds(machine, f"! kubectl -n farm get pod {lb_pod}")
         rollout("nix-grpc-farm-lb")
+        release("lb1", pods, "vialb")
+        wait_until("vialb ended", lambda: ended(machine, "vialb"))
+        machine.succeed("systemctl show -p Result --value vialb | grep -qx success || { journalctl -u vialb >&2; false; }")
 
     with subtest("deleting a worker pod mid-build drains it: the build finishes there and publishes"):
         machine.succeed(f"systemd-run --unit slow nix build -L --store '{store}' --eval-store auto -f ${slowExpr} --argstr tag s1")
         def holder() -> str | None:
-            # [2] keeps the probe from matching itself.
-            return next((p for p in pods if machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- pgrep -f 'read -t [2]0 x'")[0] == 0), None)
-        retry(lambda _: holder() is not None, timeout=sec(120))
+            # [g] keeps the probe from matching itself, $ the build's outer sh.
+            return next((p for p in pods if machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- pgrep -f 'slow-s1-holdin[g]$'", timeout=None)[0] == 0), None)
+        wait_until("a worker pod to run the slow build", lambda: holder() is not None, clients=[(machine, "slow")])
         busy = holder()
+        assert busy is not None
         kubectl(f"delete pod {busy} --wait=false")
-        machine.sleep(duration=sec(5))
+        # The worker has its SIGTERM and drains; its build still runs after.
+        wait_stream(machine, f"kubectl -n farm logs -f {busy} -c nix-grpc-daemon", "event=draining( |$)")
         assert holder() == busy, "pod delete killed the build instead of draining"
-        machine.wait_until_succeeds("! systemctl is-active slow", timeout=sec(300))
+        release("s1", [busy], "slow")
+        wait_until("slow ended", lambda: ended(machine, "slow"))
         machine.succeed("systemctl show -p Result --value slow | grep -qx success || { journalctl -u slow >&2; false; }")
         machine.fail("journalctl -u slow | grep -q 'asking the scheduler again'")
         narinfo = out_path("${slowExpr}", "s1").removeprefix("/nix/store/").split("-")[0] + ".narinfo"

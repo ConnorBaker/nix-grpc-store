@@ -13,7 +13,7 @@ fn timed(argv: &[&str]) -> f64 {
                     echo $(( (e - s) / 1000000 )); exit $rc"#;
     let mut cmd = vec!["sh", "-c", script, "sh"];
     cmd.extend(argv);
-    let o = run_t(&cmd, 600);
+    let o = run(&cmd);
     assert_eq!(
         o.code,
         0,
@@ -45,7 +45,7 @@ impl Netem {
 
 impl Drop for Netem {
     fn drop(&mut self) {
-        let _ = run_t(&["tc", "qdisc", "del", "dev", "lo", "root", "netem"], 30);
+        let _ = run(&["tc", "qdisc", "del", "dev", "lo", "root", "netem"]);
     }
 }
 

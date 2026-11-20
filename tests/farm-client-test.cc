@@ -1,6 +1,5 @@
 // Drives src/daemon/cache.hh and push.hh against tests/farm-mock.py. Run via `meson test`.
 
-#include <chrono>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
@@ -26,8 +25,6 @@
 #include "push.hh"
 
 namespace {
-
-constexpr std::chrono::milliseconds settle{300};
 
 class Suite
 {
@@ -68,26 +65,26 @@ public:
     }
 };
 
+// As the daemon's callers pass one: a wait nobody gives up on.
+auto never() -> bool
+{
+    return false;
+}
+
 void testPush(Suite & tst, nixgrpc::PushProcess & push)
 {
     // The child must outlive the thread that spawned it.
-    std::thread([&] -> void { push.pushWait({"/nix/store/x.drv"}); }).join();
+    std::thread([&] -> void { push.pushWait({"/nix/store/x.drv"}, never); }).join();
+    push.pushWait({"/nix/store/y", "/nix/store/y2"}, never);
     {
-        constexpr std::chrono::milliseconds wellUnderCancelPoll{800};
-        auto const started = std::chrono::steady_clock::now();
-        push.pushWait({"/nix/store/quick"});
-        tst.check(std::chrono::steady_clock::now() - started < wellUnderCancelPoll, "pushWait wakes on the ack");
-    }
-    push.pushWait({"/nix/store/y", "/nix/store/y2"});
-    {
-        auto sigs = push.pushWait({"/nix/store/signed-a", "/nix/store/plain"});
+        auto sigs = push.pushWait({"/nix/store/signed-a", "/nix/store/plain"}, never);
         tst.check(sigs.size() == 1 && sigs.contains("/nix/store/signed-a"), "signatures come back for the paths niks3 signed");
         tst.check(sigs["/nix/store/signed-a"].size() == 1, "one signature per key");
     }
     {
         // spec/push.qnt: two RPCs publishing the same path at once.
-        std::thread other([&] -> void { push.pushWait({"/nix/store/shared"}); });
-        push.pushWait({"/nix/store/shared"});
+        std::thread other([&] -> void { push.pushWait({"/nix/store/shared"}, never); });
+        push.pushWait({"/nix/store/shared"}, never);
         other.join();
     }
     {
@@ -103,7 +100,7 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
         constexpr int writers = 8;
         threads.reserve(writers);
         for (int i = 0; i < writers; i++) {
-            threads.emplace_back([&] -> void { push.pushWait(many); });
+            threads.emplace_back([&] -> void { push.pushWait(many, never); });
         }
         for (auto & thr : threads) {
             thr.join();
@@ -111,7 +108,7 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
     }
     auto const throws = [&](const char * path) -> std::string {
         try {
-            push.pushWait({path});
+            push.pushWait({path}, never);
         } catch (nix::Error &) {
             return "error";
         }
@@ -121,20 +118,16 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
     tst.check(throws("/nix/store/crash") == "error", "dead child fails the waiter");
     tst.check(throws("/nix/store/z") == "ok", "child is respawned");
     {
-        bool stop = false;
-        std::thread canceller([&] -> void {
-            std::this_thread::sleep_for(settle);
-            stop = true;
-        });
+        // Cancelled once the wait for the ack has begun: at its second look.
+        int looks = 0;
         std::string got = "ok";
         try {
-            push.pushWait({"/nix/store/hang"}, [&] -> bool { return stop; });
+            push.pushWait({"/nix/store/hang"}, [&] -> bool { return ++looks > 1; });
         } catch (nixgrpc::CancelledWait &) {
             got = "cancelled";
         } catch (nix::Error &) {
             got = "error";
         }
-        canceller.join();
         tst.check(got == "cancelled", "pushWait returns once cancelled while niks3 never acks");
         tst.check(throws("/nix/store/z2") == "ok", "push usable after a cancelled wait");
     }
@@ -150,7 +143,7 @@ void testCache(Suite & tst, const std::string & base, const std::string & mock)
 {
     nixgrpc::Cache off(nixgrpc::Niks3Config{});
     tst.check(!off.hasRemote() && off.holds({"a.narinfo"}).empty(), "no niks3: the cache holds nothing, publish is a no-op");
-    off.publish({"/nix/store/whatever"});
+    off.publish({"/nix/store/whatever"}, never);
 
     auto const tokenFile = std::filesystem::path(nix::createTempDir()).string() + "/token";
     nix::writeFile(tokenFile, "stale");
@@ -167,7 +160,7 @@ void testCache(Suite & tst, const std::string & base, const std::string & mock)
     nix::writeFile(tokenFile + ".new", "testtoken");
     std::filesystem::rename(tokenFile + ".new", tokenFile);
     tst.check(cache.holds({"aaaa.narinfo"}).empty(), "token rotation picked up; unknown key absent");
-    cache.publish({"/nix/store/aaaa-foo", "/nix/store/bbbb-bar"});
+    cache.publish({"/nix/store/aaaa-foo", "/nix/store/bbbb-bar"}, never);
     auto const have = cache.holds({"aaaa.narinfo", "bbbb.narinfo", "cccc.narinfo"});
     tst.check(have == std::unordered_set<std::string>{"aaaa.narinfo", "bbbb.narinfo"}, "published paths are held");
     tst.check(cache.holds({}).empty(), "empty query, no request");

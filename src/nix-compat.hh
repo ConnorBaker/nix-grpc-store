@@ -54,6 +54,11 @@
 #include <nix/store/substituter.hh> // IWYU pragma: export
 #endif
 
+// Newer Nix declares DerivationOutput in a header of its own.
+#if __has_include(<nix/store/derivation/output.hh>)
+#include <nix/store/derivation/output.hh> // IWYU pragma: export
+#endif
+
 #if __has_include(<nix/store/derivation/aterm.hh>)
 #include <nix/store/derivation/aterm.hh>
 #define NIX_COMPAT_HAS_DERIVATION_ATERM 1
@@ -157,6 +162,16 @@ auto isSandboxed(const D & drv) -> bool
     }
 }
 
+template<typename D>
+auto isImpure(const D & drv) -> bool
+{
+    if constexpr (requires { drv.type(); }) {
+        return drv.type().isImpure();
+    } else {
+        return type(drv).isImpure();
+    }
+}
+
 inline auto succeeded(nix::BuildResult &res) -> bool {
   return res.tryGetSuccess() != nullptr;
 }
@@ -240,6 +255,15 @@ inline auto failureStatusName(FailureStatus status) -> std::string_view {
   default:
     return "Unknown";
   }
+}
+
+// The drv's output paths, and their variables, from its contents.
+inline void fillInOutputPaths(nix::Derivation &drv, nix::Store &store) {
+#if NIX_COMPAT_TEMPLATED_DRV
+  nix::derivation::fillInOutputPaths(drv, store);
+#else
+  drv.fillInOutputPaths(store);
+#endif
 }
 
 // Plain store path inputs of a BasicDerivation.

@@ -5,10 +5,12 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +22,7 @@
 namespace nixgrpc {
 
 using nix::remote::WorkerMsg;
+using nix::remote::WorkerMsgs;
 
 Builder::Builder(Config config, Metrics & metrics)
     : config(std::move(config))
@@ -48,10 +51,13 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     auto lck = state.lock();
     arrived(*lck);
     auto & ent = lck->expected[exp.drv_path()];
-    if (ent.claimed) {
-        return; // re-announced across a scheduler restart, keep the live one
-    }
+    // A claimed one runs here already: placed here again (a client bounced
+    // off it), or re-announced across a scheduler restart. Its Done names
+    // the placement the scheduler holds now, the latest.
     ent.assignId = exp.assign_id();
+    if (ent.claimed) {
+        return;
+    }
     ent.since = config.now();
     metrics.event("expect");
 }
@@ -72,7 +78,11 @@ auto Builder::claim(const std::string & drvPath, uint64_t assignId) -> bool
         }
         // The scheduler numbers its assignments in the order it sends them,
         // so only a newer one than the last we read can still arrive.
-        if (assignId <= lck->newestExpect || lck.wait_until(expectArrived, deadline) == std::cv_status::timeout) {
+        if (assignId <= lck->newestExpect) {
+            return false;
+        }
+        metrics.event("expect_wait");
+        if (lck.wait_until(expectArrived, deadline) == std::cv_status::timeout) {
             return false;
         }
     }
@@ -198,6 +208,7 @@ auto Builder::hello() -> WorkerMsg
         hel->add_features(feat);
     }
     hel->set_max_jobs(maxJobs_);
+    hel->set_publish_failing(publishFailing_);
     auto lck = state.lock();
     lck->newestExpect = 0; // a new session, maybe of a new scheduler, counts anew
     // A slot nobody claimed is dropped, not reported: the scheduler would
@@ -214,11 +225,15 @@ auto Builder::hello() -> WorkerMsg
 auto Builder::greet() -> bool
 {
     std::scoped_lock const lock(unavailableMutex);
-    if (!send(hello())) {
-        return false;
+    // With its drain in the same message: a draining builder is never
+    // offered builds on its Hello alone, which it would each give back.
+    WorkerMsgs msgs;
+    *msgs.add_msgs() = hello();
+    if (draining()) {
+        *msgs.add_msgs() = load();
     }
-    greeted_ = true;
-    return !draining() || send(load());
+    greeted_ = send(msgs);
+    return greeted_;
 }
 
 auto Builder::load() const -> WorkerMsg
@@ -226,7 +241,20 @@ auto Builder::load() const -> WorkerMsg
     WorkerMsg msg;
     msg.mutable_load()->set_draining(draining());
     msg.mutable_load()->set_max_jobs(maxJobs_);
+    msg.mutable_load()->set_publish_failing(publishFailing_);
     return msg;
+}
+
+void Builder::published(bool works)
+{
+    std::scoped_lock const lock(unavailableMutex);
+    if (publishFailing_.exchange(!works) == !works) {
+        return;
+    }
+    logLine(LogLevel::info, {{"event", works ? "publishing" : "publish_failing"}});
+    if (greeted_) {
+        send(load());
+    }
 }
 
 void Builder::setMaxJobs(uint32_t maxJobs)
@@ -295,8 +323,90 @@ void Builder::setSend(SendFn send)
 
 auto Builder::send(const WorkerMsg & msg) const -> bool
 {
+    WorkerMsgs one;
+    *one.add_msgs() = msg;
+    return send(one);
+}
+
+auto Builder::send(const WorkerMsgs & msgs) const -> bool
+{
     const SendFn cur = *sendFn.lock(); // copy: do not hold the lock across stream I/O
-    return cur && cur(msg);
+    return cur && cur(msgs);
+}
+
+void Builder::checkBuiltWith(BuiltHere built)
+{
+    builtHere = std::move(built);
+}
+
+// A placement nobody claims whose outputs this node's store has, all of
+// them, is built: its build ran on this node outside this process, as one
+// of a predecessor's for a client that never calls here. Finished as BUILT,
+// it is neither given back nor placed again, and it frees its slot. Outputs
+// the node had before the placement read the same: a real client calling
+// more than probeAfter late (--rebuild, saturated handlers) finds its
+// placement already finished, and its call is turned down as for any drv
+// not expected here, a bounce (docs/farm.md, Upgrade a single node).
+void Builder::probeBuiltHere(const std::stop_token & stop)
+{
+    std::mutex sleepMutex;
+    std::condition_variable_any wake;
+    while (!stop.stop_requested()) {
+        finishBuiltHere();
+        std::unique_lock lock(sleepMutex);
+        wake.wait_for(lock, stop, std::chrono::seconds(1), [] -> bool { return false; });
+    }
+}
+
+void Builder::finishBuiltHere()
+{
+    if (!builtHere) {
+        return;
+    }
+    auto const now = config.now();
+    std::vector<std::pair<std::string, uint64_t>> due;
+    {
+        auto lck = state.lock();
+        for (auto & [drv, ent] : lck->expected) {
+            if (!ent.claimed && now - ent.since >= probeAfter) {
+                due.emplace_back(drv, ent.assignId);
+            }
+        }
+    }
+    // On this thread an exception would end the process, and every build on
+    // the node with it. One drv's failure is its own: the others are asked.
+    for (const auto & [drv, assignId] : due) {
+        try {
+            settleBuiltHere(drv, assignId);
+        } catch (const std::exception & err) {
+            logLine(LogLevel::info, {{"event", "built_here_failed"}, {"drv", drv}, {"error", err.what()}});
+        }
+    }
+}
+
+void Builder::settleBuiltHere(const std::string & drv, uint64_t assignId)
+{
+    auto const outputs = builtHere(drv);
+    if (!outputs) {
+        return;
+    }
+    decltype(State::expected)::node_type held;
+    {
+        auto lck = state.lock();
+        auto const found = lck->expected.find(drv);
+        if (found == lck->expected.end() || found->second.claimed || found->second.assignId != assignId) {
+            return;
+        }
+        held = lck->expected.extract(found);
+    }
+    try {
+        sendDone(drv, assignId, nix::remote::Done::BUILT, *outputs);
+    } catch (...) {
+        // Not sent: held as before, for the next round, unless placed anew.
+        state.lock()->expected.insert(std::move(held));
+        throw;
+    }
+    metrics.event("expect_built_here");
 }
 
 void Builder::tick()

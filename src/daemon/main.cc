@@ -36,6 +36,7 @@
 #include <thread>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <sys/socket.h>
@@ -72,6 +73,7 @@
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/strings.hh>
+#include <nix/util/terminal.hh>
 #include <nix/util/unix-domain-socket.hh>
 #include <nix/util/util.hh>
 
@@ -195,7 +197,8 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         using nix::Error::Error;
     };
 
-    // Publishing makes our paths everyone's. Without it the client may not rely on them.
+    // Publishing makes our paths everyone's. Without it the client may not
+    // rely on them. Tells the scheduler whether this worker can.
     // Returns the paths the cache took from us.
     auto publish(
         nix::Store & localStore,
@@ -203,13 +206,20 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         const nixgrpc::Cancelled & cancelled,
         bool verify = false) -> nixgrpc::PushProcess::Signatures
     {
+        bool const reports = coord.builder && coord.cache.hasRemote() && !paths.empty();
         nixgrpc::PushProcess::Signatures signed_;
         try {
             signed_ = coord.cache.publish(paths, cancelled, verify);
         } catch (nixgrpc::CancelledWait &) {
             throw;
         } catch (nix::Error & err) {
+            if (reports) {
+                coord.builder->published(false);
+            }
             throw Unavailable("publish failed: %s", err.what());
+        }
+        if (reports) {
+            coord.builder->published(true);
         }
         // Built here the paths are only "ultimate", a client checking
         // signatures would refuse them. Outside the catch: a local nix-daemon
@@ -920,8 +930,9 @@ public:
 
     static auto missingFeature(nix::Store & store, const nix::BasicDerivation & drv) -> std::optional<std::string>
     {
+        auto const offered = nix::StoreConfig::getDefaultSystemFeatures();
         for (const auto & feature : nixcompat::requiredSystemFeatures(store, drv)) {
-            if (!nix::settings.systemFeatures.get().contains(feature)) {
+            if (!offered.contains(feature)) {
                 return feature;
             }
         }
@@ -940,11 +951,49 @@ public:
         return res;
     }
 
+    // A floating content-addressed output the GC took before we held it.
+    // nix-daemon 2.35 through current master keeps the build trace that
+    // names it.
+    static auto collected(
+        const nix::Store & store, const nix::StorePath & drvPath, const nix::StorePath & path, std::string_view before)
+        -> grpc::Status
+    {
+        return {
+            grpc::StatusCode::UNAVAILABLE,
+            "output " + store.printStorePath(path) + " was garbage-collected before it was " + std::string(before)
+                + "; a nix-daemon 2.35 through current master keeps its build trace of "
+                + store.printStorePath(drvPath)
+                + " and refuses a rebuild here that makes other bytes"};
+    }
+
+    // A build trace of an output the GC took, and a rebuild that made other
+    // bytes, which a nix-daemon 2.35 through current master refuses: another
+    // builder has no such trace. registerDrvOutput throws a plain Error,
+    // which says so in text only. Only nix-daemon's errors get here, never a
+    // build's log, and it builds drvPath alone: its inputs are all here.
+    static auto staleTrace(const nix::Store & store, const nix::StorePath & drvPath, std::string_view error)
+        -> std::optional<grpc::Status>
+    {
+        auto const plain = nix::filterANSIEscapes(error, true);
+        if (!plain.contains("Trying to register a realisation of '")) {
+            return std::nullopt;
+        }
+        return grpc::Status{
+            grpc::StatusCode::UNAVAILABLE,
+            "this builder's build trace of " + store.printStorePath(drvPath)
+                + " names an output it no longer has, and a nix-daemon 2.35 through current master refuses the "
+                  "rebuild's other bytes: "
+                + plain};
+    }
+
     // Who a build runs for. It does not have to be an RPC.
     struct Caller
     {
         std::function<bool()> gone; // it no longer waits for the result
         nixgrpc::BuildEventSink log;
+        // Keeps outputs known only once built (floating content-addressed
+        // ones) for whoever fetches them.
+        std::function<void(const std::vector<nix::StorePath> &)> hold = [](const auto &) -> void {};
         bool cacheLost = false;   // it builds again because the cache lost the NAR
         std::string missingInput; // out: the input that could not be fetched
     };
@@ -1078,8 +1127,14 @@ public:
         }
         auto & builder = *coord.builder;
         auto const outPaths = staticOutputs(localStore, drv);
-        if (outPaths.size() != drv.outputs.size()) {
-            return {grpc::StatusCode::UNIMPLEMENTED, "builds need statically known output paths"};
+        // A floating content-addressed output's path comes with the result.
+        if (!std::ranges::all_of(drv.outputs, [&](const auto & output) -> bool {
+                return outPaths.contains(output.first)
+                       || std::holds_alternative<nix::DerivationOutput::CAFloating>(output.second.raw);
+            })) {
+            return {
+                grpc::StatusCode::UNIMPLEMENTED,
+                "builds need statically known or floating content-addressed output paths"};
         }
         if (auto feature = missingFeature(localStore, drv)) {
             return {grpc::StatusCode::FAILED_PRECONDITION, "lacks system feature '" + *feature + "'"};
@@ -1169,6 +1224,36 @@ public:
         }
     }
 
+    // nix-daemon's build, or the status that gives it back when a stale
+    // build trace refused it.
+    auto buildOnDaemon(
+        const nixgrpc::Cancelled & cancelled,
+        nix::Store & localStore,
+        const nix::StorePath & drvPath,
+        nix::BuildMode mode,
+        nixgrpc::Backends::Limits limits,
+        const nixgrpc::BuildEventSink & log) -> std::variant<nix::BuildResult, grpc::Status>
+    {
+        nix::BuildResult res;
+        try {
+            res = backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
+        } catch (nix::Error & err) {
+            if (cancelled()) {
+                throw nixgrpc::CancelledWait("build interrupted");
+            }
+            if (auto stale = staleTrace(localStore, drvPath, err.what())) {
+                return *stale;
+            }
+            throw;
+        }
+        if (!nixcompat::succeeded(res) && cancelled()) {
+            // nix-daemon killed the builder when we hung up and still got its
+            // "failed: signal 9" result out before the socket closed.
+            throw nixgrpc::CancelledWait("build interrupted");
+        }
+        return res;
+    }
+
     auto buildExpected(
         Caller & caller,
         nixgrpc::Expected::Shared & shared,
@@ -1200,32 +1285,43 @@ public:
         }
         nix::BuildResult res;
         log({.text = workerName + ": building " + std::string(drvPath.to_string())});
-        try {
+        {
             phase.next("build");
             nixgrpc::Metrics::Held const building(metrics, "build_slot");
-            res = backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
-            phase.done();
-        } catch (nix::Error &) {
-            if (cancelled()) {
-                throw nixgrpc::CancelledWait("build interrupted");
+            auto built = buildOnDaemon(cancelled, localStore, drvPath, mode, limits, log);
+            if (auto * status = std::get_if<grpc::Status>(&built)) {
+                return *status;
             }
-            throw;
-        }
-        if (!nixcompat::succeeded(res) && cancelled()) {
-            // nix-daemon killed the builder when we hung up and still got its
-            // "failed: signal 9" result out before the socket closed.
-            throw nixgrpc::CancelledWait("build interrupted");
+            res = std::move(std::get<nix::BuildResult>(built));
+            phase.done();
         }
         metrics.event(nixcompat::succeeded(res) ? "built" : "build_failed");
         if (auto const status = nixcompat::failureStatus(res)) {
             metrics.buildFailure(nixcompat::failureStatusName(*status));
         }
         if (nixcompat::succeeded(res)) {
+            // From the result: a floating content-addressed output has no path
+            // before the build, and nix-daemon does not root it. Rooted now, an
+            // output still valid stays so until publish is done, and is held for
+            // the client's session before that root goes. One the GC took is
+            // given back: the scheduler places the build on another builder if
+            // one can run it.
+            std::vector<nix::StorePath> paths;
+            nixcompat::forBuiltOutputs(res, [&](const nix::StorePath & path) -> void { paths.push_back(path); });
             std::vector<std::string> built;
-            built.reserve(outPaths.size());
-            for (const auto & [name, path] : outPaths) {
+            built.reserve(paths.size());
+            std::vector<nix::StorePath> floating;
+            for (const auto & path : paths) {
+                if (!std::ranges::contains(outPaths | std::views::values, path)) {
+                    roots->addTempRoot(path);
+                    if (!localStore.isValidPath(path)) {
+                        return collected(localStore, drvPath, path, "rooted");
+                    }
+                    floating.push_back(path);
+                }
                 built.push_back(localStore.printStorePath(path));
             }
+            caller.hold(floating);
             phase.next("publish");
             // The build is paid for: publish it also when the client left or the
             // scheduler moved on. The cache keeps one of two builds of a path.
@@ -1285,6 +1381,7 @@ public:
             Caller caller{
                 .gone = [context] -> bool { return context->IsCancelled(); },
                 .log = sendLogLine,
+                .hold = [&](const std::vector<nix::StorePath> & paths) -> void { holdForSession(rpc, paths); },
                 .cacheLost = context->client_metadata().contains("x-nix-cache-lost"),
             };
             if (auto const status =
@@ -1294,6 +1391,27 @@ public:
                     context->AddTrailingMetadata("x-nix-missing-input", caller.missingInput);
                 }
                 return {status.error_code(), workerName + ": " + status.error_message()};
+            }
+            // An attached caller learns the floating content-addressed outputs
+            // only now. Without a cache to publish to, its client fetches them
+            // from here: held for its session from now on, and checked, since
+            // the owner's build let go of them and only the owner's session
+            // holds them. The build was reported done, so one the GC took only
+            // makes the client ask the scheduler again.
+            std::vector<nix::StorePath> floating;
+            for (const auto & output : chunk.done().outputs()) {
+                if (nix::StorePath path(output.path()); std::ranges::find(held, path) == held.end()) {
+                    floating.push_back(std::move(path));
+                }
+            }
+            holdForSession(rpc, floating);
+            if (!coord.cache.hasRemote()) {
+                for (const auto & path : floating) {
+                    if (!localStore->isValidPath(path)) {
+                        auto const status = collected(*localStore, drvPath, path, "held");
+                        return {status.error_code(), workerName + ": " + status.error_message()};
+                    }
+                }
             }
             writer->Write(chunk);
             rpc.done(
@@ -1416,6 +1534,8 @@ struct Generation
     std::optional<takeover::Predecessor> predecessor;
     // Shutdown() since the takeover: GOAWAY, then it waits for the calls.
     std::thread goaway;
+    // Their idle ones end with the takeover: our server takes none after it.
+    nixgrpc::tunnel::Tunnels * tunnels = nullptr;
 
     // Until it is gone this process may not end: systemd would take that for
     // the unit's end and kill the predecessor's builds (KillMode=mixed).
@@ -1569,6 +1689,11 @@ void takeOverStep(
             logLine(LogLevel::info, {{"event", "takeover_failed"}, {"pid", peer}});
             resume(next, metrics);
             return;
+        }
+        // First, so that the server, still running, took every tunnel it
+        // was handed.
+        if (gen.tunnels != nullptr) {
+            gen.tunnels->stop();
         }
         // New calls on our connections go to new ones, which the successor
         // accepts. Calls in flight here go on.
@@ -1809,7 +1934,7 @@ try {
         NIX_GRPC_VERSION,
         options.workerName,
         nix::settings.thisSystem.get(),
-        nix::concatStringsSep(",", nix::settings.systemFeatures.get()));
+        nix::concatStringsSep(",", nix::StoreConfig::getDefaultSystemFeatures()));
     nixgrpc::IdleTracker idle;
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
@@ -1891,6 +2016,9 @@ try {
     coord.start(*server);
     if (tunnelled && coord.builder) {
         startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);
+        if (tunnels) {
+            gen.tunnels = &*tunnels;
+        }
     }
     announceReady(detached, gen);
 

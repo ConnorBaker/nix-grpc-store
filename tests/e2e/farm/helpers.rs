@@ -10,7 +10,10 @@ pub const WORKER1: Node = Node("worker1");
 pub const WORKER2: Node = Node("worker2");
 pub const WORKERS: [Node; 2] = [WORKER1, WORKER2];
 
-pub const BUILDER: &[&str] = &["pgrep", "-f", "read -t [9]0 x"];
+/// The slow builds (farm.nix), which run until released.
+/// The inner sh, its last argument, not the build's outer sh, which has
+/// more after it; [g] keeps the pattern from matching the probe's own shell.
+pub const BUILDER: &[&str] = &["pgrep", "-f", "slow-holdin[g]$"];
 
 pub fn system() -> String {
     env("NGS_SYSTEM")
@@ -79,12 +82,26 @@ pub fn build(store: &str, tag: &str, extra: &[&str]) -> String {
 pub fn holders(path: &str) -> Vec<Node> {
     WORKERS
         .into_iter()
-        .filter(|&w| run_t(w, &["test", "-e", path], 60).code == 0)
+        .filter(|&w| run(w, &["test", "-e", path]).code == 0)
         .collect()
 }
 
 pub fn worker_metrics(w: Node) -> Vec<String> {
     crate::harness::metrics(w, 9464)
+}
+
+/// `w`'s nix_grpc_build_info line.
+pub fn build_info(w: Node) -> String {
+    worker_metrics(w)
+        .into_iter()
+        .find(|l| l.starts_with("nix_grpc_build_info{"))
+        .unwrap_or_else(|| panic!("no nix_grpc_build_info on {}", w.0))
+}
+
+/// The `features` label of a metrics line.
+pub fn features_label(line: &str) -> Option<&str> {
+    let (_, rest) = line.split_once(r#"features=""#)?;
+    rest.split('"').next()
 }
 
 fn value(line: &str) -> i64 {
@@ -183,15 +200,11 @@ pub fn unhealthy(cluster: &str) -> Vec<Node> {
 pub fn wait_members(cluster: &str, want: &[Node]) {
     let mut want = want.to_vec();
     want.sort_by_key(|n| n.0);
-    retry(
-        90,
-        &format!("healthy members of {cluster} are {want:?}"),
-        || {
-            let mut got = members(cluster);
-            got.sort_by_key(|n| n.0);
-            got == want
-        },
-    );
+    retry(&[], &format!("healthy members of {cluster} are {want:?}"), || {
+        let mut got = members(cluster);
+        got.sort_by_key(|n| n.0);
+        got == want
+    });
 }
 
 pub fn leader() -> Node {
@@ -222,33 +235,32 @@ pub fn farm_ready() {
     static READY: Once = Once::new();
     READY.call_once(|| {
         wait_members(&system(), &WORKERS);
-        retry(60, "one scheduler with both workers", settled);
+        retry(&[], "one scheduler with both workers", settled);
     });
     // A test that stopped a daemon and then failed must not fail every later one.
     for w in WORKERS {
-        run_t(
+        run(
             w,
             &[
                 "sh",
                 "-c",
                 "systemctl is-active -q nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
             ],
-            60,
         );
     }
-    retry(60, "one scheduler with both workers", settled);
+    retry(&[], "one scheduler with both workers", settled);
 }
 
 pub fn building() -> Vec<Node> {
     WORKERS
         .into_iter()
-        .filter(|&w| run_t(w, BUILDER, 60).code == 0)
+        .filter(|&w| run(w, BUILDER).code == 0)
         .collect()
 }
 
 pub fn release_slow() {
     for w in WORKERS {
-        run_t(w, &["pkill", "-f", "read -t [9]0 x"], 60);
+        run(w, &["pkill", "-f", BUILDER[2]]);
     }
 }
 
@@ -274,10 +286,20 @@ pub fn spawn_build(unit: &str, tag: &str) {
     );
 }
 
-pub fn wait_unit_done(units: &str, secs: u64) {
-    let mut cmd = vec!["sh", "-c", r#"! systemctl is-active "$@""#, "sh"];
-    cmd.extend(units.split_whitespace());
-    wait_until_succeeds(CLIENT, &cmd, secs);
+/// Releases slow builds until `unit` has ended: for a client whose build
+/// may start again (moved, or rebuilt after its builder died) after a
+/// release, which a slow build no longer ends by itself.
+pub fn release_until_done(unit: &str) {
+    retry(&[], &format!("{unit} ended, its slow builds released"), || {
+        release_slow();
+        ended(CLIENT, unit)
+    });
+}
+
+pub fn wait_unit_done(units: &str) {
+    for unit in units.split_whitespace() {
+        retry(&[], &format!("{unit} ended"), || ended(CLIENT, unit));
+    }
 }
 
 pub fn assert_unit_success(unit: &str) {
@@ -288,8 +310,11 @@ pub fn assert_unit_success(unit: &str) {
     }
 }
 
-pub fn wait_building() {
-    retry(60, "a slow build is running", || !building().is_empty());
+/// Waits for a slow build to run, which the client in `unit` asked for.
+pub fn wait_building(unit: &str) {
+    retry(&[(CLIENT, unit)],"a slow build is running", || {
+        !building().is_empty()
+    });
 }
 
 /// DEP's `input` for `tag`, needing vip, with other bytes on every build if
@@ -389,8 +414,8 @@ pub fn lose(key: &str) {
 /// `nix build` of DEP's `job` for `tag` through `store`, its input needing
 /// vip (and `nondet` as in input_only_in_the_cache) and the job
 /// `job_features`.
-pub fn build_dep_job(store: &str, tag: &str, job_features: &str, nondet: bool, secs: u64) -> Out {
-    run_t(
+pub fn build_dep_job(store: &str, tag: &str, job_features: &str, nondet: bool) -> Out {
+    run(
         CLIENT,
         &[
             "nix",
@@ -418,7 +443,6 @@ pub fn build_dep_job(store: &str, tag: &str, job_features: &str, nondet: bool, s
             "nondet",
             if nondet { "true" } else { "false" },
         ],
-        secs,
     )
 }
 
@@ -431,8 +455,7 @@ pub fn restart_daemon(w: Node) {
             "-c",
             "systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
         ],
-        60,
     );
     wait_members(&system(), &WORKERS);
-    retry(90, "scheduler settled", settled);
+    retry(&[], "scheduler settled", settled);
 }

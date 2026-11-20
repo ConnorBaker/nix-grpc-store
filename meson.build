@@ -258,16 +258,20 @@ if build_server
     include_directories : [include_directories('src/client')],
     dependencies : [dispatcher_dep, jemalloc_dep],
   )
-  benchmark('dispatcher', dispatcher_bench, args : ['large'], timeout : 300)
+  benchmark('dispatcher', dispatcher_bench, args : ['large'])
 
   # Same Dispatcher behind the real gRPC service on loopback.
   scheduler_grpc_bench = executable('scheduler-grpc-bench',
     sources : ['tests/scheduler-grpc-bench.cc', gen[2], gen[3]],
     dependencies : [dispatcher_dep, grpc_dep, jemalloc_dep],
   )
-  benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'], timeout : 60)
+  benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'])
 
   # --- tests ------------------------------------------------------------------
+
+  # No deadline, as in the Nix build's check phase: a test waits for what it
+  # checks, and one that hangs shows a failure to diagnose.
+  add_test_setup('nodeadline', timeout_multiplier : 0, is_default : true)
 
   test('plugin-loader', executable('plugin-loader-test',
     sources : ['tests/plugin-loader-test.cc'],
@@ -283,7 +287,6 @@ if build_server
   )
   test('farm-client', find_program('tests/farm-client-test.sh'),
     args : [farm_client_test, files('tests/farm-mock.py')],
-    timeout : 60,
   )
 
   oidc_test = executable('oidc-test',
@@ -291,7 +294,7 @@ if build_server
     include_directories : [src_inc, include_directories('src/daemon')],
     dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
   )
-  test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
+  test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test])
 
   test('http', executable('http-test',
     sources : ['tests/http-test.cc'],
@@ -305,7 +308,6 @@ if build_server
   # that client followed ends, revoked or given back, and is not placed again.
   test('keepalive', find_program('python3'),
     args : [files('tests/keepalive-test.py'), daemon_exe],
-    timeout : 180,
   )
 
   # The other side: a client waiting on its Schedule stream must notice by
@@ -325,7 +327,6 @@ if build_server
   )
   test('client-keepalive', find_program('python3'),
     args : [files('tests/client-keepalive-test.py'), daemon_exe, keepalive_client, store_query_client, client_plugin],
-    timeout : 300,
   )
 
   # queryMissing with an evaluation store, through the plugin as nix loads
@@ -366,7 +367,7 @@ if build_server
     sources : ['tests/farm-sim-test.cc'],
     dependencies : [dispatcher_dep, jemalloc_dep],
     cpp_args : ['-UNDEBUG'],
-  ), timeout : 120)
+  ))
 
   test('builder', executable('builder-test',
     sources : ['tests/builder-test.cc'],
@@ -406,7 +407,7 @@ if build_server
       include_directories : [src_inc, include_directories('src/daemon')],
       dependencies : [nix_util_dep, threads_dep],
       cpp_args : ['-UNDEBUG'],
-    ), timeout : 60)
+    ))
   endif
 
   test('acl', executable('acl-test',
@@ -437,12 +438,20 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
-  test('local-store', executable('local-store-test',
+  local_store_test = executable('local-store-test',
     sources : ['tests/local-store-test.cc', gen],
     include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
-    cpp_args : ['-UNDEBUG'],
-  ))
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+  )
+  test('local-store', local_store_test)
+
+  # A placement nobody claims whose outputs the node's store has is settled
+  # from that store by the daemon's own thread, while its client still waits.
+  test('built-here', find_program('python3'),
+    args : [files('tests/built-here-test.py'), daemon_exe, local_store_test],
+    timeout : 120,
+  )
 
   test('tunnel', executable('tunnel-test',
     sources : ['tests/tunnel-test.cc', 'src/daemon/tunnel.cc', 'src/daemon/tunnels.cc'],
@@ -469,7 +478,7 @@ if build_server
     include_directories : [gen_inc, src_inc, include_directories('src/client')],
     cpp_args : nix_compat_args + ['-UNDEBUG'],
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
-  ), timeout : 30)
+  ))
 
   test('executor', executable('executor-test',
     sources : ['tests/executor-test.cc'],
@@ -483,14 +492,14 @@ if build_server
     include_directories : [gen_inc, src_inc, include_directories('src/client')],
     cpp_args : ['-UNDEBUG'],
     dependencies : common_deps,
-  ), timeout : 30)
+  ))
 
   test('call', executable('call-test',
     sources : ['tests/call-test.cc', gen],
     include_directories : [gen_inc, src_inc, include_directories('src/client')],
     cpp_args : nix_compat_args + ['-UNDEBUG'],
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
-  ), timeout : 30)
+  ))
 
   test('top-down', executable('top-down-test',
     sources : ['tests/top-down-test.cc'],

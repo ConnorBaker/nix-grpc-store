@@ -68,7 +68,17 @@ let
     ];
     testCerts.trusted = [ "public-ca" ];
     nix.package = nixPkgs.nix-everything;
-    nix.settings.experimental-features = [ "nix-command" ];
+    # The other parts keep nix's default configuration, but for the
+    # ca-derivations the workers enable below.
+    nix.settings.experimental-features = [
+      "nix-command"
+    ]
+    ++ lib.optionals (part == "ca") [
+      "ca-derivations"
+      "dynamic-derivations"
+      "impure-derivations"
+      "recursive-nix"
+    ];
   };
 
   worker =
@@ -195,13 +205,60 @@ let
       system = builtins.currentSystem;
       requiredSystemFeatures = features;
       builder = "/bin/sh";
-      # Inner sh so a test can pkill it to let the build succeed early.
+      # Runs until a test pkills the inner sh, which lets the build succeed:
+      # a read of a pipe it also holds open for writing, which never ends
+      # nor spins.
       args = [
         "-c"
-        "/bin/sh -c 'read -t 90 x < /dev/zero'; ''${
+        "/bin/sh -c ': | { exec 3<>/proc/self/fd/0; read x <&3; }' slow-holding; ''${
           if unique then "read tag < /proc/sys/kernel/random/uuid" else "tag=''${tag}"
         }; echo $tag > $out"
       ];
+    }
+  '';
+  # Floating content-addressed derivations: `a`, `b` on `a`, and `slow` (as
+  # in slow.nix), and `dynamic`, which reads the output of `inner`, the
+  # derivation that the text-hashed `producer` outputs, byte for byte.
+  caExpr = pkgs.writeText "ca.nix" ''
+    { tag }:
+    let
+      ca = name: script: derivation {
+        inherit name;
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" script ];
+        __contentAddressed = true;
+        outputHashMode = "recursive";
+        outputHashAlgo = "sha256";
+      };
+    in
+    rec {
+      a = ca "ca-a-''${tag}" "echo a-''${tag} > $out";
+      b = ca "ca-b-''${tag}" "read x < ''${a}; echo b-$x > $out";
+      slow = ca "ca-slow-''${tag}" "/bin/sh -c ': | { exec 3<>/proc/self/fd/0; read x <&3; }' slow-holding; echo slow-''${tag} > $out";
+      inner = ca "ca-inner-''${tag}" "echo inner-''${tag} > $out";
+      producer = derivation {
+        name = "ca-inner-''${tag}.drv";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "read -r d < ''${builtins.unsafeDiscardOutputDependency inner.drvPath}; printf %s \"$d\" > $out" ];
+        __contentAddressed = true;
+        outputHashMode = "text";
+        outputHashAlgo = "sha256";
+      };
+      dynamic = derivation {
+        name = "ca-dynamic-''${tag}";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "read x < ''${builtins.outputOf producer.outPath "out"}; echo dynamic-$x > $out" ];
+      };
+      impure = derivation {
+        name = "ca-impure-''${tag}";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "echo impure-''${tag} > $out" ];
+        __impure = true;
+      };
     }
   '';
 
@@ -233,11 +290,17 @@ let
         threads = 1;
       }
     ];
+    ca = [
+      {
+        title = "floating content-addressed and dynamic derivations";
+        module = "ca";
+        threads = 1;
+      }
+    ];
   };
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm-${part}";
-  globalTimeout = 540;
 
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
@@ -361,16 +424,16 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/waits.nix}
     start_all()
     for n, a in [(client, "${ip.client}"), (lb, "${ip.lb}"), (worker1, "${ip.worker1}"), (worker2, "${ip.worker2}")]:
-        n.wait_for_unit("network-addresses-eth1.service")
+        wait_unit(n, "network-addresses-eth1.service")
         n.succeed(f"ip -4 addr show | grep -qF {a}/ || {{ ip -4 addr >&2; false; }}")
-    lb.wait_for_unit("niks3.service")
-    lb.wait_for_open_port(5751)
-    lb.wait_for_unit("envoy.service")
-    lb.wait_for_open_port(50051)
+    wait_unit(lb, "niks3.service")
+    wait_unit(lb, "envoy.service")
+    wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")
     for w in [worker1, worker2]:
-        w.systemctl("start nix-grpc-daemon.service")
+        w.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 
     env = {
         "NGS_WORKER1_IP": "${ip.worker1}",
@@ -386,18 +449,19 @@ pkgs.testers.runNixOSTest {
         "NGS_DEP_EXPR": "${depExpr}",
         "NGS_FAIL_EXPR": "${failExpr}",
         "NGS_SLOW_EXPR": "${slowExpr}",
+        "NGS_CA_EXPR": "${caExpr}",
     }
     nodes = {"client": client, "lb": lb, "worker1": worker1, "worker2": worker2}
 
     ${lib.optionalString (part == "scheduling") ''
       with subtest("extraSystems are advertised"):
           # Either worker may hold the scheduler role.
-          def advertised(last_try: bool) -> bool:
+          def advertised() -> bool:
               return any(
-                  w.execute("journalctl -u nix-grpc-daemon -o cat | grep worker_hello | grep '${ip.worker2}' | grep -q riscv64-linux")[0] == 0
+                  w.execute("journalctl -u nix-grpc-daemon -o cat | grep worker_hello | grep '${ip.worker2}' | grep -q riscv64-linux", timeout=None)[0] == 0
                   for w in [worker1, worker2]
               )
-          retry(advertised, timeout_seconds=60)
+          wait_until("worker2's hello with riscv64-linux", advertised)
     ''}
     ${lib.concatMapStringsSep "\n" (s: ''
       with subtest("${s.title}"):

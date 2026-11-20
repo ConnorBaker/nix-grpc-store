@@ -56,7 +56,7 @@ in
     path = [ pkgs.garage_2 ];
     # Each step tolerates a rerun, so a restart of the unit stays harmless.
     script = ''
-      for i in $(seq 60); do garage status && break; sleep 1; done
+      until garage status; do sleep 1; done
       garage layout assign -z test -c 1G "$(garage node id -q | cut -d@ -f1)" || true
       garage layout apply --version 1 || true
       garage key import --yes -n farm ${s3Key} ${s3Secret} || true

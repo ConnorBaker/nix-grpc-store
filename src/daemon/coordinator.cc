@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <iterator>
 #include <memory>
@@ -41,6 +42,7 @@
 
 #include <nix/store/globals.hh>
 #include <nix/store/local-settings.hh>
+#include <nix/store/store-api.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 
@@ -51,6 +53,7 @@
 #include "client/channel.hh"
 #include "client/retry-pause.hh"
 #include "daemon-probe.hh"
+#include "local-store.hh"
 #include "logfmt.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
@@ -65,7 +68,6 @@ using nix::remote::ClientMsgs;
 using nix::remote::SchedCmd;
 using nix::remote::SchedCmds;
 using nix::remote::SchedMsgs;
-using nix::remote::WorkerMsg;
 using nix::remote::WorkerMsgs;
 
 namespace {
@@ -211,6 +213,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
     : cache(options.niks3)
     , options(options)
     , metrics(metrics)
+    , builtHereStore(options.storeUri)
 {
     if (options.builder) {
         Builder::Config self{
@@ -220,7 +223,9 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
             .maxJobs = servable(options.maxJobs != 0 ? options.maxJobs : nixcompat::configuredMaxBuildJobs())};
         self.systems.append_range(nix::settings.extraPlatforms.get());
         self.systems.append_range(options.extraSystems);
-        self.features.append_range(nix::settings.systemFeatures.get());
+        // As nix-daemon builds: system-features plus those its experimental
+        // features imply, such as ca-derivations.
+        self.features.append_range(nix::StoreConfig::getDefaultSystemFeatures());
         builder.emplace(std::move(self), metrics);
         metrics.buildSlots(builder->maxJobs());
     }
@@ -251,10 +256,8 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
                 builder->onRevoke(cmd.revoke());
             }
         });
-        builder->setSend([this, worker](const WorkerMsg & msg) -> bool {
-            WorkerMsgs one;
-            *one.add_msgs() = msg;
-            dispatcher->workerMsgs(*worker, one);
+        builder->setSend([this, worker](const WorkerMsgs & msgs) -> bool {
+            dispatcher->workerMsgs(*worker, msgs);
             return true;
         });
     }
@@ -268,6 +271,13 @@ Coordinator::~Coordinator()
     if (probeThread.joinable()) {
         probeThread.request_stop();
         probeThread.join();
+    }
+    // Before the send is cut and the dispatcher goes: a round may be sending
+    // a Done through the loopback. The body runs before any member's
+    // destructor, so declaring the thread last would not do.
+    if (builtHereThread.joinable()) {
+        builtHereThread.request_stop();
+        builtHereThread.join();
     }
     if (sessionThread.joinable()) {
         sessionThread.request_stop();
@@ -306,6 +316,8 @@ void Coordinator::start(grpc::Server & server)
     auto & bld = *builder;
     askLocalDaemon(bld);
     probeThread = std::jthread([this, &bld](const std::stop_token & stop) -> void { watchLocalDaemon(bld, stop); });
+    bld.checkBuiltWith(std::bind_front(&LocalStore::builtHere, &builtHereStore));
+    builtHereThread = std::jthread([&bld](const std::stop_token & stop) -> void { bld.probeBuiltHere(stop); });
     if (options.schedulerAddr.empty()) {
         bld.greet();
     } else {
@@ -328,12 +340,11 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
         auto const writeMutex = std::make_shared<std::mutex>();
         auto const live = std::make_shared<std::atomic<bool>>(true);
         auto * raw = stream.get();
-        // Builders send a Done every few seconds at most. No batching needed.
-        bld.setSend([raw, writeMutex, live](const WorkerMsg & msg) -> bool {
-            WorkerMsgs one;
-            *one.add_msgs() = msg;
+        // A Done every few seconds at most goes alone; greet() sends its
+        // Hello and Load together.
+        bld.setSend([raw, writeMutex, live](const WorkerMsgs & msgs) -> bool {
             const std::scoped_lock lock(*writeMutex);
-            return *live && raw->Write(one);
+            return *live && raw->Write(msgs);
         });
         const bool helloed = bld.greet();
         if (helloed) {
@@ -380,8 +391,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 // no error tells the scheduler. So ask it, and take no builds meanwhile.
 void Coordinator::askLocalDaemon(Builder & bld)
 {
-    constexpr std::chrono::seconds patience{5};
-    bool const answers = nixDaemonAnswers(options.socketPath, patience);
+    bool const answers = nixDaemonAnswers(options.socketPath, daemonPatience);
     if (answers == daemonAnswered) {
         return;
     }

@@ -44,11 +44,6 @@ struct CancelledWait : nix::Error
     using nix::Error::Error;
 };
 
-inline auto never() -> bool
-{
-    return false;
-}
-
 
 // One long-lived `niks3 push --stdin`. A request line names paths and blocks
 // until every one was acked. If the child dies all waiters fail and the next
@@ -83,7 +78,7 @@ public:
     using Signatures = std::map<std::string, std::set<std::string>>;
 
     // Returns after niks3 committed all of `paths`.
-    auto pushWait(const std::vector<std::string> & paths, const Cancelled & cancelled = never) -> Signatures
+    auto pushWait(const std::vector<std::string> & paths, const Cancelled & cancelled) -> Signatures
     {
         auto const pending = std::make_shared<Pending>(paths.size());
         uint64_t reqId = 0;
