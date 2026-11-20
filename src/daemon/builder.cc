@@ -22,6 +22,7 @@
 namespace nixgrpc {
 
 using nix::remote::WorkerMsg;
+using nix::remote::WorkerMsgs;
 
 Builder::Builder(Config config, Metrics & metrics)
     : config(std::move(config))
@@ -224,11 +225,15 @@ auto Builder::hello() -> WorkerMsg
 auto Builder::greet() -> bool
 {
     std::scoped_lock const lock(unavailableMutex);
-    if (!send(hello())) {
-        return false;
+    // With its drain in the same message: a draining builder is never
+    // offered builds on its Hello alone, which it would each give back.
+    WorkerMsgs msgs;
+    *msgs.add_msgs() = hello();
+    if (draining()) {
+        *msgs.add_msgs() = load();
     }
-    greeted_ = true;
-    return !draining() || send(load());
+    greeted_ = send(msgs);
+    return greeted_;
 }
 
 auto Builder::load() const -> WorkerMsg
@@ -318,8 +323,15 @@ void Builder::setSend(SendFn send)
 
 auto Builder::send(const WorkerMsg & msg) const -> bool
 {
+    WorkerMsgs one;
+    *one.add_msgs() = msg;
+    return send(one);
+}
+
+auto Builder::send(const WorkerMsgs & msgs) const -> bool
+{
     const SendFn cur = *sendFn.lock(); // copy: do not hold the lock across stream I/O
-    return cur && cur(msg);
+    return cur && cur(msgs);
 }
 
 void Builder::checkBuiltWith(BuiltHere built)

@@ -62,7 +62,6 @@ using nix::remote::ClientMsgs;
 using nix::remote::SchedCmd;
 using nix::remote::SchedCmds;
 using nix::remote::SchedMsgs;
-using nix::remote::WorkerMsg;
 using nix::remote::WorkerMsgs;
 
 namespace {
@@ -225,10 +224,8 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
                 builder->onRevoke(cmd.revoke());
             }
         });
-        builder->setSend([this, worker](const WorkerMsg & msg) -> bool {
-            WorkerMsgs one;
-            *one.add_msgs() = msg;
-            dispatcher->workerMsgs(*worker, one);
+        builder->setSend([this, worker](const WorkerMsgs & msgs) -> bool {
+            dispatcher->workerMsgs(*worker, msgs);
             return true;
         });
     }
@@ -311,12 +308,11 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
         auto const writeMutex = std::make_shared<std::mutex>();
         auto const live = std::make_shared<std::atomic<bool>>(true);
         auto * raw = stream.get();
-        // Builders send a Done every few seconds at most. No batching needed.
-        bld.setSend([raw, writeMutex, live](const WorkerMsg & msg) -> bool {
-            WorkerMsgs one;
-            *one.add_msgs() = msg;
+        // A Done every few seconds at most goes alone; greet() sends its
+        // Hello and Load together.
+        bld.setSend([raw, writeMutex, live](const WorkerMsgs & msgs) -> bool {
             const std::scoped_lock lock(*writeMutex);
-            return *live && raw->Write(one);
+            return *live && raw->Write(msgs);
         });
         const bool helloed = bld.greet();
         if (helloed) {

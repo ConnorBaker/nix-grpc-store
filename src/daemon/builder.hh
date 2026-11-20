@@ -70,8 +70,9 @@ struct Expected
 class Builder
 {
 public:
-    // Delivers a message to the scheduler. False if no session is up.
-    using SendFn = std::function<bool(const nix::remote::WorkerMsg &)>;
+    // Delivers messages to the scheduler, which takes them in one go: it
+    // places nothing between them. False if no session is up.
+    using SendFn = std::function<bool(const nix::remote::WorkerMsgs &)>;
 
     // What the worker tells the scheduler about itself.
     struct Config
@@ -207,6 +208,7 @@ public:
     // Swapped by the session thread on every (re)connect.
     void setSend(SendFn send);
     auto send(const nix::remote::WorkerMsg & msg) const -> bool;
+    auto send(const nix::remote::WorkerMsgs & msgs) const -> bool;
 
 private:
     Config config;
