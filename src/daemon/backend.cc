@@ -40,9 +40,9 @@
 namespace nixgrpc {
 
 namespace {
-// No build hook: it would bypass the scheduler. Of `overrides`, nix-daemon
+// No build hook: it would bypass the scheduler. Of `extra`, nix-daemon
 // takes some, narinfo-cache-positive-ttl among them, from a trusted user only.
-void buildLocally(Backend::Conn & conn, Backends::Limits limits, std::map<std::string, std::string> overrides = {})
+void buildLocally(Backend::Conn & conn, const Backends::Limits & limits, std::map<std::string, std::string> extra = {})
 {
     constexpr uint64_t off = 0;
     constexpr uint64_t yes = 1;
@@ -50,8 +50,7 @@ void buildLocally(Backend::Conn & conn, Backends::Limits limits, std::map<std::s
             << off /* tryFallback */ << off /* verbosity */ << yes /* maxBuildJobs */
             << limits.maxSilentTime << yes << off /* verbosity */ << off << off
             << uint64_t{nixcompat::buildCores()} << yes /* useSubstitutes */;
-    overrides.insert_or_assign("builders", "");
-    overrides.insert_or_assign("timeout", std::to_string(limits.buildTimeout));
+    auto const overrides = limits.overrides(std::move(extra));
     conn.to << overrides.size();
     for (const auto & [name, value] : overrides) {
         conn.to << name << value;
@@ -123,7 +122,7 @@ auto Backends::storedBuild(
     nix::Store & localStore,
     const nix::StorePath & drvPath,
     nix::BuildMode mode,
-    Limits limits,
+    const Limits & limits,
     const BuildEventSink & sendLogLine) const -> nix::BuildResult
 {
     auto backend = forBuild(std::move(cancelled), localStore);
