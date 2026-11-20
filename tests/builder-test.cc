@@ -30,8 +30,10 @@ auto greetsFirst() -> bool
     nixgrpc::Metrics metrics{""};
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     std::vector<bool> hellos;
-    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
-        hellos.push_back(msg.has_hello());
+    builder.setSend([&](const nix::remote::WorkerMsgs & msgs) -> bool {
+        for (const auto & msg : msgs.msgs()) {
+            hellos.push_back(msg.has_hello());
+        }
         return true;
     });
     builder.setUnavailable(Builder::Unavailable::localDaemonDown, true);
@@ -96,9 +98,11 @@ struct Quiet
 
     Quiet()
     {
-        builder.setSend([this](const nix::remote::WorkerMsg & msg) -> bool {
-            if (msg.has_done()) {
-                dones.push_back(msg.done());
+        builder.setSend([this](const nix::remote::WorkerMsgs & msgs) -> bool {
+            for (const auto & msg : msgs.msgs()) {
+                if (msg.has_done()) {
+                    dones.push_back(msg.done());
+                }
             }
             return true;
         });
@@ -263,12 +267,14 @@ auto aFailedAskOrSendKeepsThePlacement() -> bool
         return false;
     }
     bool sendFails = true;
-    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
-        if (msg.has_done()) {
-            if (std::exchange(sendFails, false)) {
-                throw std::runtime_error("the dispatcher threw");
+    builder.setSend([&](const nix::remote::WorkerMsgs & msgs) -> bool {
+        for (const auto & msg : msgs.msgs()) {
+            if (msg.has_done()) {
+                if (std::exchange(sendFails, false)) {
+                    throw std::runtime_error("the dispatcher threw");
+                }
+                quiet.dones.push_back(msg.done());
             }
-            quiet.dones.push_back(msg.done());
         }
         return true;
     });
@@ -421,9 +427,11 @@ auto run() -> int
     nixgrpc::Metrics metrics{""};
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     std::vector<bool> told;
-    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
-        if (msg.has_load()) {
-            told.push_back(msg.load().draining());
+    builder.setSend([&](const nix::remote::WorkerMsgs & msgs) -> bool {
+        for (const auto & msg : msgs.msgs()) {
+            if (msg.has_load()) {
+                told.push_back(msg.load().draining());
+            }
         }
         return true;
     });
