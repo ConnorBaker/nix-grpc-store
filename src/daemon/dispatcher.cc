@@ -709,7 +709,8 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
          .lingerMs = want.lease_id().size() > maxLeaseIdLen
                          ? 0
                          : std::min(static_cast<double>(want.linger_s()) * msPerSecond, config.maxLingerMs),
-         .leaseId = want.lease_id()},
+         .leaseId = want.lease_id(),
+         .runsElsewhere = !want.running_on().empty()},
         nowMs());
     if (res.idleMs) {
         logLine(

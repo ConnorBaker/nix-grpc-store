@@ -496,6 +496,47 @@ says which process serves. By hand, upgrade with `systemctl reload`:
 daemon too old to hand over fails the reload and keeps running
 unchanged.
 
+After a takeover, clients Want again the builds they run through the old
+process, and leave alone an Assigned to the node they already build on: a
+client that says so (`Want.running_on`) takes no slot here, but an older
+one does not, so the new scheduler places those builds for nobody to
+claim. The builder that holds such a placement settles it from what it
+sees itself, on a thread of its own, not on the loop that pets systemd's
+watchdog. One nobody claimed for 10 s whose outputs the node's store
+holds, all of them (asked every second), was built beside it: it is
+finished as built, which frees its slot, and is not placed again. Until
+then such a placement churns: given back after 60 s unclaimed, it is
+placed again for the same client. The 10 s and the second are not
+measured: no figure of how late a real client's first call comes
+(`expect_late`, `expect_wait`) stands behind them.
+
+On a node that is its own scheduler's only builder, the case above, that
+is tolerated: the placement comes back to the node, where it holds one
+slot as the old process's build of it holds the node's, and the node's
+builds go on. That was tried on one node of 63 slots, full of builds
+from clients older than `Want.running_on` when it was taken over: all
+of them finished, and holding the placement for the old process's
+lifetime instead changed no outcome there. tests/built-here-test.py
+checks the settling itself. Where the new scheduler has other builders, it may place the
+build on a node whose store lacks the outputs. There it is never
+settled: it is given back every 60 s and placed on another builder each
+time (a drv goes to a builder that gave it back only when no other can
+take it), until its client stops wanting it. If the node's nix-daemon
+does not answer, the check waits on its thread and settles nothing: the
+placements churn as above, and the builder drains (`local_daemon`) as
+for any build.
+
+The check reads valid outputs as a build already done, so it also settles
+a placement whose outputs the node had before it: a real client whose
+call reaches the builder more than 10 s after the placement, for
+`--rebuild` or because the builder's handlers are saturated, finds it
+reported built without a build of its own. That late call is turned
+down (not scheduled here), and the client treats it as a bounce: its
+next Want names the refused placement, as for any builder that turns a
+call down. The first such bounce per builder is free; each later one
+counts against `reschedule-retries` (8), and a client whose calls keep
+coming that late fails the build ("gave up after 9 reschedules").
+
 **Upgrade the module or the chart.** Both pass the daemon
 `--niks3-cache-url` (from `niks3.cacheUrl`, the chart's `niks3.cacheURL`). A
 `nix-grpc-daemon` older than that flag exits on it, so deploy the

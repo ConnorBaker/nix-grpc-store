@@ -438,12 +438,20 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
-  test('local-store', executable('local-store-test',
+  local_store_test = executable('local-store-test',
     sources : ['tests/local-store-test.cc', gen],
     include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
-    cpp_args : ['-UNDEBUG'],
-  ))
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+  )
+  test('local-store', local_store_test)
+
+  # A placement nobody claims whose outputs the node's store has is settled
+  # from that store by the daemon's own thread, while its client still waits.
+  test('built-here', find_program('python3'),
+    args : [files('tests/built-here-test.py'), daemon_exe, local_store_test],
+    timeout : 120,
+  )
 
   test('tunnel', executable('tunnel-test',
     sources : ['tests/tunnel-test.cc', 'src/daemon/tunnel.cc', 'src/daemon/tunnels.cc'],

@@ -5,10 +5,12 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -318,6 +320,81 @@ auto Builder::send(const WorkerMsg & msg) const -> bool
 {
     const SendFn cur = *sendFn.lock(); // copy: do not hold the lock across stream I/O
     return cur && cur(msg);
+}
+
+void Builder::checkBuiltWith(BuiltHere built)
+{
+    builtHere = std::move(built);
+}
+
+// A placement nobody claims whose outputs this node's store has, all of
+// them, is built: its build ran on this node outside this process, as one
+// of a predecessor's for a client that never calls here. Finished as BUILT,
+// it is neither given back nor placed again, and it frees its slot. Outputs
+// the node had before the placement read the same: a real client calling
+// more than probeAfter late (--rebuild, saturated handlers) finds its
+// placement already finished, and its call is turned down as for any drv
+// not expected here, a bounce (docs/farm.md, Upgrade a single node).
+void Builder::probeBuiltHere(const std::stop_token & stop)
+{
+    std::mutex sleepMutex;
+    std::condition_variable_any wake;
+    while (!stop.stop_requested()) {
+        finishBuiltHere();
+        std::unique_lock lock(sleepMutex);
+        wake.wait_for(lock, stop, std::chrono::seconds(1), [] -> bool { return false; });
+    }
+}
+
+void Builder::finishBuiltHere()
+{
+    if (!builtHere) {
+        return;
+    }
+    auto const now = config.now();
+    std::vector<std::pair<std::string, uint64_t>> due;
+    {
+        auto lck = state.lock();
+        for (auto & [drv, ent] : lck->expected) {
+            if (!ent.claimed && now - ent.since >= probeAfter) {
+                due.emplace_back(drv, ent.assignId);
+            }
+        }
+    }
+    // On this thread an exception would end the process, and every build on
+    // the node with it. One drv's failure is its own: the others are asked.
+    for (const auto & [drv, assignId] : due) {
+        try {
+            settleBuiltHere(drv, assignId);
+        } catch (const std::exception & err) {
+            logLine(LogLevel::info, {{"event", "built_here_failed"}, {"drv", drv}, {"error", err.what()}});
+        }
+    }
+}
+
+void Builder::settleBuiltHere(const std::string & drv, uint64_t assignId)
+{
+    auto const outputs = builtHere(drv);
+    if (!outputs) {
+        return;
+    }
+    decltype(State::expected)::node_type held;
+    {
+        auto lck = state.lock();
+        auto const found = lck->expected.find(drv);
+        if (found == lck->expected.end() || found->second.claimed || found->second.assignId != assignId) {
+            return;
+        }
+        held = lck->expected.extract(found);
+    }
+    try {
+        sendDone(drv, assignId, nix::remote::Done::BUILT, *outputs);
+    } catch (...) {
+        // Not sent: held as before, for the next round, unless placed anew.
+        state.lock()->expected.insert(std::move(held));
+        throw;
+    }
+    metrics.event("expect_built_here");
 }
 
 void Builder::tick()

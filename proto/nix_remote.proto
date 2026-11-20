@@ -190,6 +190,13 @@ message Want {
   // another's, and Release ends a lease by id. Empty with a linger (older
   // clients): a lease of its own, the longest such linger, never released.
   string lease_id = 10;
+  // The worker this client's build of the drv runs on already, Wanted
+  // again because the client's stream ended (empty: none). A scheduler
+  // that has not placed the drv itself, such as one that took over from the
+  // one that did, does not place it while that build runs: the client would
+  // not call the new placement. Once the client gives that build up, it
+  // Wants the drv without this, and the drv is placed as any other.
+  string running_on = 12;
 }
 
 message Cancel {

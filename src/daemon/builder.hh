@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -156,6 +157,18 @@ public:
     // Give back Expects nobody came for, or whose client went quiet. Called
     // from the serve loop.
     void tick();
+
+    // The outputs of a drv, all valid in this node's store, with their NAR
+    // sizes; nullopt if any is not. It asks the node's nix-daemon, which may
+    // not answer: never from the serve loop, which pets the watchdog.
+    using BuiltHere = std::function<std::optional<std::vector<std::pair<std::string, uint64_t>>>(const std::string &)>;
+    // Before the builder serves.
+    void checkBuiltWith(BuiltHere built);
+    // Finishes the Expects nobody claimed whose outputs this node's store
+    // has (see builder.cc), until `stop`. On a thread of its own.
+    void probeBuiltHere(const std::stop_token & stop);
+    // One round of that, at the builder's now(): for tests.
+    void finishBuiltHere();
     // A call that claimed `drvPath` returns, however it went.
     void callEnded(const std::string & drvPath);
 
@@ -220,6 +233,11 @@ private:
     // worker has not read yet.
     static constexpr std::chrono::seconds expectLag{5};
     std::condition_variable expectArrived;
+    BuiltHere builtHere;
+    void settleBuiltHere(const std::string & drv, uint64_t assignId);
+    // An Expect nobody claimed for this long is asked about (builtHere): a
+    // client's own call claims it sooner.
+    static constexpr std::chrono::seconds probeAfter{10};
 
     // Draining and capacity. Under unavailableMutex.
     [[nodiscard]] auto load() const -> nix::remote::WorkerMsg;
