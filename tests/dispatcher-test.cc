@@ -881,10 +881,8 @@ void aBounceOffTheOnlyWorkerLeavesNoSlotTaken()
             builder.onRevoke(cmd.revoke());
         }
     });
-    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
-        WorkerMsgs one;
-        *one.add_msgs() = msg;
-        disp.workerMsgs(*worker, one);
+    builder.setSend([&](const WorkerMsgs & msgs) -> bool {
+        disp.workerMsgs(*worker, msgs);
         return true;
     });
     builder.greet();
@@ -1079,10 +1077,8 @@ void aPhantomWhoseOutputsTheNodeHasFreesItsSlot()
             builder.onRevoke(cmd.revoke());
         }
     });
-    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
-        WorkerMsgs one;
-        *one.add_msgs() = msg;
-        disp.workerMsgs(*worker, one);
+    builder.setSend([&](const WorkerMsgs & msgs) -> bool {
+        disp.workerMsgs(*worker, msgs);
         return true;
     });
     builder.greet();
@@ -1100,6 +1096,43 @@ void aPhantomWhoseOutputsTheNodeHasFreesItsSlot()
     now += probeAfter;
     builder.finishBuiltHere();
     assert(assigned(toClient) == 2 && toClient.back().assigned().drv_path() == drvB);
+    disp.clientGone(client);
+    disp.workerGone(*worker);
+    builder.setSend(nullptr);
+}
+
+// The node's daemon starts while its nix-daemon hangs: the builder greets
+// draining (Coordinator::start after askLocalDaemon), and builds are wanted.
+// The scheduler in the same process must place none on it. Each would come
+// straight back and be placed there again, inside greet(), which the
+// daemon's readiness waits for. Past `cut` Expects that loop is cut here, so
+// that it fails the count instead of hanging.
+void aBuilderThatGreetsDrainingIsPlacedNothing()
+{
+    constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+    constexpr size_t cut = 100;
+    Metrics metrics{""};
+    Dispatcher disp(debugConfig(), metrics);
+    nixgrpc::Builder builder({.advertise = "w1:50051", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 2}, metrics);
+    size_t expects = 0;
+    auto const worker = disp.loopbackWorker([&](const SchedCmd & cmd) -> void {
+        if (cmd.has_expect() && ++expects <= cut) {
+            builder.onExpect(cmd.expect());
+        }
+    });
+    builder.setSend([&](const WorkerMsgs & msgs) -> bool {
+        disp.workerMsgs(*worker, msgs);
+        return true;
+    });
+    std::vector<SchedMsg> toClient;
+    auto client = disp.connectClient(recordMsgsInto(toClient), [] -> void {});
+    disp.clientMsgs(client, wantOf(drvA));
+    builder.setUnavailable(nixgrpc::Builder::Unavailable::localDaemonDown, true);
+    assert(builder.greet());
+    assert(expects == 0 && assigned(toClient) == 0);
+    // Its nix-daemon answers again: the build goes there.
+    builder.setUnavailable(nixgrpc::Builder::Unavailable::localDaemonDown, false);
+    assert(expects == 1 && assigned(toClient) == 1);
     disp.clientGone(client);
     disp.workerGone(*worker);
     builder.setSend(nullptr);
@@ -1130,6 +1163,7 @@ try {
     aBuildInFlightOnThePredecessorTakesNoSlotHere();
     aBuildLostWithThePredecessorIsPlacedHere();
     aPhantomWhoseOutputsTheNodeHasFreesItsSlot();
+    aBuilderThatGreetsDrainingIsPlacedNothing();
     return 0;
 } catch (std::exception &) {
     return 1;
