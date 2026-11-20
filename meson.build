@@ -303,6 +303,12 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  # The keepalive tests' greeter is done before their interpreter finalizes,
+  # or a traceback it is still writing aborts a test that passed.
+  test('testdaemon', find_program('python3'),
+    args : [files('tests/testdaemon-test.py')],
+  )
+
   # A client that vanished without closing its connection must not keep its
   # builds wanted: the daemon ends its Schedule stream, and the build only
   # that client followed ends, revoked or given back, and is not placed again.
