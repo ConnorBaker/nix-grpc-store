@@ -23,6 +23,7 @@
 #include "eds.hh"
 #include "elector.hh"
 #include "idle.hh"
+#include "local-store.hh"
 #include "metrics.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
@@ -94,6 +95,10 @@ private:
     Metrics & metrics;
     std::jthread sessionThread; // remote WorkerSession client
     std::jthread probeThread;
+    // Settles placements nobody claims from this store (Builder::probeBuiltHere),
+    // off the serve loop that pets the watchdog: the nix-daemon may not answer.
+    LocalStore builtHereStore;
+    std::jthread builtHereThread;
     // Read and written by start() and then by the probe thread only.
     bool daemonAnswered = true;
     std::optional<Elector> elector;

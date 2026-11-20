@@ -9,7 +9,9 @@
 #include <future>
 #include <optional>
 #include <print>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "builder.hh"
@@ -76,6 +78,7 @@ auto staleCallIsRefusedAtOnce() -> bool
 }
 
 constexpr auto past = std::chrono::seconds(61); // Builder's expectTimeout is 60 s
+constexpr auto probeAfter = std::chrono::seconds(10); // Builder::probeAfter
 
 // A builder on a clock the test moves, and the Dones it sends.
 struct Quiet
@@ -134,6 +137,148 @@ auto quietClaimIsGivenBack() -> bool
     quiet.now += past;
     builder.tick();
     return quiet.dones.size() == 2 && builder.holding() == 0;
+}
+
+// A placement nobody claims, whose outputs this node's store has (a
+// predecessor built them for a client that never calls here), is finished
+// as BUILT with those outputs, not given back to be placed again. One a
+// client claimed is its call's to finish, whatever the store says.
+auto unclaimedBuiltHereIsFinished() -> bool
+{
+    Quiet quiet;
+    auto & builder = quiet.builder;
+    std::vector<std::string> asked;
+    constexpr uint64_t narSize = 7;
+    builder.checkBuiltWith([&](const std::string & drv) -> std::optional<std::vector<std::pair<std::string, uint64_t>>> {
+        asked.push_back(drv);
+        return std::vector<std::pair<std::string, uint64_t>>{{"/nix/store/" + drv + "-out", narSize}};
+    });
+    builder.onExpect(expectOf(1, "a.drv"));
+    builder.onExpect(expectOf(2, "b.drv"));
+    builder.claim("b.drv");
+    builder.finishBuiltHere();
+    // A client claims its placement within moments: not asked yet.
+    if (!quiet.dones.empty() || !asked.empty()) {
+        return false;
+    }
+    quiet.now += probeAfter;
+    builder.finishBuiltHere();
+    return asked == std::vector<std::string>{"a.drv"} && quiet.dones.size() == 1
+           && quiet.dones.at(0).drv_path() == "a.drv" && quiet.dones.at(0).assign_id() == 1
+           && quiet.dones.at(0).outcome() == Done::BUILT && quiet.dones.at(0).outputs_size() == 1
+           && quiet.dones.at(0).outputs(0).nar_size() == narSize && builder.holding() == 1;
+}
+
+// The store is asked outside the builder's lock. A client that claims the
+// drv meanwhile builds it: the probe's answer does not end its claim.
+auto aClaimDuringTheProbeKeepsIt() -> bool
+{
+    Quiet quiet;
+    auto & builder = quiet.builder;
+    builder.checkBuiltWith([&](const std::string & drv) -> std::optional<std::vector<std::pair<std::string, uint64_t>>> {
+        builder.claim(drv);
+        return std::vector<std::pair<std::string, uint64_t>>{{"/nix/store/" + drv + "-out", 1}};
+    });
+    builder.onExpect(expectOf(1, "a.drv"));
+    quiet.now += probeAfter;
+    builder.finishBuiltHere();
+    return quiet.dones.empty() && builder.holding() == 1;
+}
+
+// The drv is placed here again while the store is asked: the answer is for
+// the placement asked about, and the newer one is finished in its own name.
+auto aPlacementDuringTheProbeIsFinishedAsItself() -> bool
+{
+    Quiet quiet;
+    auto & builder = quiet.builder;
+    bool placedAgain = false;
+    builder.checkBuiltWith([&](const std::string & drv) -> std::optional<std::vector<std::pair<std::string, uint64_t>>> {
+        if (!placedAgain) {
+            placedAgain = true;
+            builder.onExpect(expectOf(2, drv));
+        }
+        return std::vector<std::pair<std::string, uint64_t>>{{"/nix/store/" + drv + "-out", 1}};
+    });
+    builder.onExpect(expectOf(1, "a.drv"));
+    quiet.now += probeAfter;
+    builder.finishBuiltHere();
+    if (!quiet.dones.empty() || builder.holding() != 1) {
+        return false;
+    }
+    quiet.now += probeAfter;
+    builder.finishBuiltHere();
+    return quiet.dones.size() == 1 && quiet.dones.at(0).assign_id() == 2 && builder.holding() == 0;
+}
+
+// The serve loop pets systemd's watchdog and ticks the builder: a tick must
+// not wait on the node's nix-daemon, which may not answer. Only the probe
+// thread (probeBuiltHere) asks the store.
+auto tickAsksTheStoreNothing() -> bool
+{
+    Quiet quiet;
+    auto & builder = quiet.builder;
+    bool asked = false;
+    builder.checkBuiltWith([&](const std::string &) -> std::optional<std::vector<std::pair<std::string, uint64_t>>> {
+        asked = true;
+        return std::nullopt;
+    });
+    builder.onExpect(expectOf(1, "a.drv"));
+    // Due to be asked, and short of expectTimeout: the tick gives nothing
+    // back first, wherever in it a call would go.
+    quiet.now += probeAfter;
+    builder.tick();
+    return !asked && builder.holding() == 1;
+}
+
+// On the probe's thread an exception would end the process. A store that
+// does not answer, or a Done that does not go out, costs that drv its turn
+// only: no Done, the placement still held and asked about again next round,
+// and the others settled meanwhile.
+auto aFailedAskOrSendKeepsThePlacement() -> bool
+{
+    Quiet quiet;
+    auto & builder = quiet.builder;
+    int asks = 0;
+    builder.checkBuiltWith([&](const std::string & drv) -> std::optional<std::vector<std::pair<std::string, uint64_t>>> {
+        if (asks++ == 0) {
+            throw std::runtime_error("the nix-daemon hung up");
+        }
+        return std::vector<std::pair<std::string, uint64_t>>{{"/nix/store/" + drv + "-out", 1}};
+    });
+    auto const round = [&] -> bool {
+        try {
+            builder.finishBuiltHere();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+    builder.onExpect(expectOf(1, "a.drv"));
+    builder.onExpect(expectOf(2, "b.drv"));
+    quiet.now += probeAfter;
+    if (!round() || quiet.dones.size() != 1 || builder.holding() != 1) {
+        return false;
+    }
+    if (!round() || quiet.dones.size() != 2 || builder.holding() != 0) {
+        return false;
+    }
+    bool sendFails = true;
+    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
+        if (msg.has_done()) {
+            if (std::exchange(sendFails, false)) {
+                throw std::runtime_error("the dispatcher threw");
+            }
+            quiet.dones.push_back(msg.done());
+        }
+        return true;
+    });
+    builder.onExpect(expectOf(3, "c.drv"));
+    quiet.now += probeAfter;
+    if (!round() || quiet.dones.size() != 2 || builder.holding() != 1) {
+        return false;
+    }
+    return round() && quiet.dones.size() == 3 && quiet.dones.back().drv_path() == "c.drv"
+           && quiet.dones.back().assign_id() == 3 && builder.holding() == 0;
 }
 
 // Draining keeps a claimed Expect while its client may still upload, and
@@ -243,6 +388,26 @@ auto run() -> int
     }
     if (!quietClaimIsGivenBack()) {
         std::println("FAIL a claimed Expect whose client went quiet is not given back after expectTimeout");
+        return EXIT_FAILURE;
+    }
+    if (!unclaimedBuiltHereIsFinished()) {
+        std::println("FAIL a placement nobody claimed whose outputs the node has is not finished as built");
+        return EXIT_FAILURE;
+    }
+    if (!aClaimDuringTheProbeKeepsIt()) {
+        std::println("FAIL a claim made while the store is asked is ended as built");
+        return EXIT_FAILURE;
+    }
+    if (!aPlacementDuringTheProbeIsFinishedAsItself()) {
+        std::println("FAIL a placement made while the store is asked is not finished in its own name");
+        return EXIT_FAILURE;
+    }
+    if (!aFailedAskOrSendKeepsThePlacement()) {
+        std::println("FAIL a store that does not answer or a Done that does not go out loses the placement or the round");
+        return EXIT_FAILURE;
+    }
+    if (!tickAsksTheStoreNothing()) {
+        std::println("FAIL a tick of the serve loop asks the node's store");
         return EXIT_FAILURE;
     }
     if (!drainingGivesBackAQuietClaim()) {

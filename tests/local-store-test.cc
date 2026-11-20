@@ -3,6 +3,7 @@
 // missing, refuse, or hang up, so a nix that words them differently fails
 // here.
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdlib>
@@ -10,9 +11,11 @@
 #include <filesystem>
 #include <print>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <signal.h> // NOLINT(modernize-deprecated-headers): SIGPIPE is POSIX, not in <csignal>.
@@ -20,8 +23,14 @@
 #include <sys/stat.h> // NOLINT(misc-include-cleaner): which header has S_IRWXU differs per platform.
 #include <unistd.h>
 
+#include <nix/store/derivations.hh>
 #include <nix/store/globals.hh>
+#include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
+#include <nix/store/store-api.hh>
+#include <nix/util/archive.hh>
+#include <nix/util/hash.hh>
+#include <nix/util/repair-flag.hh>
 #include <nix/util/error.hh> // NOLINT(misc-include-cleaner): which header has SysError differs per Nix version.
 #include <nix/util/serialise.hh>
 #include <nix/util/terminal.hh>
@@ -29,6 +38,7 @@
 
 #include "client-stream.hh"
 #include "local-store.hh"
+#include "nix-compat.hh"
 #include "nix_remote.pb.h"
 #include "pump.hh"
 #include "upload-spool.hh"
@@ -92,6 +102,84 @@ auto longNarIsLost() -> bool
     }
 }
 
+// A drv with these outputs, written to `store`, and its path as clients name
+// it (StorePath::to_string); none of the outputs valid yet.
+auto writeDrv(nix::Store & store, const std::vector<std::string> & outputs) -> std::pair<nix::Derivation, std::string>
+{
+    nix::Derivation drv;
+    drv.name = "built-here";
+    drv.platform = "x86_64-linux";
+    drv.builder = "/bin/sh";
+    for (const auto & output : outputs) {
+        drv.outputs.emplace(output, nix::DerivationOutput::Deferred{});
+        // As the evaluator does: each output's variable, empty until its path is in.
+        drv.env.emplace(output, "");
+    }
+    nixcompat::fillInOutputPaths(drv, store);
+    auto const path = std::string(store.writeDerivation(drv).to_string());
+    return {std::move(drv), path};
+}
+
+// One of the drv's outputs made valid, a file holding its name: its path and
+// NAR size.
+auto addOutput(nix::Store & store, const nix::Derivation & drv, const std::string & output) -> LocalStore::Outputs::value_type
+{
+    nix::StringSink nar;
+    nix::dumpString(output, nar);
+    auto const path = std::get<nix::DerivationOutput::InputAddressed>(drv.outputs.at(output).raw).path;
+    nix::ValidPathInfo info(path, nix::UnkeyedValidPathInfo(store, nix::hashString(nix::HashAlgorithm::SHA256, nar.s)));
+    info.narSize = nar.s.size();
+    nix::StringSource source(nar.s);
+    store.addToStore(info, source, nix::NoRepair, nix::NoCheckSigs);
+    return {store.printStorePath(path), info.narSize};
+}
+
+// The check that settles a placement nobody claims (Builder::checkBuiltWith),
+// against a real store: a drv the store lacks is not built here, and one with
+// two outputs only once both are valid, and then with their NAR sizes.
+auto builtHereNeedsEveryOutput(const std::filesystem::path & root) -> bool
+{
+    LocalStore local("local?root=" + root.string());
+    auto const store = local.scoped();
+    if (LocalStore::builtHereIn(*store, "00000000000000000000000000000000-absent.drv")) {
+        return false;
+    }
+    auto const [drv, drvPath] = writeDrv(*store, {"out", "dev"});
+    if (LocalStore::builtHereIn(*store, drvPath)) {
+        return false;
+    }
+    auto const out = addOutput(*store, drv, "out");
+    if (LocalStore::builtHereIn(*store, drvPath)) {
+        return false;
+    }
+    auto const dev = addOutput(*store, drv, "dev");
+    auto built = LocalStore::builtHereIn(*store, drvPath);
+    if (!built) {
+        return false;
+    }
+    std::ranges::sort(*built);
+    auto want = LocalStore::Outputs{out, dev};
+    std::ranges::sort(want);
+    return *built == want;
+}
+
+// A store that failed to connect refuses every later attempt (errorsOf): a
+// lost nix-daemon must leave the next ask a fresh pool.
+auto aLostDaemonDropsThePool(const std::filesystem::path & socket) -> bool
+{
+    LocalStore local("unix://" + socket.string());
+    auto const first = local.shared();
+    try {
+        local.builtHere("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv");
+        return false;
+    } catch (const std::exception & err) {
+        if (!LocalStore::lost(err)) {
+            return false;
+        }
+    }
+    return local.shared().get() != first.get();
+}
+
 auto run() -> int
 {
     nix::initLibStore();
@@ -142,6 +230,21 @@ auto run() -> int
         status = EXIT_FAILURE;
     }
 
+    bool needsEvery = false;
+    try {
+        needsEvery = builtHereNeedsEveryOutput(dir / "root");
+    } catch (const std::exception & err) {
+        std::println("FAIL a real store: {}", err.what());
+    }
+    if (!needsEvery) {
+        std::println("FAIL a drv counts as built here with an output missing, or not with all of them");
+        status = EXIT_FAILURE;
+    }
+    if (!aLostDaemonDropsThePool(dir / "missing")) {
+        std::println("FAIL asking a lost nix-daemon whether a drv was built keeps the dead pool");
+        status = EXIT_FAILURE;
+    }
+
     if (endedUploadIsLost()) {
         std::println("FAIL an upload that ends early counts as a lost nix-daemon");
         status = EXIT_FAILURE;
@@ -160,11 +263,28 @@ auto run() -> int
     return status;
 }
 
+// For built-here-test.py: a drv whose one output is valid in the store at
+// `root`, as one a predecessor built; prints the drv's path.
+auto builtDrv(const std::filesystem::path & root) -> int
+{
+    nix::initLibStore();
+    LocalStore local("local?root=" + root.string());
+    auto const store = local.scoped();
+    auto const [drv, drvPath] = writeDrv(*store, {"out"});
+    addOutput(*store, drv, "out");
+    std::println("{}", drvPath);
+    return EXIT_SUCCESS;
+}
+
 } // namespace
 
-auto main() -> int
+auto main(int argc, char ** argv) -> int
 {
     try {
+        auto const args = std::span(argv, static_cast<size_t>(argc)).subspan(1);
+        if (args.size() == 2 && std::string_view(args.front()) == "--built-drv") {
+            return builtDrv(args.back());
+        }
         return run();
     } catch (...) {
         return EXIT_FAILURE;

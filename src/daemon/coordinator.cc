@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -45,6 +46,7 @@
 #include "client/channel.hh"
 #include "client/retry-pause.hh"
 #include "daemon-probe.hh"
+#include "local-store.hh"
 #include "logfmt.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
@@ -180,6 +182,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
     : cache(options.niks3)
     , options(options)
     , metrics(metrics)
+    , builtHereStore(options.storeUri)
 {
     if (options.builder) {
         Builder::Config self{
@@ -240,6 +243,13 @@ Coordinator::~Coordinator()
         probeThread.request_stop();
         probeThread.join();
     }
+    // Before the send is cut and the dispatcher goes: a round may be sending
+    // a Done through the loopback. The body runs before any member's
+    // destructor, so declaring the thread last would not do.
+    if (builtHereThread.joinable()) {
+        builtHereThread.request_stop();
+        builtHereThread.join();
+    }
     if (sessionThread.joinable()) {
         sessionThread.request_stop();
         sessionThread.join();
@@ -277,6 +287,8 @@ void Coordinator::start(grpc::Server & server)
     auto & bld = *builder;
     askLocalDaemon(bld);
     probeThread = std::jthread([this, &bld](const std::stop_token & stop) -> void { watchLocalDaemon(bld, stop); });
+    bld.checkBuiltWith(std::bind_front(&LocalStore::builtHere, &builtHereStore));
+    builtHereThread = std::jthread([&bld](const std::stop_token & stop) -> void { bld.probeBuiltHere(stop); });
     if (options.schedulerAddr.empty()) {
         bld.greet();
     } else {
