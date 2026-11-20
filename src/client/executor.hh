@@ -411,6 +411,13 @@ public:
 
     [[nodiscard]] auto refused(JobId jid) const -> uint64_t { return jobs.at(jid).refused; }
 
+    // The worker the job's build runs on, if it runs (Want.running_on).
+    [[nodiscard]] auto runningOn(JobId jid) const -> std::string
+    {
+        const auto * run = std::get_if<state::Running>(&jobs.at(jid).state);
+        return run == nullptr ? std::string() : run->at.addr;
+    }
+
     // No scheduler any more. Placed jobs still build; everything else, now
     // or released later, fails as lost.
     void abandon()
