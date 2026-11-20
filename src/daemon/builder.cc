@@ -14,20 +14,38 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <google/protobuf/repeated_ptr_field.h>
 
 #include "logfmt.hh"
 #include "metrics.hh"
 #include "nix_remote.pb.h"
+#include "scheduler.hh"
 
 namespace nixgrpc {
 
 using nix::remote::WorkerMsg;
 using nix::remote::WorkerMsgs;
 
+namespace {
+void addFarm(google::protobuf::RepeatedPtrField<nix::remote::FarmMachine> & into, const std::vector<sched::FarmMachine> & farm)
+{
+    for (const auto & machine : farm) {
+        auto * out = into.Add();
+        for (const auto & [system, offered] : machine.systems) {
+            nix::remote::FarmFeatures features;
+            features.mutable_features()->Add(offered.begin(), offered.end());
+            out->mutable_systems()->emplace(system, std::move(features));
+        }
+        out->set_jobs(machine.jobs);
+    }
+}
+} // namespace
+
 Builder::Builder(Config config, Metrics & metrics)
     : config(std::move(config))
     , metrics(metrics)
     , maxJobs_(this->config.maxJobs)
+    , farm_(this->config.farm)
 {
     for (auto const why : {Unavailable::stopping, Unavailable::localDaemonDown}) {
         metrics.unavailable(name(why), false);
@@ -208,6 +226,7 @@ auto Builder::hello() -> WorkerMsg
         hel->add_features(feat);
     }
     hel->set_max_jobs(maxJobs_);
+    addFarm(*hel->mutable_farm(), farm_);
     hel->set_publish_failing(publishFailing_);
     auto lck = state.lock();
     lck->newestExpect = 0; // a new session, maybe of a new scheduler, counts anew
@@ -241,6 +260,7 @@ auto Builder::load() const -> WorkerMsg
     WorkerMsg msg;
     msg.mutable_load()->set_draining(draining());
     msg.mutable_load()->set_max_jobs(maxJobs_);
+    addFarm(*msg.mutable_load()->mutable_farm(), farm_);
     msg.mutable_load()->set_publish_failing(publishFailing_);
     return msg;
 }
@@ -264,6 +284,18 @@ void Builder::setMaxJobs(uint32_t maxJobs)
         return;
     }
     send(load());
+}
+
+void Builder::setFarm(std::vector<sched::FarmMachine> farm)
+{
+    std::scoped_lock const lock(unavailableMutex);
+    if (farm == farm_) {
+        return;
+    }
+    farm_ = std::move(farm);
+    if (greeted_) {
+        send(load());
+    }
 }
 
 void Builder::onAvailability(std::function<void(bool)> changed)

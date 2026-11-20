@@ -206,7 +206,13 @@ def main():
         return 1
     # max-jobs, but no more than the 128 auto-allocated uid slots.
     os.environ["NIX_CONFIG"] = "max-jobs = 200\nextra-experimental-features = auto-allocate-uids\nauto-allocate-uids = true"
-    proc, log = testdaemon.start(daemon, tmp)
+    # The farm it hands builds to, from a file it reads again when it changes.
+    farm_dir = os.path.join(tmp, "farm")
+    os.mkdir(farm_dir)
+    farm_file = os.path.join(farm_dir, "farm.json")
+    with open(farm_file, "w") as f:
+        f.write('{"machines": [{"systems": {"keepalive-test-system": []}, "jobs": 3}]}')
+    proc, log = testdaemon.start(daemon, tmp, "--farm-file", farm_file)
 
     def daemon_log():
         log.seek(0)
@@ -245,6 +251,38 @@ def main():
         print(f"before: {show(vals)}")
         if "max_jobs=128" not in daemon_log():
             return fail("not advertising min(max-jobs 200, 128 build user slots)")
+        if 'event=farm machines=1 said="keepalive-test-system[]=3"' not in daemon_log():
+            return fail("--farm-file not read at start")
+
+        def farm_logged(line):
+            # The serve loop looks about once a second.
+            deadline = time.monotonic() + 30
+            while line not in daemon_log():
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    return False
+                time.sleep(0.2)
+            return True
+
+        with open(farm_file + ".tmp", "w") as f:
+            f.write('{"machines": [{"systems": {"keepalive-test-system": []}, "jobs": 5}]}')
+        os.rename(farm_file + ".tmp", farm_file)
+        if not farm_logged('event=farm machines=1 said="keepalive-test-system[]=5"'):
+            return fail("--farm-file not read again after it changed")
+        # Unreadable, then gone: no farm, and said so.
+        with open(farm_file + ".tmp", "w") as f:
+            f.write('{"machines": [{"systems": {"keepalive-test-system": []}}]}')
+        os.rename(farm_file + ".tmp", farm_file)
+        if not farm_logged("event=farm_unreadable"):
+            return fail("an unreadable --farm-file not logged")
+        # One it cannot even stat is unreadable too, not absent.
+        os.chmod(farm_dir, 0)
+        denied = farm_logged("Permission denied")
+        os.chmod(farm_dir, 0o755)
+        if not denied or "event=farm_absent" in daemon_log():
+            return fail("a --farm-file the daemon cannot stat not logged as unreadable")
+        os.unlink(farm_file)
+        if not farm_logged("event=farm_absent"):
+            return fail("an absent --farm-file not logged")
         sock = socket.create_connection(("127.0.0.1", port))
         conn = Conn(sock)
 

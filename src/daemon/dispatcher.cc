@@ -23,6 +23,7 @@
 #include <nix/util/error.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/types.hh>
+#include <google/protobuf/repeated_ptr_field.h>
 
 #include "logfmt.hh"
 #include "metrics.hh"
@@ -323,6 +324,22 @@ void Dispatcher::debugLog(std::initializer_list<LogField> fields) const
         logLine(LogLevel::debug, fields);
     }
 }
+
+namespace {
+auto farmOf(const google::protobuf::RepeatedPtrField<nix::remote::FarmMachine> & machines) -> std::vector<sched::FarmMachine>
+{
+    std::vector<sched::FarmMachine> farm;
+    farm.reserve(static_cast<size_t>(machines.size()));
+    for (const auto & machine : machines) {
+        sched::FarmMachine mach{.systems = {}, .jobs = machine.jobs()};
+        for (const auto & [system, offered] : machine.systems()) {
+            mach.systems.emplace(system, std::vector<std::string>(offered.features().begin(), offered.features().end()));
+        }
+        farm.push_back(std::move(mach));
+    }
+    return farm;
+}
+} // namespace
 
 // "builtin" (fetchurl) runs anywhere. Count it as the scheduler's own system.
 auto Dispatcher::systemFor(std::string_view system) const -> std::string_view
@@ -710,7 +727,8 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
                          ? 0
                          : std::min(static_cast<double>(want.linger_s()) * msPerSecond, config.maxLingerMs),
          .leaseId = want.lease_id(),
-         .runsElsewhere = !want.running_on().empty()},
+         .runsElsewhere = !want.running_on().empty(),
+         .builtin = want.system() == "builtin"},
         nowMs());
     if (res.idleMs) {
         logLine(
@@ -856,6 +874,7 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
          .systems = std::move(systems),
          .features = {hel.features().begin(), hel.features().end()},
          .maxJobs = hel.max_jobs(),
+         .farm = farmOf(hel.farm()),
          .running = std::move(running),
          .faulty = hel.publish_failing()},
         superseded);
@@ -940,6 +959,7 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
         core.setDraining(*worker.id, load.draining());
         if (load.has_max_jobs()) {
             core.setMaxJobs(*worker.id, load.max_jobs());
+            core.setFarm(*worker.id, farmOf(load.farm()));
         }
         if (load.publish_failing() != core.worker(*worker.id).faulty) {
             logLine(

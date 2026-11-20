@@ -215,6 +215,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
                 throw nix::Error("--max-jobs expects a positive integer");
             }
             options.maxJobs = *jobs;
+        } else if (arg == "--farm-file") {
+            options.farmFile = next();
         } else if (arg == "--lookup-threads") {
             auto threads = parseInt<unsigned>(next());
             if (!threads || *threads < 1 || *threads > maxLookupThreads) {
@@ -256,6 +258,7 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     }
     if (!options.builder) {
         options.maxJobs = 0;
+        options.farmFile.clear();
     }
     if (options.schedulerAddr.empty() && !options.scheduler) {
         throw nix::Error("--role builder without --scheduler has nobody to take work from");

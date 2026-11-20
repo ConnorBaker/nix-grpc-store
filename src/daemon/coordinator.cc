@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <grp.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -61,6 +62,7 @@
 #include "nix_remote.pb.h"
 #include "options.hh"
 #include "sched-reactor.hh"
+#include "farm.hh"
 
 namespace nixgrpc {
 
@@ -228,6 +230,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
         self.features.append_range(nix::StoreConfig::getDefaultSystemFeatures());
         builder.emplace(std::move(self), metrics);
         metrics.buildSlots(builder->maxJobs());
+        readFarm(*builder);
     }
     if (options.scheduler) {
         Dispatcher::PresentFn present;
@@ -431,7 +434,50 @@ void Coordinator::tick()
     if (!builder) {
         return;
     }
-    builder->tick();
+    auto & bld = *builder;
+    readFarm(bld);
+    bld.tick();
+}
+
+// Options::farmFile, when it appeared, changed or went away since last
+// looked at (its change time and size). Without a farm the builder
+// takes builds as it would without the option: a file that is absent,
+// unreadable or not a farm (readFarmText) is logged and leaves no farm.
+void Coordinator::readFarm(Builder & bld)
+{
+    if (options.farmFile.empty()) {
+        return;
+    }
+    struct stat info{};
+    FarmSeen seen;
+    if (stat(options.farmFile.c_str(), &info) == 0) {
+        constexpr int64_t nsPerSec = 1'000'000'000;
+        seen.ctimeNs = (static_cast<int64_t>(info.st_ctim.tv_sec) * nsPerSec) + info.st_ctim.tv_nsec;
+        seen.size = info.st_size;
+    } else {
+        seen.error = errno;
+    }
+    if (farmSeen && *farmSeen == seen) {
+        return;
+    }
+    farmSeen = seen;
+    FarmText text;
+    if (seen.error == 0) {
+        try {
+            text = nix::readFile(options.farmFile);
+        } catch (nix::Error & err) {
+            text = FarmUnreadable{err.msg()};
+        }
+    } else if (seen.error != ENOENT) {
+        text = FarmUnreadable{nix::SysError(seen.error, "stat '%s'", options.farmFile).msg()};
+    }
+    auto read = readFarmText(text);
+    if (read.event == "farm") {
+        logLine(LogLevel::info, {{"event", read.event}, {"machines", std::to_string(read.farm.size())}, {"said", describeFarm(read.farm)}});
+    } else {
+        logLine(LogLevel::info, {{"event", read.event}, {"path", options.farmFile}, {"error", read.error}});
+    }
+    bld.setFarm(std::move(read.farm));
 }
 
 // Whoever rewrites nix's configuration signals us; a Tribuchet hub rewrites

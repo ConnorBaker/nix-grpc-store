@@ -72,6 +72,10 @@
   "--max-jobs"
   (toString cfg.maxJobs)
 ]
+++ lib.optionals (cfg.farmFile != null) [
+  "--farm-file"
+  cfg.farmFile
+]
 ++ lib.optionals (cfg.lookupThreads != null) [
   "--lookup-threads"
   (toString cfg.lookupThreads)

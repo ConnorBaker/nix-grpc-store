@@ -25,6 +25,7 @@
 #include "log-spill.hh"
 #include "metrics.hh"
 #include "nix_remote.pb.h"
+#include "scheduler.hh"
 
 namespace nixgrpc {
 
@@ -81,6 +82,8 @@ public:
         std::vector<std::string> systems; // first is the native one
         std::vector<std::string> features;
         uint32_t maxJobs = 0;
+        // The farm it hands its builds to (Hello.farm).
+        std::vector<sched::FarmMachine> farm;
         std::function<Clock::time_point()> now = Clock::now;
     };
 
@@ -151,6 +154,8 @@ public:
     }
     // The capacity changed (nix's max-jobs read anew): tell the scheduler.
     void setMaxJobs(uint32_t maxJobs);
+    // Likewise for Config::farm.
+    void setFarm(std::vector<sched::FarmMachine> farm);
     // Every publish to the cache reports how it went. The scheduler hears
     // when that changes, see Load.publish_failing.
     void published(bool works);
@@ -224,6 +229,7 @@ private:
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<uint8_t> unavailable_{0};
     std::atomic<uint32_t> maxJobs_;
+    std::vector<sched::FarmMachine> farm_; // under unavailableMutex
     std::atomic<bool> publishFailing_{false};
     // Orders the Load messages of concurrent setUnavailable() and
     // setMaxJobs() calls, and keeps them behind the Hello of their session.

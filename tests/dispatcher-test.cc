@@ -1138,10 +1138,70 @@ void aBuilderThatGreetsDrainingIsPlacedNothing()
     builder.setSend(nullptr);
 }
 
+// Hello.farm reaches the scheduler, an older worker's Load (without
+// max_jobs) leaves it, and a Load with max_jobs replaces all of it.
+void testFarm()
+{
+    Farm farm;
+    Session hub;
+    WorkerMsgs msgs;
+    auto * hel = msgs.add_msgs()->mutable_hello();
+    hel->set_addr("hub:1");
+    hel->add_systems("x86_64-linux");
+    hel->add_systems("aarch64-linux");
+    hel->set_max_jobs(3);
+    auto * machine = hel->add_farm();
+    machine->mutable_systems()->emplace("x86_64-linux", nix::remote::FarmFeatures{});
+    machine->set_jobs(1);
+    farm.disp.workerMsgs(hub.conn, msgs);
+    for (auto [drv, system] : {std::pair{"a.drv", "x86_64-linux"}, {"b.drv", "x86_64-linux"}, {"c.drv", "aarch64-linux"}}) {
+        ClientMsgs want;
+        auto * wnt = want.add_msgs()->mutable_want();
+        wnt->set_drv_path(drv);
+        wnt->set_system(system);
+        farm.disp.clientMsgs(farm.client, want);
+    }
+    assert((hub.expected == std::vector<std::string>{"a.drv", "c.drv"}));
+    WorkerMsgs older;
+    older.add_msgs()->mutable_load()->set_draining(false);
+    farm.disp.workerMsgs(hub.conn, older);
+    assert(hub.expected.size() == 2);
+    farm.disp.workerMsgs(hub.conn, loadOf(false, 3));
+    assert((hub.expected == std::vector<std::string>{"a.drv", "c.drv", "b.drv"}));
+}
+
+// A Want of system "builtin" (builtin:fetchurl) is counted as the default
+// system once it reaches the scheduler; its nix-daemon runs it, on no machine
+// of the farm, so a farm full for the default system still places it.
+void testFarmPlacesABuiltinWhenFull()
+{
+    Farm farm;
+    Session hub;
+    WorkerMsgs msgs;
+    auto * hel = msgs.add_msgs()->mutable_hello();
+    hel->set_addr("hub:1");
+    hel->add_systems("x");
+    hel->set_max_jobs(3);
+    auto * machine = hel->add_farm();
+    machine->mutable_systems()->emplace("x", nix::remote::FarmFeatures{});
+    machine->set_jobs(1);
+    farm.disp.workerMsgs(hub.conn, msgs);
+    for (auto [drv, system] : {std::pair{"a.drv", "x"}, {"b.drv", "x"}, {"f.drv", "builtin"}}) {
+        ClientMsgs want;
+        auto * wnt = want.add_msgs()->mutable_want();
+        wnt->set_drv_path(drv);
+        wnt->set_system(system);
+        farm.disp.clientMsgs(farm.client, want);
+    }
+    assert((hub.expected == std::vector<std::string>{"a.drv", "f.drv"}));
+}
+
 } // namespace
 
 auto main() -> int
 try {
+    testFarm();
+    testFarmPlacesABuiltinWhenFull();
     testOldSessionEndKeepsTheReconnectedWorker();
     testOldSessionMessagesAfterTheNewHello();
     testReplacedSessionAfterTheWorkerLeft();

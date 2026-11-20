@@ -568,7 +568,7 @@ struct Entry
     std::vector<PathKey> inputs;       // for locality only
     std::string system;
     std::vector<std::string> features; // required
-    std::string featureKey;            // featureSetKey(features); fixed while queued
+    std::string featureKey;            // classKey(*this); fixed while queued
     std::vector<ClientId> followers;
     // Followers holding a lease on it (at most one each), and which.
     std::vector<std::pair<ClientId, std::string>> holders;
@@ -592,6 +592,201 @@ struct Entry
     // The lease its last client held when that client's stream ended and
     // its hold began, if any: that lease's Release ends the hold.
     std::optional<std::string> holdLease;
+    // Its system was "builtin": nix-daemon runs it itself, no farm.
+    bool builtin = false;
+};
+
+// One machine of the farm a worker hands its builds to (Hello.farm): the
+// features it offers for each system it builds, and the builds it takes at
+// once, of all its systems together. A machine that is away takes 0.
+struct FarmMachine
+{
+    std::map<std::string, std::vector<std::string>> systems;
+    uint32_t jobs = 0;
+    auto operator==(const FarmMachine &) const -> bool = default;
+
+    [[nodiscard]] auto builds(const std::string & system, const std::vector<std::string> & features) const -> bool
+    {
+        auto const iter = systems.find(system);
+        return iter != systems.end() && std::ranges::all_of(features, [&](const std::string & feat) -> bool {
+                   return std::ranges::contains(iter->second, feat);
+               });
+    }
+};
+
+// The builds a worker has out on its farm, each on a slot of a machine that
+// can build it. A build of class (system, required features) fits while some
+// machine that builds it has a free slot, or one can be freed by moving
+// builds already out to other machines that build them (an augmenting path).
+// Classes whose machines overlap so draw from the same slots, and no slot is
+// counted twice. A class the farm lists no machine for is not the farm's to
+// bound: it is not counted, and always fits. One whose machines all take 0
+// (away) never fits: it waits for them, as the farm would.
+class FarmFlow
+{
+public:
+    using Key = std::pair<std::string, std::string>; // system, feature set key
+
+    void reset(std::vector<FarmMachine> machines)
+    {
+        farm = std::move(machines);
+        used.assign(farm.size(), 0);
+        classes.clear();
+    }
+
+    [[nodiscard]] auto empty() const -> bool
+    {
+        return farm.empty();
+    }
+
+    [[nodiscard]] auto fits(const Key & key, const std::vector<std::string> & features) const -> bool
+    {
+        if (auto const iter = classes.find(key); iter != classes.end()) {
+            return path(iter->second.can).has_value();
+        }
+        return !matched(key.first, features) || path(canBuild(key.first, features)).has_value();
+    }
+
+    void add(const Key & key, const std::vector<std::string> & features)
+    {
+        if (!matched(key.first, features)) {
+            return;
+        }
+        auto & cls =
+            classes.try_emplace(key, Class{.can = canBuild(key.first, features), .on = std::vector<int64_t>(farm.size()), .over = 0})
+                .first->second;
+        if (auto const found = path(cls.can)) {
+            apply(key, *found);
+        } else {
+            cls.over++; // out beyond the farm's slots, from before it changed
+        }
+    }
+
+    void remove(const Key & key)
+    {
+        auto const iter = classes.find(key);
+        if (iter == classes.end()) {
+            return;
+        }
+        auto & cls = iter->second;
+        if (cls.over > 0) {
+            cls.over--;
+        } else if (auto const mach = std::ranges::find_if(cls.on, [](int64_t num) -> bool { return num > 0; });
+                   mach != cls.on.end()) {
+            (*mach)--;
+            used.at(static_cast<size_t>(mach - cls.on.begin()))--;
+        }
+        if (cls.over == 0 && std::ranges::all_of(cls.on, [](int64_t num) -> bool { return num == 0; })) {
+            classes.erase(iter);
+        }
+        settle();
+    }
+
+private:
+    struct Class
+    {
+        std::vector<size_t> can; // machines that build it and take any
+        std::vector<int64_t> on; // its builds on each machine
+        int64_t over = 0;        // its builds on no slot
+    };
+    // How a machine was reached: a build of `cls` on `from` moves to it.
+    struct Step
+    {
+        size_t from = 0;
+        const Key * cls = nullptr;
+    };
+    struct Path
+    {
+        size_t start = 0; // the new build's machine
+        size_t free = 0;  // the machine whose free slot the path ends on
+        std::vector<std::optional<Step>> via; // by machine; none for a start
+    };
+
+    std::vector<FarmMachine> farm;
+    std::vector<int64_t> used; // builds on each machine
+    std::map<Key, Class> classes;
+
+    [[nodiscard]] auto matched(const std::string & system, const std::vector<std::string> & features) const -> bool
+    {
+        return std::ranges::any_of(farm, [&](const FarmMachine & mach) -> bool { return mach.builds(system, features); });
+    }
+
+    [[nodiscard]] auto canBuild(const std::string & system, const std::vector<std::string> & features) const -> std::vector<size_t>
+    {
+        std::vector<size_t> can;
+        for (size_t mach = 0; mach < farm.size(); mach++) {
+            if (farm.at(mach).jobs > 0 && farm.at(mach).builds(system, features)) {
+                can.push_back(mach);
+            }
+        }
+        return can;
+    }
+
+    // Breadth-first over machines from `can`. O(machines^2 * classes).
+    [[nodiscard]] auto path(const std::vector<size_t> & can) const -> std::optional<Path>
+    {
+        Path out{.start = 0, .free = 0, .via = std::vector<std::optional<Step>>(farm.size())};
+        std::vector<bool> seen(farm.size(), false);
+        std::deque<size_t> todo;
+        for (auto const mach : can) {
+            seen.at(mach) = true;
+            todo.push_back(mach);
+        }
+        while (!todo.empty()) {
+            auto const mach = todo.front();
+            todo.pop_front();
+            if (used.at(mach) < int64_t{farm.at(mach).jobs}) {
+                out.free = mach;
+                auto cur = mach;
+                for (auto step = out.via.at(cur); step; step = out.via.at(cur)) {
+                    cur = step->from;
+                }
+                out.start = cur;
+                return out;
+            }
+            for (const auto & [key, cls] : classes) {
+                if (cls.on.at(mach) == 0) {
+                    continue;
+                }
+                for (auto const dest : cls.can) {
+                    if (!seen.at(dest)) {
+                        seen.at(dest) = true;
+                        out.via.at(dest) = Step{.from = mach, .cls = &key};
+                        todo.push_back(dest);
+                    }
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    void apply(const Key & key, const Path & found)
+    {
+        used.at(found.free)++;
+        auto cur = found.free;
+        for (auto step = found.via.at(cur); step; step = found.via.at(cur)) {
+            auto & moved = classes.at(*step->cls);
+            moved.on.at(step->from)--;
+            moved.on.at(cur)++;
+            cur = step->from;
+        }
+        classes.at(key).on.at(found.start)++;
+    }
+
+    // Builds out on no slot take any that are free now.
+    void settle()
+    {
+        for (auto & [key, cls] : classes) {
+            while (cls.over > 0) {
+                auto const found = path(cls.can);
+                if (!found) {
+                    break;
+                }
+                cls.over--;
+                apply(key, *found);
+            }
+        }
+    }
 };
 
 // What a give-back says: the worker takes no builds at all right now, or it
@@ -604,6 +799,10 @@ struct Worker
     std::vector<std::string> systems;
     std::vector<std::string> features;
     uint32_t maxJobs = 0;
+    // The farm it hands its builds to, if it says, and the builds it has out
+    // there. It then takes a drv only while the drv fits the farm (FarmFlow);
+    // maxJobs bounds them all together.
+    FarmFlow farm;
     bool up = false;
     bool draining = false;
     // Give-backs for a failure of its own since it last finished a build.
@@ -724,6 +923,7 @@ public:
         double lingerMs = 0;      // see Want.linger_s, capped by the caller
         std::string_view leaseId; // see Want.lease_id
         bool runsElsewhere = false; // see Want.running_on
+        bool builtin = false;       // its system was builtin (Entry::builtin)
     };
 
     // Caller handled the cache-hit case already.
@@ -737,8 +937,9 @@ public:
                 .drvPath = std::string(info.drvPath),
                 .system = std::string(info.system),
                 .features = std::move(info.features),
-                .enqMs = nowMs};
-            slot->featureKey = featureSetKey(slot->features);
+                .enqMs = nowMs,
+                .builtin = info.builtin};
+            slot->featureKey = classKey(*slot);
             slot->inputs.reserve(info.inputs.size());
             for (auto const input : info.inputs) {
                 slot->inputs.emplace_back(input);
@@ -747,7 +948,11 @@ public:
             // Known only from a worker's Hello so far.
             slot->system = std::string(info.system);
             slot->features = std::move(info.features);
-            slot->featureKey = featureSetKey(slot->features);
+            slot->builtin = info.builtin;
+            slot->featureKey = classKey(*slot);
+            if (slot->worker != noWorker) {
+                farmAdd(workers.at(slot->worker), drv); // its class is known now
+            }
         }
         // Followers of an assigned drv are told again if its worker vanishes.
         if (std::ranges::find(slot->followers, client) == slot->followers.end()) {
@@ -952,6 +1157,7 @@ public:
         std::vector<std::string> systems; // first is the native one
         std::vector<std::string> features;
         uint32_t maxJobs = 0;
+        std::vector<FarmMachine> farm; // see Worker::farm
         std::vector<std::pair<std::string_view, uint64_t>> running; // running + expecting, with assignId
         bool faulty = false;
     };
@@ -993,6 +1199,7 @@ public:
             if (slot->worker != noWorker && slot->worker != wid) {
                 // Placed since our restart, seconds old. The reporter is further along.
                 superseded.push_back({.drv = drv, .loser = slot->worker});
+                farmRemove(workers.at(slot->worker), drv);
                 std::erase(workers.at(slot->worker).running, drv);
                 refreshFree(slot->worker);
             } else if (slot->worker == noWorker && !slot->followers.empty()) {
@@ -1013,6 +1220,7 @@ public:
             }
         }
         refreshFree(wid);
+        setFarmOf(wid, info.farm);
         return wid;
     }
 
@@ -1122,6 +1330,12 @@ public:
         refreshFree(wid);
     }
 
+    // Its farm changed (Worker::farm).
+    void setFarm(WorkerId wid, std::vector<FarmMachine> farm)
+    {
+        setFarmOf(wid, std::move(farm));
+    }
+
     // How long a placed drv waits for a client or worker whose stream broke.
     static constexpr double holdMs = 60'000;
 
@@ -1154,6 +1368,7 @@ public:
             }
             auto & wkr = workers.at(slot->worker);
             if (!wkr.up) {
+                farmRemove(wkr, held.drv);
                 std::erase(wkr.running, held.drv);
                 unplace(held.drv);
                 requeued = true;
@@ -1278,6 +1493,15 @@ public:
         return key;
     }
 
+    // A build's class within its system: its feature set, and apart for a
+    // builtin, which the farm does not count, so that a pass that finds the
+    // farm full for the one (Pass.stuck) still places the other. No
+    // featureSetKey starts with a letter.
+    [[nodiscard]] static auto classKey(const Entry & ent) -> std::string
+    {
+        return (ent.builtin ? "builtin" : "") + featureSetKey(ent.features);
+    }
+
     [[nodiscard]] static auto featureKey(std::vector<std::string> feats) -> std::string
     {
         std::ranges::sort(feats);
@@ -1365,6 +1589,7 @@ private:
     size_t workersUp_ = 0;
     size_t resting_ = 0;
     size_t faultyCount = 0; // workers with `faulty` set
+    size_t farmedCount = 0; // workers with a farm
     struct SystemState
     {
         WaitQueue queue;
@@ -1667,6 +1892,7 @@ private:
         if (!slot || slot->worker != lease.worker || slot->assignId != lease.assignId) {
             return std::nullopt;
         }
+        farmRemove(workers.at(lease.worker), *found);
         std::erase(workers.at(lease.worker).running, *found);
         refreshFree(lease.worker);
         return found;
@@ -1836,6 +2062,7 @@ private:
         place(*slot, *wid);
         slot->assignId = ++lastAssignId;
         workers.at(*wid).running.push_back(drv);
+        farmAdd(workers.at(*wid), drv);
         refreshFree(*wid);
         out.push_back(Assign{.drv = drv, .worker = *wid, .assignId = slot->assignId, .clients = slot->followers});
     }
@@ -1848,6 +2075,58 @@ private:
         }
         auto const iter = systems.find(wkr.systems.front());
         return iter == systems.end() ? 0 : iter->second.free.get(wid);
+    }
+
+    // The worker's farm, and what it has out there now.
+    void setFarmOf(WorkerId wid, std::vector<FarmMachine> farm)
+    {
+        auto & wkr = workers.at(wid);
+        farmedCount -= wkr.farm.empty() ? 0 : 1;
+        wkr.farm.reset(std::move(farm));
+        farmedCount += wkr.farm.empty() ? 0 : 1;
+        for (auto const drv : wkr.running) {
+            farmAdd(wkr, drv);
+        }
+    }
+
+    // What the farm counts a drv as: nothing for one nix-daemon runs itself
+    // (builtin), or one whose system is not known yet (from a Hello).
+    [[nodiscard]] static auto farmKey(const Entry & ent) -> std::optional<FarmFlow::Key>
+    {
+        if (ent.builtin || ent.system.empty()) {
+            return std::nullopt;
+        }
+        return FarmFlow::Key{ent.system, ent.featureKey};
+    }
+
+    void farmAdd(Worker & wkr, DrvId drv)
+    {
+        if (const auto & slot = entries.at(drv); slot && !wkr.farm.empty()) {
+            if (auto const key = farmKey(*slot)) {
+                wkr.farm.add(*key, slot->features);
+            }
+        }
+    }
+
+    void farmRemove(Worker & wkr, DrvId drv)
+    {
+        if (const auto & slot = entries.at(drv); slot && !wkr.farm.empty()) {
+            if (auto const key = farmKey(*slot)) {
+                wkr.farm.remove(*key);
+            }
+        }
+    }
+
+    [[nodiscard]] static auto fitsFarm(const Worker & wkr, const Entry & ent) -> bool
+    {
+        auto const key = farmKey(ent);
+        return wkr.farm.empty() || !key || wkr.farm.fits(*key, ent.features);
+    }
+
+    // A free slot for the drv on the worker: one of its own, and its farm's.
+    [[nodiscard]] auto roomFor(WorkerId wid, const Entry & ent) const -> bool
+    {
+        return freeOf(wid) > 0 && fitsFarm(workers.at(wid), ent);
     }
 
     void unrest(WorkerId wid)
@@ -1893,7 +2172,7 @@ private:
             return std::nullopt;
         }
         const auto & fidx = iter->second.free;
-        if (ent.features.empty() && faultyCount == 0) {
+        if (ent.features.empty() && faultyCount == 0 && farmedCount == 0) {
             return fidx.emptiest();
         }
         std::optional<WorkerId> best;
@@ -1901,7 +2180,8 @@ private:
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
             const auto & wkr = workers.at(wid);
             auto & pick = wkr.faulty ? faulty : best;
-            if (wkr.up && fidx.get(wid) > 0 && offers(wkr, ent) && (!pick || fidx.get(wid) > fidx.get(*pick))) {
+            if (wkr.up && fidx.get(wid) > 0 && offers(wkr, ent) && fitsFarm(wkr, ent)
+                && (!pick || fidx.get(wid) > fidx.get(*pick))) {
                 pick = wid;
             }
         }
@@ -1929,7 +2209,7 @@ private:
             }
             others = true;
             auto & best = bests.at((gave(ent, wid) ? 2 : 0) + (wkr.faulty ? 1 : 0));
-            if (freeOf(wid) > 0 && (!best || freeOf(wid) > freeOf(*best))) {
+            if (roomFor(wid, ent) && (!best || freeOf(wid) > freeOf(*best))) {
                 best = wid;
             }
         }
@@ -1965,7 +2245,7 @@ private:
             }
             auto [wid, size] = iter->second;
             if (wid >= workers.size() || gave(ent, wid) || !workers.at(wid).up || workers.at(wid).faulty
-                || freeOf(wid) <= 0 || !offers(workers.at(wid), ent)) {
+                || !roomFor(wid, ent) || !offers(workers.at(wid), ent)) {
                 continue;
             }
             auto const cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });

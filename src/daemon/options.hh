@@ -26,6 +26,10 @@ struct Options
     std::string socketPath = "/nix/var/nix/daemon-socket/socket";
     // Store URI for the native bulk RPCs. Defaults to the proxy socket.
     std::string storeUri;
+    // The farm this builder hands its builds to (Hello.farm), as JSON written
+    // by whoever runs that farm (parseFarm). Read at start and whenever it
+    // changes.
+    std::string farmFile;
     std::string tlsCert;
     std::string tlsKey;
     std::string clientCA;
