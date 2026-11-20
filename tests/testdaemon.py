@@ -1,31 +1,42 @@
 """The keepalive tests' nix-grpc-daemon, on ports it binds itself: a port a
 test picked and let go of could be another test's daemon's by then."""
+import atexit
 import os
 import re
-import socket
+import socketserver
 import struct
 import subprocess
 import threading
 import time
 
 
+class Hello(socketserver.BaseRequestHandler):
+    def handle(self):
+        if self.request.recv(8):
+            self.request.sendall(struct.pack("<Q", 0x6478696F))
+        while self.request.recv(4096):
+            pass
+
+
 def greeter(path):
     """A nix-daemon that only says hello: the builder takes no builds while
-    its local nix-daemon does not answer (Coordinator::askLocalDaemon)."""
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(path)
-    srv.listen()
+    its local nix-daemon does not answer (Coordinator::askLocalDaemon).
 
-    def serve():
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                if conn.recv(8):
-                    conn.sendall(struct.pack("<Q", 0x6478696F))
-                while conn.recv(4096):
-                    pass
+    A connection's error is printed, and the greeter goes on serving. It stops
+    and is joined at exit, before the interpreter finalizes: a daemon thread
+    still writing then holds stderr's lock, and finalization aborts the test
+    (testdaemon-test.py)."""
+    srv = socketserver.UnixStreamServer(path, Hello)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
 
-    threading.Thread(target=serve, daemon=True).start()
+    # Exit functions run before finalization, and after the interpreter joins
+    # the non-daemon threads, which is why this thread is a daemon one.
+    @atexit.register
+    def stop():
+        srv.shutdown()
+        thread.join()
+        srv.server_close()
 
 
 def start(daemon, tmp, *args):
