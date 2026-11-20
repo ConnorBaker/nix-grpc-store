@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -1044,6 +1045,66 @@ void aBuildLostWithThePredecessorIsPlacedHere()
     assert(std::ranges::contains(got, std::string("a.drv")));
 }
 
+// The phantom an old client leaves after a takeover, seen whole: it re-Wants
+// a build it runs through the predecessor and never calls here, sending no
+// Want.running_on. The node's one slot holds that placement; once the
+// predecessor has built it into the node's store, the builder finishes it
+// as BUILT (Builder::checkBuiltWith) and the slot goes to the next drv. Given
+// back instead, it would only be placed again for its client.
+void aPhantomWhoseOutputsTheNodeHasFreesItsSlot()
+{
+    constexpr auto drvA = "/nix/store/00000000000000000000000000000000-a.drv";
+    constexpr auto drvB = "/nix/store/11111111111111111111111111111111-b.drv";
+    Metrics metrics{""};
+    Dispatcher disp(debugConfig(), metrics);
+    auto now = std::chrono::steady_clock::now();
+    nixgrpc::Builder builder(
+        {.advertise = "w1:50051",
+         .systems = {"x86_64-linux"},
+         .features = {},
+         .maxJobs = 1,
+         .now = [&now] -> std::chrono::steady_clock::time_point { return now; }},
+        metrics);
+    bool aBuilt = false;
+    builder.checkBuiltWith([&](const std::string & drv) -> std::optional<std::vector<std::pair<std::string, uint64_t>>> {
+        if (drv == drvA && aBuilt) {
+            return std::vector<std::pair<std::string, uint64_t>>{{"/nix/store/22222222222222222222222222222222-a", 1}};
+        }
+        return std::nullopt;
+    });
+    auto const worker = disp.loopbackWorker([&](const SchedCmd & cmd) -> void {
+        if (cmd.has_expect()) {
+            builder.onExpect(cmd.expect());
+        } else if (cmd.has_revoke()) {
+            builder.onRevoke(cmd.revoke());
+        }
+    });
+    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
+        WorkerMsgs one;
+        *one.add_msgs() = msg;
+        disp.workerMsgs(*worker, one);
+        return true;
+    });
+    builder.greet();
+    std::vector<SchedMsg> toClient;
+    auto client = disp.connectClient(recordMsgsInto(toClient), [] -> void {});
+    disp.clientMsgs(client, wantOf(drvA));
+    disp.clientMsgs(client, wantOf(drvB));
+    assert(assigned(toClient) == 1); // a, never claimed
+    constexpr auto probeAfter = std::chrono::seconds(10); // Builder::probeAfter
+    now += probeAfter;
+    builder.finishBuiltHere();
+    assert(assigned(toClient) == 1 && builder.holding() == 1); // still building there
+    // The predecessor's build of a ends.
+    aBuilt = true;
+    now += probeAfter;
+    builder.finishBuiltHere();
+    assert(assigned(toClient) == 2 && toClient.back().assigned().drv_path() == drvB);
+    disp.clientGone(client);
+    disp.workerGone(*worker);
+    builder.setSend(nullptr);
+}
+
 } // namespace
 
 auto main() -> int
@@ -1068,6 +1129,7 @@ try {
     aBounceOffTheOnlyWorkerLeavesNoSlotTaken();
     aBuildInFlightOnThePredecessorTakesNoSlotHere();
     aBuildLostWithThePredecessorIsPlacedHere();
+    aPhantomWhoseOutputsTheNodeHasFreesItsSlot();
     return 0;
 } catch (std::exception &) {
     return 1;

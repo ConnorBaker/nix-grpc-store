@@ -352,6 +352,15 @@ inline auto failureStatusName(S status) -> std::string_view {
   }
 }
 
+// The drv's output paths, and their variables, from its contents.
+inline void fillInOutputPaths(nix::Derivation &drv, nix::Store &store) {
+#if NIX_COMPAT_TEMPLATED_DRV
+  nix::derivation::fillInOutputPaths(drv, store);
+#else
+  drv.fillInOutputPaths(store);
+#endif
+}
+
 // Plain store path inputs of a BasicDerivation.
 inline auto drvInputs(const nix::BasicDerivation &drv) -> const nix::StorePathSet & {
 #if NIX_COMPAT_TEMPLATED_DRV

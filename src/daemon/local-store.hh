@@ -5,13 +5,18 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
+#include <nix/store/path-info.hh>
+#include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
 #include <nix/util/error.hh>
@@ -80,6 +85,38 @@ public:
             pool.reset();
         }
         return gone;
+    }
+
+    using Outputs = std::vector<std::pair<std::string, uint64_t>>;
+
+    // A drv's outputs, all valid in this store, with their NAR sizes
+    // (Builder::checkBuiltWith); nullopt if any is not, or not known. A lost
+    // nix-daemon drops the pool, so the next ask gets a fresh one.
+    auto builtHere(const std::string & drvPath) -> std::optional<Outputs>
+    {
+        try {
+            return builtHereIn(*shared(), drvPath);
+        } catch (const std::exception & err) {
+            dropIfLost(err);
+            throw;
+        }
+    }
+
+    static auto builtHereIn(nix::Store & store, const std::string & drvPath) -> std::optional<Outputs>
+    {
+        // As clients name it (StorePath::to_string): no store directory.
+        auto const drv = nix::StorePath(drvPath);
+        if (!store.isValidPath(drv)) {
+            return std::nullopt;
+        }
+        Outputs outputs;
+        for (const auto & [name, out] : store.queryPartialDerivationOutputMap(drv)) {
+            if (!out || !store.isValidPath(*out)) {
+                return std::nullopt;
+            }
+            outputs.emplace_back(store.printStorePath(*out), store.queryPathInfo(*out)->narSize);
+        }
+        return outputs;
     }
 
 private:
