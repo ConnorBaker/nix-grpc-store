@@ -341,6 +341,10 @@ message Expect {
 
 message Revoke {
   string drv_path = 1;
+  // From a scheduler handing over, at the end of a linger or hold: a build
+  // that runs is revoked only once no call waits for it, a client that
+  // followed it there being one that still wants it.
+  bool once_uncalled = 2;
 }
 
 message SchedCmd {

@@ -335,6 +335,78 @@ auto uploadKeepsTheClaim() -> bool
     return quiet.dones.size() == 1 && builder.holding() == 0;
 }
 
+// A builder with a.drv expected, and the Dones it sends.
+struct Revokable
+{
+    nixgrpc::Metrics metrics{""};
+    Builder builder{{.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics};
+    std::vector<Done> dones;
+
+    Revokable()
+    {
+        builder.setSend([this](const nix::remote::WorkerMsgs & msgs) -> bool {
+            for (const auto & msg : msgs.msgs()) {
+                if (msg.has_done()) {
+                    dones.push_back(msg.done());
+                }
+            }
+            return true;
+        });
+        builder.onExpect(expectOf(1));
+    }
+
+    // From a scheduler handing over (Revoke.once_uncalled).
+    void revokeOnceUncalled()
+    {
+        nix::remote::Revoke rev;
+        rev.set_drv_path("a.drv");
+        rev.set_once_uncalled(true);
+        builder.onRevoke(rev);
+    }
+};
+
+// A build that does not run yet has no call that could wait for it: a revoke
+// once uncalled revokes it at once, as any Revoke does.
+auto aRevokeOnceUncalledEndsABuildNotRunning() -> bool
+{
+    Revokable rev;
+    rev.revokeOnceUncalled();
+    return rev.dones.size() == 1 && rev.dones.front().outcome() == Done::CANCELLED && !rev.builder.admit("a.drv");
+}
+
+// A running build is only marked: it runs on while its owner's caller is
+// there, and is to end once that caller is gone.
+auto aRevokeOnceUncalledMarksARunningBuild() -> bool
+{
+    Revokable rev;
+    auto const owner = rev.builder.claim("a.drv", 1) ? rev.builder.admit("a.drv") : std::nullopt;
+    if (!owner) {
+        return false;
+    }
+    rev.revokeOnceUncalled();
+    return rev.dones.empty() && owner->shared->revokeOnceUncalled && !owner->shared->revoked
+           && !owner->shared->uncalled(false) && owner->shared->uncalled(true);
+}
+
+// A call that attaches waits for the build from the moment it is admitted,
+// before it gets to wait: a build revoked once uncalled whose owner's caller
+// is gone must not end in between. Once the attached call is over, it ends.
+auto anAttachedCallKeepsARevokedBuildFromItsAdmission() -> bool
+{
+    Revokable rev;
+    auto const owner = rev.builder.claim("a.drv", 1) ? rev.builder.admit("a.drv") : std::nullopt;
+    if (!owner) {
+        return false;
+    }
+    rev.revokeOnceUncalled();
+    auto attacher = rev.builder.admit("a.drv");
+    if (!attacher || !attacher->attach || owner->shared->uncalled(true)) {
+        return false;
+    }
+    attacher.reset();
+    return owner->shared->uncalled(true);
+}
+
 constexpr uint64_t silent = 1800; // the build's --max-silent-time
 constexpr uint64_t otherSilent = 1200;
 constexpr uint64_t check = nixgrpc::Expected::Shared::checkMode;
@@ -377,6 +449,18 @@ auto run() -> int
     }
     if (attacherTakes(nix::remote::Done::BUILT, {check, 0, otherSilent}, check)) {
         std::println("FAIL a caller asking for a check with other limits takes another caller's check");
+        return EXIT_FAILURE;
+    }
+    if (!aRevokeOnceUncalledEndsABuildNotRunning()) {
+        std::println("FAIL a revoke once uncalled of a build not running does not revoke it at once");
+        return EXIT_FAILURE;
+    }
+    if (!aRevokeOnceUncalledMarksARunningBuild()) {
+        std::println("FAIL a revoke once uncalled of a running build does not only mark it");
+        return EXIT_FAILURE;
+    }
+    if (!anAttachedCallKeepsARevokedBuildFromItsAdmission()) {
+        std::println("FAIL an attached call does not keep a build revoked once uncalled from its admission on");
         return EXIT_FAILURE;
     }
     if (!earlyCallWaits()) {

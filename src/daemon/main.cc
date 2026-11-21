@@ -1192,6 +1192,10 @@ public:
         } catch (nixgrpc::CancelledWait &) {
             outcome = nix::remote::Done::CANCELLED;
             report();
+            if (adm->shared->endedUncalled) {
+                metrics.event("revoked");
+                nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "revoked_uncalled"}, {"drv", drvName}});
+            }
             if (adm->shared->revoked) {
                 metrics.event("revoked");
                 return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
@@ -1270,8 +1274,19 @@ public:
         std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
     {
         // Not when our caller's stream breaks: the scheduler sends it back here
-        // to attach. It revokes the build once no client wants it any more.
-        auto const cancelled = [&] -> bool { return shared.revoked || stopSignal >= nixgrpc::kCancelBuilds; };
+        // to attach. It revokes the build once no client wants it any more. A
+        // scheduler handing over cannot send it back here, its successor
+        // having the socket: it revokes the build once no call waits for it.
+        auto const uncalled = [&] -> bool {
+            if (!shared.uncalled(caller.gone())) {
+                return false;
+            }
+            shared.endedUncalled = true;
+            return true;
+        };
+        auto const cancelled = [&] -> bool {
+            return shared.revoked || uncalled() || stopSignal >= nixgrpc::kCancelBuilds;
+        };
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto const roots = local.scoped();

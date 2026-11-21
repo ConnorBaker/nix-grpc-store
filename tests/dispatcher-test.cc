@@ -860,6 +860,133 @@ void testExpiryRevokeReachesAWorker()
     disp.workerGone(worker);
 }
 
+// A build whose client's linger, or hold, runs out without that client is
+// revoked. A scheduler handing over (restarting) sent its clients to the new
+// one and let their builds run on as they left (clientGone); its Revoke says
+// to revoke a build only once no call waits for it (once_uncalled), a client
+// that followed the build there still waiting on its call. Nothing is revoked
+// before the linger or hold is over (the negative control).
+void anExpiryRevokesWhatNobodyCameBackFor(uint32_t lingerS, bool handedOver)
+{
+    constexpr double capMs = 120'000; // past Core::holdMs, so a linger binds
+    constexpr uint32_t lingerOnlyS = 0;
+    auto const dueMs = lingerS != lingerOnlyS ? capMs : nixgrpc::sched::Core::holdMs;
+    Metrics metrics{""};
+    std::atomic<double> nowMs{0};
+    Dispatcher disp(
+        Dispatcher::Config{
+            .defaultSystem = "x86_64-linux",
+            .present = {},
+            .lookupThreads = 0,
+            .nowMs = [&nowMs] -> double { return nowMs; },
+            .maxLingerMs = capMs},
+        metrics);
+    std::vector<SchedCmd> toWorker;
+    Dispatcher::Worker worker{.send = recordInto(toWorker), .abort = {}, .id = {}};
+    disp.workerMsgs(worker, helloFrom("w0:50051", 1));
+    auto const revokes = [&toWorker] -> std::vector<nix::remote::Revoke> {
+        std::vector<nix::remote::Revoke> out;
+        for (const auto & cmd : toWorker) {
+            if (cmd.has_revoke()) {
+                out.push_back(cmd.revoke());
+            }
+        }
+        return out;
+    };
+    auto client = disp.connectClient([](const SchedMsg &) -> bool { return true; }, [] -> void {});
+    ClientMsgs want;
+    auto * wnt = want.add_msgs()->mutable_want();
+    wnt->set_drv_path("/nix/store/33333333333333333333333333333333-chain.drv");
+    wnt->set_linger_s(lingerS);
+    if (lingerS != lingerOnlyS) {
+        wnt->set_lease_id("chain-1");
+    }
+    disp.clientMsgs(client, want);
+    assert(expectsIn(toWorker) == 1);
+    if (handedOver) {
+        disp.restarting();
+    }
+    disp.clientGone(client);
+    disp.tick();
+    assert(revokes().empty());
+    nowMs = dueMs - 1;
+    disp.tick();
+    assert(revokes().empty());
+    nowMs = dueMs + 1;
+    disp.tick();
+    auto const got = revokes();
+    assert(got.size() == 1);
+    assert(got.front().once_uncalled() == handedOver);
+    disp.workerGone(worker);
+}
+
+// The other revokes a client's leaving or a Release makes: the build of a
+// client that held a released lease, revoked when its stream ends
+// (clientGone), and a build kept only for a lease, revoked by its Release.
+// A scheduler handing over revokes them too, once no call waits for them
+// (once_uncalled); one that serves, at once.
+void aLeaveOrAReleaseRevokesWhatNobodyWaitsFor(bool viaRelease, bool handedOver)
+{
+    constexpr uint32_t lingerS = 600;
+    constexpr double capMs = 600e3;
+    constexpr auto drv = "/nix/store/44444444444444444444444444444444-chain.drv";
+    Metrics metrics{""};
+    std::atomic<double> nowMs{0};
+    Dispatcher disp(
+        Dispatcher::Config{
+            .defaultSystem = "x86_64-linux",
+            .present = {},
+            .lookupThreads = 0,
+            .nowMs = [&nowMs] -> double { return nowMs; },
+            .maxLingerMs = capMs},
+        metrics);
+    std::vector<SchedCmd> toWorker;
+    Dispatcher::Worker worker{.send = recordInto(toWorker), .abort = {}, .id = {}};
+    disp.workerMsgs(worker, helloFrom("w0:50051", 1));
+    auto const revokes = [&toWorker] -> std::vector<nix::remote::Revoke> {
+        std::vector<nix::remote::Revoke> out;
+        for (const auto & cmd : toWorker) {
+            if (cmd.has_revoke()) {
+                out.push_back(cmd.revoke());
+            }
+        }
+        return out;
+    };
+    auto link = disp.connectClient([](const SchedMsg &) -> bool { return true; }, [] -> void {});
+    ClientMsgs want;
+    auto * wnt = want.add_msgs()->mutable_want();
+    wnt->set_drv_path(drv);
+    wnt->set_linger_s(lingerS);
+    wnt->set_lease_id("chain-1");
+    disp.clientMsgs(link, want);
+    assert(expectsIn(toWorker) == 1);
+    auto releaser = disp.connectClient([](const SchedMsg &) -> bool { return true; }, [] -> void {});
+    ClientMsgs release;
+    release.add_msgs()->mutable_release()->set_lease_id("chain-1");
+    if (viaRelease) {
+        // Kept for its lease alone once its client left.
+        disp.clientGone(link);
+        assert(revokes().empty());
+        if (handedOver) {
+            disp.restarting();
+        }
+        disp.clientMsgs(releaser, release);
+    } else {
+        // Its client still follows it: the Release revokes nothing yet.
+        disp.clientMsgs(releaser, release);
+        assert(revokes().empty());
+        if (handedOver) {
+            disp.restarting();
+        }
+        disp.clientGone(link);
+    }
+    auto const got = revokes();
+    assert(got.size() == 1);
+    assert(got.front().drv_path() == drv && got.front().once_uncalled() == handedOver);
+    disp.clientGone(releaser);
+    disp.workerGone(worker);
+}
+
 // A client whose build runs on the only worker that can build it refuses
 // that assignment (it could not reach the worker again). The scheduler
 // revokes the build there and places it there again, with a new id. The
@@ -1159,6 +1286,14 @@ try {
     testReleaseAndTheStatsSeries();
     testKeptQueuedExpiryExported();
     testExpiryRevokeReachesAWorker();
+    constexpr uint32_t aChainsLingerS = 600;
+    for (bool const handedOver : {true, false}) {
+        anExpiryRevokesWhatNobodyCameBackFor(aChainsLingerS, handedOver);
+        anExpiryRevokesWhatNobodyCameBackFor(0, handedOver);
+        for (bool const viaRelease : {true, false}) {
+            aLeaveOrAReleaseRevokesWhatNobodyWaitsFor(viaRelease, handedOver);
+        }
+    }
     aBounceOffTheOnlyWorkerLeavesNoSlotTaken();
     aBuildInFlightOnThePredecessorTakesNoSlotHere();
     aBuildLostWithThePredecessorIsPlacedHere();

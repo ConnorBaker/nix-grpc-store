@@ -119,6 +119,12 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
         if (found == lck->expected.end()) {
             return;
         }
+        if (found->second.running && rev.once_uncalled()) {
+            // The build RPC kills the build once no call waits for it.
+            found->second.shared->revokeOnceUncalled = true;
+            logLine(LogLevel::info, {{"event", "revoke_once_uncalled"}, {"drv", rev.drv_path()}});
+            return;
+        }
         if (found->second.running) {
             // The build RPC notices, kills the build and reports Done itself.
             found->second.shared->revoked = true;
@@ -139,7 +145,11 @@ auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
         return std::nullopt;
     }
     auto & ent = found->second;
-    Admission adm{.shared = ent.shared, .assignId = ent.assignId, .attach = ent.running};
+    Admission adm{
+        .shared = ent.shared,
+        .assignId = ent.assignId,
+        .attach = ent.running,
+        .waiting = ent.running ? Expected::Waiting(ent.shared) : Expected::Waiting()};
     ent.claimed = true;
     ent.running = true;
     return adm;
