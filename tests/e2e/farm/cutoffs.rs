@@ -54,7 +54,7 @@ impl Drop for NarRefused {
 fn an_input_fetch_that_fails_is_given_back_not_rebuilt() {
     farm_ready();
     let tag = "fetchfail";
-    let inp = input_only_in_the_cache(tag, false);
+    let inp = input_only_in_the_cache(tag, false, false);
     let store = format!("{}&reschedule-retries=2", envoy());
     let count = |kind| events(WORKER1, kind);
     let (lost0, missed0) = (count("input_lost"), count("input_not_substitutable"));
@@ -116,7 +116,7 @@ fn an_input_fetch_that_fails_is_given_back_not_rebuilt() {
 fn a_root_niks3_dropped_after_planning_is_given_back_not_rebuilt() {
     farm_ready();
     let tag = "dropped";
-    let inp = input_only_in_the_cache(tag, false);
+    let inp = input_only_in_the_cache(tag, false, false);
     let narinfo = format!("{}.narinfo", &inp["/nix/store/".len()..][..32]);
     let nar = nar_of(&inp);
     // Offered by the other substituter too, signed with the cache's key,

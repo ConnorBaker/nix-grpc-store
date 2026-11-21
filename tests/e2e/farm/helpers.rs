@@ -1,4 +1,5 @@
 use std::sync::Once;
+use std::thread;
 
 use crate::harness::*;
 
@@ -321,33 +322,51 @@ pub fn wait_building(unit: &str) {
 /// `nondet`: built on the client (which offers vip for that build only),
 /// uploaded to worker1 alone, which publishes it to niks3, then deleted from
 /// the client and worker1. Worker1 never asked a substituter for it. Returns
-/// its store path.
-pub fn input_only_in_the_cache(tag: &str, nondet: bool) -> String {
+/// its store path. A `held` input runs until released (release_slow), on
+/// the client too, which this releases.
+pub fn input_only_in_the_cache(tag: &str, nondet: bool, held: bool) -> String {
     let dep = expr("DEP");
-    let inp = succeed(
-        CLIENT,
-        &[
-            "nix-build",
-            "--no-out-link",
-            "--option",
-            "extra-system-features",
-            "vip",
-            &dep,
-            "-A",
-            "input",
-            "--argstr",
-            "tag",
-            tag,
-            "--arg",
-            "features",
-            r#"["vip"]"#,
-            "--arg",
-            "nondet",
-            if nondet { "true" } else { "false" },
-        ],
-    )
-    .trim()
-    .to_string();
+    let build = || {
+        succeed(
+            CLIENT,
+            &[
+                "nix-build",
+                "--no-out-link",
+                "--option",
+                "extra-system-features",
+                "vip",
+                &dep,
+                "-A",
+                "input",
+                "--argstr",
+                "tag",
+                tag,
+                "--arg",
+                "features",
+                r#"["vip"]"#,
+                "--arg",
+                "nondet",
+                if nondet { "true" } else { "false" },
+                "--arg",
+                "held",
+                if held { "true" } else { "false" },
+            ],
+        )
+        .trim()
+        .to_string()
+    };
+    let inp = if held {
+        thread::scope(|s| {
+            let built = s.spawn(build);
+            retry(&[], "the held input building on the client", || {
+                built.is_finished() || run(CLIENT, BUILDER).code == 0
+            });
+            run(CLIENT, &["pkill", "-f", BUILDER[2]]);
+            built.join().expect("the build of the held input")
+        })
+    } else {
+        build()
+    };
     succeed(
         CLIENT,
         &[
