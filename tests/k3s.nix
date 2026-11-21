@@ -217,6 +217,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm-k3s";
+  globalTimeout = 2100;
   # checks.helm lints these without booting a VM.
   passthru = { inherit chartValues; };
 

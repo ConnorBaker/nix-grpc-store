@@ -96,6 +96,7 @@ let
 in
 {
   name = "tribuchet-lease" + lib.optionalString (scenario == "queue") "-queue";
+  globalTimeout = 900;
   defaults.documentation.enable = false;
 
   nodes = {

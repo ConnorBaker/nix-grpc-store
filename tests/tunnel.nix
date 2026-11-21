@@ -87,6 +87,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-tunnel";
+  globalTimeout = 1800;
 
   nodes = {
     dialled = {

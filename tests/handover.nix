@@ -30,6 +30,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-handover-${part}";
+  globalTimeout = 900;
 
   sshBackdoor.enable = true;
   # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.

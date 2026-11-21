@@ -209,6 +209,8 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     module = nixosModule;
   };
 
+  waits-bound = import ../tests/waits-bound.nix { inherit pkgs; };
+
   farm-scheduling = farm "scheduling";
   farm-restarts = farm "restarts";
   farm-cutoffs = farm "cutoffs";

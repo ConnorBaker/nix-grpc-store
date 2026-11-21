@@ -1,16 +1,74 @@
 # Python for a NixOS testScript: waits without a deadline. The driver's own
 # waits (wait_for_unit, wait_until_succeeds, wait_for_open_port, retry) and
-# its execute all take one, 15 minutes unless given another, and the test
-# one more (globalTimeout). An event that never comes hangs the test here;
-# that hang is the failure to diagnose. A client the wait names that ends
-# first fails it, with its journal.
+# its execute all take one, 15 minutes unless given another. An event that
+# never comes hangs the wait here; that hang is the failure to diagnose. A
+# client the wait names that ends first fails it, with its journal.
+#
+# The whole test keeps one bound, its globalTimeout, so that a hang ends and
+# frees the machine it holds. The driver's own timer counts wall time, which
+# a build the farm's CPU arbiter freezes spends without running. Here a
+# clock ticks every 0.05 s, and a tick that comes more than 0.1 s after the
+# last counts 0.1 s: each freeze (or other stop) adds at most 0.1 s to the
+# count, whatever the arbiter's policy. Time the test is not stopped but
+# starved of CPU on a loaded host counts in full; the bounds' margin is for
+# that. At the bound the test fails with where its script is. Each test
+# sets its globalTimeout to three times its longest passing run on the farm
+# (wall time, so no less than its running time), rounded up to 300 s, at
+# least 600 s, and never below the value upstream gives it.
 ''
   import shlex
+  import signal
+  import sys
+  import threading
   import time
+  import traceback
   from test_driver.errors import RequestedAssertionFailed
 
-  driver.race_timer.cancel()
-  log.info("the test's global timeout is cancelled: its waits have no deadline")
+  class RunningBound(threading.Timer):
+      # Stands in for the driver's race_timer, so the driver cancels it as it
+      # would its own once the test script is over (join_all, cleanup).
+      def __init__(self, bound, tick=0.05, most=0.1):
+          super().__init__(bound, lambda: None)
+          self.tick, self.most = tick, most
+
+      def run(self):
+          ran, last = 0.0, time.monotonic()
+          while ran < self.interval:
+              if self.finished.wait(self.tick):
+                  return
+              now = time.monotonic()
+              ran, last = ran + min(now - last, self.most), now
+          # The finally ends the test however the report goes;
+          # log_test_error keeps the report itself free of log.error's
+          # sys.exit.
+          try:
+              self.report()
+          finally:
+              self.end()
+
+      def report(self):
+          main = sys._current_frames().get(threading.main_thread().ident)
+          code = driver.tests.splitlines()
+          at = [f"  {code[f.lineno - 1].strip()}" for f in traceback.extract_stack(main) if f.filename == "<string>" and f.lineno] if main else []
+          log.log_test_error(
+              f"the test ran {self.interval:.0f} s, its globalTimeout (a freeze counts at most {self.most} s),"
+              + " and did not finish; its script is at:\n" + ("\n".join(at) or "  (no frame of the script)")
+          )
+
+      def end(self):
+          # terminate_test releases the machines and sends the driver SIGTERM;
+          # the SIGTERM goes even if a release fails.
+          try:
+              driver.terminate_test()
+          finally:
+              signal.raise_signal(signal.SIGTERM)
+
+  # Only where the driver armed its own (run_tests; not interactively).
+  if driver.race_timer.is_alive():
+      driver.race_timer.cancel()
+      driver.race_timer = RunningBound(driver.config.global_timeout.total_seconds())
+      driver.race_timer.start()
+      log.info(f"the test's {driver.race_timer.interval:.0f} s global timeout counts time not frozen")
 
   def ended(m, unit):
       # Inactive or failed: a unit still deactivating, or activating, runs
