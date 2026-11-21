@@ -13,6 +13,8 @@
 #     plus one for the client's check that an output added after
 #     queryMissing is valid (what queryMissing asked must not answer it).
 #   built: BUILT derivations whose outputs the store has. One call.
+#   opaque: BUILT store paths given as targets, half of them valid, as
+#     `nix path-info` gives its arguments. One call.
 #   deep: a target only the client's substituter has, over DEEP levels of
 #     WIDE derivations nobody has. Nix's walk stops at the target, so asking
 #     ahead must too: one call, not one per level below.
@@ -110,6 +112,7 @@ def main():
         for name, limit, substituters, scenario in (
             ("chain", -(-CHAIN // BUDGET) + 1, None, ("chain", str(CHAIN))),
             ("built", 1, None, ("built", str(BUILT))),
+            ("opaque", 1, None, ("opaque", str(BUILT))),
             ("deep", 1, None, ("deep", "5", str(BUDGET + 1))),
             ("mixed", None, None, ("mixed",)),
             ("mixed-own", None, "", ("mixed",)),
