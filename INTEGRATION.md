@@ -1,0 +1,76 @@
+# The `integration` branch
+
+This branch is upstream `main` (Mic92/nix-grpc-store) with this fork's topic branches merged into it, one `git merge --no-ff` per branch, in the order below. It is what the farm builds and runs; it is not meant to go upstream as a whole. Each topic branch is its own unit and goes upstream (or not) on its own.
+
+Each topic branch is a linear stack of commits on upstream `main`, or on the topic it depends on ("Stacked on"). A topic that depends on two or more topics sits on a merge of them; the reason is in the table. When two independent topics touch the same lines, the integration merge of the later one resolves it, and that merge commit's message names the files.
+
+`integ/<name>`: the integration copy of a change that also exists as an upstream pull request or upstream commit in another form (rebased, reworded, or merged upstream after this base). The pull request branch keeps its own name and is not changed by this branch.
+
+Coverage: each topic branch below was built alone, x86_64-linux only, as `packages.x86_64-linux.default` (which runs the unit tests), and passed. That is all that was run per topic. The full check set (all systems, VM tests, clang-tidy) gates this integration branch, not each topic alone; run it on a topic before that topic goes upstream.
+
+- `scheduler-uncap-max-jobs` was also built alone as `checks.x86_64-linux.clang-tidy`, and passed.
+- clang-tidy (`checks.x86_64-linux.clang-tidy`) has not been run on each topic alone. A review found it fails alone at `single-node-takeover` (a missing include in takeover.cc, added by a later topic), `integ/daemon-floating-ca`, `takeover-placements` and `greeter-stop-before-finalize` (includes in options.cc). It passes on this integration branch.
+- `tunnel-takeover-test`: its own VM test (`checks.x86_64-linux.tunnel-takeover`) fails at its head, as it did at the same commit in the old linear history; later commits in `integ/tests-event-waits` fix it.
+- `attach-other-limits-outputs` built alone as `checks.x86_64-linux.farm-scheduling`: its own test passes; two lost-input tests (`an_input_whose_nar_the_cache_lost_is_built_again_with_other_bytes`, `lost_input_rebuilt_with_other_bytes_reaches_its_user_on_another`) fail without `niks3-fork-pin` (as that topic's commit message says; the same check on a merge of this topic and `niks3-fork-pin` passed). Every topic below `niks3-fork-pin` has the same two failures in farm-scheduling.
+
+The base below is 9 commits behind upstream `main` `f2f5acd8`. Upstream has since merged its own forms of three changes this branch carries as `integ/` topics: `integ/nar-fetcher-fail-session-together`, `integ/nar-fetcher-record-once` and `integ/call-test-interrupt-race`. They are dropped when this branch is next rebuilt on upstream.
+
+Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
+
+## Merged branches
+
+| Merge order | Branch | Head sha merged | Stacked on | Why stacked | Description | Upstream PR |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `client-lazy-output-lookup` | `d8c9c77592cec87aa266e1e43a63a552be7ef361` |  |  | Look up an input's outputs when the walk first reads them |  |
+| 2 | `lost-input-recovery` | `a8b3c4631afbd14950582f544be02cae64e8795a` |  |  | Recover inputs the cache lost: refetch with a fresh narinfo, name a missing input only if the cache lost it, give the job back, build the producer for hook jobs |  |
+| 3 | `single-node-takeover` | `f3f831ad4046fe025410f6cb642d9143f01dc3e5` |  |  | A single node's next generation takes over its socket on reload instead of draining |  |
+| 4 | `eval-store-query-missing` | `e2f795d3b2fac22813e1ccf38b7420f0bf920c3d` |  |  | Pass the evaluation store through queryMissing (Nix PR 16433); flake builds the plugin against the farm Nix |  |
+| 5 | `max-jobs-sighup` | `e9a6533f87f06eebbf6ef9c0bded0a6310899f75` |  |  | Read nix's max-jobs again on SIGHUP |  |
+| 6 | `farm-cutoff-tests` | `d0e0922c69e4691905f50a1ec840618bfc524eca` |  |  | Farm tests: builds kept through drains, kills and cut-offs |  |
+| 7 | `drain-waits-for-uploads` | `56b00f1e01d1d73800fae2b34ff9f14cea90b8ac` | `single-node-takeover` |  | Uploads in flight land before a draining builder exits |  |
+| 8 | `reschedule-unreached-worker` | `dd0ac896a2062cf3eb09d0ae334dacf947c9f228` |  |  | Place a build elsewhere when its worker was not reached |  |
+| 9 | `follow-broken-stream` | `c620f26e63ccec05cc3bb16d37b759a9fbb71265` | `reschedule-unreached-worker` |  | Keep a build whose stream broke and follow it again |  |
+| 10 | `upload-resend-missing` | `c9cebbb57eb2237c956b9359ad2103ad795db5ef` |  |  | Count an upload from when a builder takes it; resend only what is missing |  |
+| 11 | `keepalive-tests` | `fec76c600b012faa4de468f9bb15a78cda9ce4d7` | `max-jobs-sighup` |  | Tests: a vanished client's builds end; a client notices a vanished daemon |  |
+| 12 | `balancer-reset-broken-stream` | `18e97e5102ea195afa743822c7d2209a4e4a426e` | `upload-resend-missing` | uses cutOff() from upload-resend-missing (does not build without it) | Take a balancer's reset for a broken stream |  |
+| 13 | `farm-test-split` | `fd267825d93842f69b59358a7cd33f67909e4607` | `lost-input-recovery`, `max-jobs-sighup`, `farm-cutoff-tests`, `drain-waits-for-uploads`, `follow-broken-stream`, `upload-resend-missing` | moves the farm tests of each topic it is stacked on | Split the farm VM test into three checks (moves the tests of the topics it is based on) |  |
+| 14 | `dispatcher-session-tests` | `783a3c4637d5cbf7158297c29bdae8ac8b70318c` | `max-jobs-sighup` | its test sends Load.max_jobs from max-jobs-sighup (does not build without it) | Dispatcher tests: a builder's old and new sessions |  |
+| 15 | `build-leases` | `09e565a139bab53a953194fa17225ab6641fb019` | `dispatcher-session-tests` | its dispatcher tests use the fixture of dispatcher-session-tests (does not build without it) | Leases: the scheduler keeps builds for a lease carried by id until Release; client settings; lease VM checks; its dispatcher tests (linger cap, revokes waited for) |  |
+| 16 | `image-daemon-check` | `3809654c71b1ab151fb807cf06f2ddffbd551260` | `build-leases` | its check sits in the attribute set the lease checks added | A check that builds the images' daemon against nixpkgs' Nix |  |
+| 17 | `integ/daemon-floating-ca` | `01bef60c4b227e49b7735c66a6e9cdbee4438309` | `farm-test-split` |  | Build floating content-addressed derivations; offer the system features nix-daemon builds with; farm-ca and floating checks | Mic92/nix-grpc-store PR 260 (open; PR head differs) |
+| 18 | `disk-full-give-back` | `5c22111d73dcd23cdb21030c2e09b1107defd716` | `balancer-reset-broken-stream`, `farm-test-split`, `build-leases` | balancer-reset-broken-stream: extends its retry classification; farm-test-split: its tests are in scheduling.rs; build-leases: changes option lines next to the lease options | Give a drv back when out of space; answer for a full disk; drop --min-free and low_disk |  |
+| 19 | `field-8-compat` | `9bc27ae367643efb56d6865e87b6bfe83818b1d5` | `build-leases` |  | Read and send the refused assignment as Want field 8 too (wire compatibility with older clients/schedulers) |  |
+| 20 | `publish-failure-avoid` | `86efd3fd5752a5b145b179159de3b0c451d1eadc` | `farm-test-split` |  | Keep a builder that cannot publish out of the way |  |
+| 21 | `pass-clang-tidy` | `10fd7b96491f58ce300f4d9bd27d6c96c18e6b73` | `disk-full-give-back` | restores the include disk-full-give-back's option removal took | Pass clang-tidy after the 2026-11-17 rebase |  |
+| 22 | `cutoffs-follow-upstream` | `0874987ca551b1ea6dd9c14b6f7d00e33d25c2f0` | `farm-test-split` |  | Cutoffs tests follow upstream renames |  |
+| 23 | `tunnel-takeover-test` | `e6523553b6ab18c1d0dca30f81030d5b8cb0e869` | `single-node-takeover` |  | Test: tunnels across a takeover |  |
+| 24 | `nix-master-compat` | `cd2534e559b2f8a38d77bc2bd8447dfd869d5008` | `farm-test-split`, `build-leases` | farm-test-split: cutoffs.rs; build-leases: fixes the lease client lines for clang-tidy | Pass clang-tidy against Nix master; pause nix-daemon workers by unit |  |
+| 25 | `integ/nar-fetcher-fail-session-together` | `1b940069454dbe8bf727b831d82073e3dddf6031` |  |  | Fail a NAR session's paths together (upstream merged its own form after this base) | PR 346 (merged, reworded) |
+| 26 | `keepalive-test-ports` | `244cb553414983e39a70c93c7cd50ab38a2fe0e2` | `keepalive-tests` |  | Keepalive tests' daemons pick their own ports; the daemon keeps its --listen port to itself |  |
+| 27 | `integ/nar-fetcher-record-once` | `f24e3150cbfe93a183f3ed841400570688c68553` |  |  | Ask for a path recorded twice only once (upstream merged its own form after this base) | PR 337 (merged, reworded) |
+| 28 | `query-missing-batch` | `091c5969d30e8151379ac03e7619c9af15fd6542` | `eval-store-query-missing`, `keepalive-test-ports` | eval-store-query-missing: batches that topic's queryMissing walk; keepalive-tests: uses its test daemon helper | queryMissing asks validity in batches; untrusted clients keep the output map off the tunnel; drop the pre-QueryMissing fallback |  |
+| 29 | `lazy-grpc-load` | `4d66a53ad0513a5b8e90339daea81ea0bf37ef6e` | `keepalive-tests`, `nix-master-compat` | keepalive-tests and nix-master-compat: changes channel and store code lines they added | Load gRPC only when a grpc:// store is opened |  |
+| 30 | `remove-unused-code` | `23d6f875cde185459418c9651c6d4fe3ba92c4d0` | `lazy-grpc-load` |  | Remove unused code and includes |  |
+| 31 | `require-nix-2-34` | `61c8b40ba8503609d2ca3ca85300ab7d0d267cfb` | `query-missing-batch`, `lazy-grpc-load` | removes compatibility branches query-missing-batch and lazy-grpc-load added | Require Nix >= 2.34 |  |
+| 32 | `latest-placement-id` | `5496bdfa9f8aa692fb7e8c5d79c5816e7e618ba4` | `reschedule-unreached-worker`, `dispatcher-session-tests` | reschedule-unreached-worker: Builder::callEnded; dispatcher-session-tests: the dispatcher test fixture (does not build without either) | Name the latest placement of a build placed here again |  |
+| 33 | `givers-in-turn-test` | `f5d1fb82448d926c0e29c6c2ecd655689ac178a9` |  |  | Test: a drv given back again and again goes to its givers in turn |  |
+| 34 | `build-log-whole-test` | `048d7593fcf294dc13f3dae4f3644f93a2f7d9af` |  |  | Test: a build log of several GetBuildLog messages arrives whole |  |
+| 35 | `topo-sort-prefetch-absent` | `ea2f3d0a669fd9322e0c6f939331c2044822f1b0` | `query-missing-batch` |  | Take a path the topoSortPaths prefetch left out as absent |  |
+| 36 | `integ/call-test-interrupt-race` | `1b99c4848d4c39cc5649cf44966456920df60b35` |  |  | Race interrupts against calls in flight (upstream merged its own form after this base) | PR 345 (merged, reworded) |
+| 37 | `integ/tests-event-waits` | `76d2de3a86ec354410522d29cfdc08a8d00b3a94` | `integ/daemon-floating-ca`, `disk-full-give-back`, `field-8-compat`, `publish-failure-avoid`, `tunnel-takeover-test`, `keepalive-test-ports`, `latest-placement-id` | rewrites the waits in the tests of every topic it is stacked on; field-8-compat and latest-placement-id because it rewrites their dispatcher tests | Tests wait on events without deadlines (71 commits). Contains 9 commits that touch src/: daemon closes idle tunnels at a hand-over (c1660707), takes the tunnels' address once they exist (7eca99c3), stops the tunnels before the server at a takeover (cbcb848e), hand-over as its own step (013f16f7), builder counts a call's wait (eea52c78), push wait without cancel polls nothing (71ccb680), every niks3 wait takes a cancel function (1be42349), one daemon-probe patience constant (56680719), and comment-only changes in sd-notify.hh/takeover.hh (cdc95413) |  |
+| 38 | `oidc-config-outside-main` | `0840a433ebe829add2ae05eb32bd4682265cfa18` |  |  | Load the OIDC config outside main (clang-tidy complexity) |  |
+| 39 | `takeover-placements` | `22d450c2b8d67f3f3fff5f9b5e23a27f9df59398` | `integ/tests-event-waits` | integ/tests-event-waits: its tests use the event waits (and that base has latest-placement-id and field-8-compat, whose Want field 8 and placement ids its tests use) | After a takeover: a build running where another scheduler placed it takes no slot; settle a placement nobody claims from the node's own store |  |
+| 40 | `cancelled-retry` | `000f8f808c2890186a892f60c2822841172d1ac5` | `balancer-reset-broken-stream`, `integ/nar-fetcher-fail-session-together` | balancer-reset-broken-stream: the same retry classifier; integ/nar-fetcher-fail-session-together: the NAR fetcher's retry | Retry a call a daemon's shutdown cut with "CANCELLED" |  |
+| 41 | `attach-other-limits-outputs` | `9a31f00785898de55de33e10e109d5671efe0735` | `integ/tests-event-waits` | farm-test-split: its test is in scheduling.rs; integ/tests-event-waits: its test uses the event-wait helpers (retry with units, wait_unit_done) and does not compile without them | A caller attached with other limits gets the outputs the build made |  |
+| 42 | `fetchnars-resume` | `3127ad07b6e5fa3c58504e2c7c0fb7eecffc1d36` | `integ/tests-event-waits`, `cancelled-retry` | integ/tests-event-waits: extends the tunnel-takeover test as rewritten there; cancelled-retry: the NAR fetcher's retry | Resume a NAR fetch where the stream was cut off; retry budget anew; refuse a different NAR; tests |  |
+| 43 | `niks3-fork-pin` | `abb72da3915b0f09e1d2ed30c183dae0b9b07209` |  |  | flake: niks3 from the fork, at its lost-NAR fix |  |
+| 44 | `scheduler-uncap-max-jobs` | `b453aa8a0a10d0a25d812e8b89a236685596c5b6` | `pass-clang-tidy`, `require-nix-2-34`, `oidc-config-outside-main` | require-nix-2-34: uses the Nix >= 2.34 settings API; oidc-config-outside-main and pass-clang-tidy: clang-tidy passes on this branch only with both (main()'s complexity; options.cc includes and builder-test fixes) | Take max-jobs as stated, and rank free slots exactly |  |
+| 45 | `greet-with-drain` | `4f9a9ed2dcad994d05f5af077278a47bf681cd13` | `takeover-placements` | changes takeover-placements' greet path | Greet with the drain in the same message as the Hello |  |
+| 46 | `greeter-stop-before-finalize` | `99c8b4566b161765ad9bce9ec7460ce612f92f88` | `keepalive-test-ports` |  | Tests: stop the greeter before the interpreter finalizes |  |
+
+21 of 46 merges resolve overlaps; each names its files in its message.
+
+The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
+
+`maintainers/integration-status.sh [remote]` compares each row with the remote: branch head, and whether that head is merged here.
+
