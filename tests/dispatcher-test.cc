@@ -1,20 +1,29 @@
 // The Dispatcher driven through the calls its transports make, without gRPC.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <initializer_list>
+#include <ios>
 #include <memory>
 #include <optional>
+#include <print>
 #include <string>
 #include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <absl/base/thread_annotations.h>
 
@@ -1377,6 +1386,75 @@ void aSystemWithOnlyTunnelledBuildersGetsTheDialledOnes()
     farm.disp.workerGone(tunnelled.conn);
 }
 
+// The thread `tid` sleeps in a write to our stderr.
+auto writesToStderr(pid_t tid) -> bool // NOLINT(misc-include-cleaner): pid_t comes from <sys/types.h>.
+{
+    std::ifstream stat("/proc/self/task/" + std::to_string(tid) + "/stat");
+    std::string line;
+    std::getline(stat, line);
+    auto const end = line.rfind(')');
+    if (end == std::string::npos || end + 2 >= line.size() || line.at(end + 2) != 'S') {
+        return false;
+    }
+    std::ifstream syscall("/proc/self/task/" + std::to_string(tid) + "/syscall");
+    long number = -1;
+    long descriptor = -1;
+    return syscall >> number >> std::hex >> descriptor && number == SYS_write && descriptor == STDERR_FILENO;
+}
+
+// Lock writes the lines of its critical section once the mutex is released,
+// through the log queue: a held-up stderr holds up neither scheduling nor the
+// thread that releases the lock. With our stderr a full pipe that nobody
+// reads, a worker that greeted then leaves: workerGone, which logs
+// worker_gone, must return; one found asleep writing to stderr cannot, as
+// nothing reads the pipe until the test is done. A step count, not a clock,
+// bounds the wait. Then the pipe is read, and the line must be on it.
+void aStalledStderrHoldsUpNoScheduling()
+{
+    constexpr int steps = 1'000'000;
+    Farm farm;
+    Session session;
+    farm.hello(session.conn, "w:1");
+    nixgrpc::flushLog(); // what was logged before goes where stderr was
+    int const ourStderr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    std::array<int, 2> err{};
+    assert(ourStderr >= 0 && pipe2(err.data(), O_CLOEXEC) == 0);
+    auto const [readSide, writeSide] = err;
+    std::string const room(static_cast<size_t>(fcntl(writeSide, F_GETPIPE_SZ)), '\0'); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    assert(write(writeSide, room.data(), room.size()) == static_cast<ssize_t>(room.size()) && dup2(writeSide, STDERR_FILENO) >= 0);
+    std::atomic<pid_t> tid = 0;
+    std::atomic<bool> returned = false;
+    std::thread leaving([&] -> void {
+        tid = gettid();
+        farm.disp.workerGone(session.conn);
+        returned = true;
+    });
+    bool held = false;
+    for (int step = 0; step < steps && !returned && !held; step++) {
+        held = tid != 0 && writesToStderr(tid);
+        std::this_thread::yield();
+    }
+    bool const leftAtOnce = returned;
+    std::string said;
+    std::thread reader([&] -> void {
+        constexpr size_t chunkBytes = 4096;
+        std::array<char, chunkBytes> chunk{};
+        for (ssize_t got = 0; (got = read(readSide, chunk.data(), chunk.size())) > 0;) {
+            said.append(chunk.data(), static_cast<size_t>(got));
+        }
+    });
+    leaving.join();
+    nixgrpc::flushLog();
+    dup2(ourStderr, STDERR_FILENO);
+    close(writeSide);
+    reader.join();
+    close(readSide);
+    close(ourStderr);
+    std::println("dispatcher-test: stalled stderr: returned={} held={}", leftAtOnce, held);
+    assert(leftAtOnce && "a worker leaving waited behind a stalled stderr write");
+    assert(said.contains("event=worker_gone") && "the line of a worker leaving is missing from our stderr");
+}
+
 } // namespace
 
 auto main() -> int
@@ -1416,6 +1494,7 @@ try {
     aBuildLostWithThePredecessorIsPlacedHere();
     aPhantomWhoseOutputsTheNodeHasFreesItsSlot();
     aBuilderThatGreetsDrainingIsPlacedNothing();
+    aStalledStderrHoldsUpNoScheduling();
     return 0;
 } catch (std::exception &) {
     return 1;

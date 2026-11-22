@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <ios>
 #include <optional>
@@ -33,6 +34,7 @@
 
 #include <nix/util/file-descriptor.hh>
 
+#include "logfmt.hh"
 #include "push.hh"
 
 // While the test sends our stderr to a file, a crash would lose what it
@@ -315,6 +317,7 @@ void aLogDoesNotWaitForTheChild()
         std::ranges::copy(stderrFile.string(), capturedPath.begin());
         capturedPath.at(stderrFile.string().size()) = '\0';
         replayTo = ourStderr.get();
+        nixgrpc::flushLog(); // what was logged before goes where stderr was
         assert(dup2(file.get(), STDERR_FILENO) != -1);
     }
     auto const openGate = [&] -> void {
@@ -431,23 +434,6 @@ auto pidIn(const std::filesystem::path & file) -> std::optional<std::string>
     return text.substr(0, end);
 }
 
-// Nothing but `self` can move: every other thread of ours sleeps, none on a
-// write to the child, and the child sleeps too, reading what we send it.
-auto settled(const std::string & self, const std::optional<std::string> & child) -> bool
-{
-    return child && processState(*child) == 'S' && std::ranges::all_of(threads(), [&](const std::string & tid) -> bool {
-        if (tid == self) {
-            return true;
-        }
-        auto const sleeping = task(tid);
-        if (sleeping.state != 'S') {
-            return false;
-        }
-        auto const descriptor = sleepsWritingTo(sleeping);
-        return !descriptor || *descriptor <= STDERR_FILENO || !isPipe(*descriptor);
-    });
-}
-
 // How a step that waits for another thread ended.
 enum class Wait : std::uint8_t
 {
@@ -456,32 +442,43 @@ enum class Wait : std::uint8_t
     // The child is gone: nothing of ours can be read as held up behind it,
     // and nothing it was to do will happen.
     childEnded,
-    // dropWithin readings found the step neither done nor held up.
+    // unheldReadings readings found the step neither done nor held up.
     noAnswer,
 };
 
-// Reads until `done` holds, or until nothing but `self` can move three
-// readings running with `steady` holding at each: then the step is held up.
-// Each reading takes settled before `done`: a thread or child that moved in
-// between reads as unsettled then, or `done` sees what it did.
-template<typename Done, typename Steady>
-auto await(const std::string & self, const std::filesystem::path & childPid, Done done, Steady steady) -> Wait
+// What a step of the stalled-stderr tests guards against, read directly: a
+// thread of ours other than the log writer asleep writing to our stderr,
+// which nothing reads until the test is done, so it sleeps there for good.
+// A correct run never shows it, however slow it is.
+auto heldOnOurStderr(const std::filesystem::path & /*childPid*/) -> bool
 {
-    constexpr int sameAnswers = 3;
-    int answers = 0;
-    for (int i = 0; i < dropWithin; i++) {
-        auto const child = pidIn(childPid);
-        bool const still = settled(self, child);
+    return std::ranges::any_of(threads(), [](const std::string & tid) -> bool {
+        return firstLine("/proc/self/task/" + tid + "/comm") != "log-writer" && sleepsWritingTo(task(tid)) == STDERR_FILENO;
+    });
+}
+
+// Reads until `done` holds, or the step is read held up on our stderr
+// (heldOnOurStderr). Each reading takes the hold before `done`: a caller
+// that returned in between is read as done. A child that is gone ends the
+// step, unless `childMayEnd`: nothing it was to do will happen then. Held
+// up is never read on a correct run; what bounds a correct step is
+// unheldReadings readings, a liveness bound: a step neither done nor held
+// within them ends as noAnswer, and the test fails saying which step.
+template<typename Done>
+auto awaitUnheld(const std::filesystem::path & childPid, Done done, bool childMayEnd = false) -> Wait
+{
+    constexpr long unheldReadings = 10L * dropWithin;
+    for (long i = 0; i < unheldReadings; i++) {
+        bool const held = heldOnOurStderr(childPid);
         if (done()) {
             return Wait::done;
         }
-        // Exited, reaped or not, or killed: '?' is a pid that no longer reads.
-        if (child && std::string_view("ZXx?").contains(processState(*child))) {
-            return Wait::childEnded;
-        }
-        answers = still && steady() ? answers + 1 : 0;
-        if (answers == sameAnswers) {
+        if (held) {
             return Wait::heldUp;
+        }
+        auto const child = pidIn(childPid);
+        if (!childMayEnd && child && std::string_view("ZXx?").contains(processState(*child))) {
+            return Wait::childEnded;
         }
         std::this_thread::yield();
     }
@@ -514,27 +511,28 @@ void endChild(const std::filesystem::path & childPid)
 }
 
 // A log line that cannot be written holds up the thread that writes it, as
-// every logLine does, and nothing else: not the log writer, nor another
-// pushLog. With the queue full and the log writer held up by the child, a
-// first caller drops the oldest log while our stderr is a full pipe that
-// nobody reads, and sleeps writing that it did. Then the child reads all it
-// is sent, and the queue must drain to it, and a second pushLog must
-// return. A queue that stays put while nothing of ours or the child's can
-// move, read three times running with the child's output unchanged, is held
-// up; so is a second caller asleep while every other thread is. Only then
-// is our stderr read, which lets the first caller go. Each step that waits
-// for the next gives up after dropWithin readings and says which, and fails
-// at once, saying so, if the child has ended: then nothing can move, and
-// the child is not there to be read as settled. After a step without an
-// answer every child PushProcess starts is ended until it has ended, so that
-// it can; however the test is left, the gate opens before PushProcess ends.
+// every logLine does, and nothing else: not the caller whose log it names,
+// nor the log writer, nor another pushLog. With the queue full and the log
+// writer held up by the child, a first caller logs while our stderr is a
+// full pipe that nobody reads, until a thread of ours sleeps writing that a
+// log was dropped; the first caller must return rather than be that
+// thread. Then the child reads all it is sent, and the queue must drain to
+// it, and a second pushLog must return. A step is held up once a thread of
+// ours other than the log writer is found asleep writing to our stderr
+// (heldOnOurStderr), which a correct run never shows. Only then is our
+// stderr read, which lets the line's writer go. Each step that waits for the
+// next ends as awaitUnheld says: done, held up, without an answer, or with
+// the child ended, when nothing it was to do will happen. After a step
+// without an answer every child PushProcess starts is ended until it has
+// ended, so that it can; however the test is left, the gate opens before
+// PushProcess ends.
 //
 // Known limits: a pushLog that spins, or sleeps on something other than our
-// stderr or the child, is never read as held up; its step has no answer
-// after dropWithin readings, and the test then hangs joining it instead of
+// stderr, is never read as held up; its step has no answer after
+// unheldReadings readings, and the test then hangs joining it instead of
 // failing. An exception while our stderr is the full pipe ends the test in
-// std::terminate, whose message waits for stderr behind the first caller's
-// write, which waits for room: the test hangs.
+// std::terminate, whose message waits for stderr behind the stalled write,
+// which waits for room: the test hangs.
 void aStalledStderrHoldsUpOnlyItsWriter()
 {
     constexpr mode_t ownerOnly = S_IRUSR | S_IWUSR;
@@ -562,6 +560,7 @@ void aStalledStderrHoldsUpOnlyItsWriter()
         std::ranges::copy(stderrFile.string(), capturedPath.begin());
         capturedPath.at(stderrFile.string().size()) = '\0';
         replayTo = ourStderr.get();
+        nixgrpc::flushLog(); // what was logged before goes where stderr was
         assert(dup2(file.get(), STDERR_FILENO) != -1);
     }
     // The child now reads all it is sent.
@@ -575,7 +574,8 @@ void aStalledStderrHoldsUpOnlyItsWriter()
     };
     bool filled = false;
     bool gaveWay = false;
-    bool firstStalled = false;
+    bool stderrStalled = false;
+    bool firstReturned = false;
     bool drained = false;
     bool secondReturned = false;
     // A step that waited and found neither its answer nor that it was held up.
@@ -624,60 +624,65 @@ void aStalledStderrHoldsUpOnlyItsWriter()
                 assert(room > 0);
                 nix::writeFull(err.writeSide.get(), std::string(static_cast<size_t>(room), '\0'));
             }
+            nixgrpc::flushLog(); // what was logged before goes where stderr was
             assert(dup2(err.writeSide.get(), STDERR_FILENO) != -1);
 
+            // The first caller logs until told to stop: the queue may have
+            // room again (a log writer read asleep in its write may have
+            // been only slow), and only a log that drops another has a line
+            // to write.
             std::atomic<int> firstTid = 0;
+            std::atomic<bool> firstDone = false;
+            std::atomic<bool> stopFirst = false;
+            std::atomic<int> lastFirst = 0;
             std::thread first([&] -> void {
                 firstTid = gettid();
-                push.pushLog(drv("first"));
+                for (int seq = 0; seq < dropWithin && !stopFirst; seq++) {
+                    push.pushLog(drv("first-" + std::to_string(seq)));
+                    lastFirst = seq;
+                }
+                firstDone = true;
             });
-            for (int i = 0; i < dropWithin && !firstStalled; i++) {
-                firstStalled = firstTid != 0 && sleepsWritingTo(task(std::to_string(firstTid))) == STDERR_FILENO;
+            auto const writesToStderr = [](const std::string & tid) -> bool {
+                return sleepsWritingTo(task(tid)) == STDERR_FILENO;
+            };
+            // Ends: a line saying the oldest log was dropped goes to the
+            // full pipe, and a write there sleeps.
+            for (int i = 0; i < dropWithin && !stderrStalled && !firstDone; i++) {
+                stderrStalled = std::ranges::any_of(threads(), writesToStderr);
+                std::this_thread::yield();
+            }
+            stopFirst = true;
+            // Ends: the first caller returns, or sleeps writing that line itself.
+            bool firstHeld = false;
+            for (int i = 0; i < dropWithin && stderrStalled && !(firstReturned = firstDone) && !firstHeld; i++) {
+                firstHeld = firstTid != 0 && writesToStderr(std::to_string(firstTid));
                 std::this_thread::yield();
             }
 
-            std::atomic<int> secondTid = 0;
             std::atomic<bool> secondDone = false;
             std::optional<std::thread> second;
-            if (firstStalled) {
+            if (stderrStalled) {
                 openGate();
-                std::string const self = std::to_string(gettid());
                 auto const finished = [&](Wait const wait, const char * step) -> bool {
                     if (unanswered.empty() && wait == Wait::childEnded) {
                         unanswered = std::string("the child ended while ") + step + ": nothing could move it";
                     } else if (unanswered.empty() && wait == Wait::noAnswer) {
-                        unanswered = std::string("no answer within dropWithin readings while ") + step;
+                        unanswered = std::string("no answer within unheldReadings readings while ") + step;
                     }
                     return wait == Wait::done;
                 };
-                std::string sent;
-                size_t lastSize = 0;
                 drained = finished(
-                    await(
-                        self,
-                        childPid,
-                        [&] -> bool {
-                            sent = contents(childOut);
-                            return sent.contains(drv("first"));
-                        },
-                        [&] -> bool {
-                            bool const same = sent.size() == lastSize;
-                            lastSize = sent.size();
-                            return same;
-                        }),
+                    awaitUnheld(childPid, [&] -> bool { return contents(childOut).contains(drv("first-" + std::to_string(lastFirst))); }),
                     "the queue drained to the child");
 
                 // A step with no answer leaves nothing the next could rely on.
                 if (unanswered.empty()) {
                     second.emplace([&] -> void {
-                        secondTid = gettid();
                         push.pushLog(drv("second"));
                         secondDone = true;
                     });
-                    secondReturned = finished(
-                        await(
-                            self, childPid, [&] -> bool { return secondDone; }, [&] -> bool { return secondTid != 0; }),
-                        "a second pushLog returned");
+                    secondReturned = finished(awaitUnheld(childPid, [&] -> bool { return secondDone; }), "a second pushLog returned");
                 }
                 if (!unanswered.empty()) {
                     ender = std::jthread([&](const std::stop_token & stop) -> void {
@@ -689,7 +694,7 @@ void aStalledStderrHoldsUpOnlyItsWriter()
                 }
             }
 
-            // Read our stderr: the first caller, and any caller held up
+            // Read our stderr: the line's writer, and any caller held up
             // behind it, goes on; so does one that waits for the child.
             openGate();
             std::thread reader([&, readSide = err.readSide.get()] -> void { stalled = nix::drainFD(readSide); });
@@ -704,12 +709,13 @@ void aStalledStderrHoldsUpOnlyItsWriter()
     }
     replayCaptured();
     dup2(ourStderr.get(), STDERR_FILENO);
-    // The pipe was filled with NULs before the first caller wrote to it.
+    // The pipe was filled with NULs before the drop's line went to it.
     if (auto const start = stalled.find_first_not_of('\0'); start != std::string::npos) {
         static_cast<void>(std::fputs(stalled.substr(start).c_str(), stderr));
     }
     static_cast<void>(std::fputs(
-        ("push-test: drained=" + std::to_string(static_cast<int>(drained))
+        ("push-test: firstReturned=" + std::to_string(static_cast<int>(firstReturned))
+         + " drained=" + std::to_string(static_cast<int>(drained))
          + " secondReturned=" + std::to_string(static_cast<int>(secondReturned)) + "\n")
             .c_str(),
         stderr));
@@ -718,10 +724,177 @@ void aStalledStderrHoldsUpOnlyItsWriter()
     }
     assert(filled && "no write to the child slept within dropWithin logs");
     assert(gaveWay && "the queue never gave way: no build_log_dropped within dropWithin logs");
-    assert(firstStalled && "the first caller did not sleep writing to stderr within dropWithin readings");
+    assert(stderrStalled && "nothing slept writing to stderr within dropWithin readings");
+    assert(firstReturned && "a pushLog that dropped a log waited behind a stalled stderr write");
     assert(unanswered.empty() && "a step that waits had no answer: the push-test: line before says which");
     assert(drained && "the log writer waited behind a stalled stderr write");
     assert(secondReturned && "a second pushLog waited behind a stalled stderr write");
+    std::filesystem::remove_all(dir);
+}
+
+// A pushWait of ours, run on a thread of its own.
+struct Call
+{
+    std::atomic<int> tid = 0;
+    std::atomic<bool> done = false;
+    std::atomic<bool> threw = false;
+};
+
+// A build's result waits for its paths' acks, and nothing it waits for
+// writes to our stderr: not the caller that starts the child, nor the ack
+// reader as an ack ends a build log's upload, nor the ack reader as the child
+// exits, failing a build log's upload with it. With our stderr a full pipe
+// that nobody reads from the start, and a child that acks each request, a
+// pushWait must return, starting the child; so must one acked after a build
+// log's ack; with a build log the child does not ack, a request the child
+// exits on must fail its pushWait, and the next pushWait must start another
+// child and return. A step is held up once a thread of ours other than the
+// log writer is found asleep writing to our stderr (heldOnOurStderr): the defects the steps exist for,
+// which a correct run never shows, however slow. The first step not done ends the steps:
+// those after it would wait behind it. Then our stderr is read, which lets
+// everything go, and every line logged must reach it: each child's start and
+// exit, and each build log's outcome.
+//
+// Known limits: as aStalledStderrHoldsUpOnlyItsWriter's, and a step without
+// an answer leaves its caller to end with the child, which the test does not
+// end for it.
+void aStalledStderrHoldsUpNoPushWait()
+{
+    std::string unique = (std::filesystem::temp_directory_path() / "push-test-XXXXXX").string();
+    if (mkdtemp(unique.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    auto const dir = std::filesystem::path(unique);
+    auto const childPid = dir / "child-pid";
+    auto const childIn = dir / "child-stdin";
+    nix::AutoCloseFD const ourStderr{fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)}; // NOLINT(cppcoreguidelines-pro-type-vararg)
+    assert(ourStderr);
+    auto const path = [](const std::string & name) -> std::string {
+        return "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-" + name;
+    };
+    bool started = false;
+    bool afterLog = false;
+    bool failedOnExit = false;
+    bool restarted = false;
+    std::string unanswered;
+    std::string stalled;
+    {
+        // No assertion may fail while our stderr is this pipe: its message
+        // would wait for room too.
+        nix::Pipe err;
+        err.create();
+        {
+            int const room = fcntl(err.writeSide.get(), F_GETPIPE_SZ); // NOLINT(cppcoreguidelines-pro-type-vararg)
+            assert(room > 0);
+            nix::writeFull(err.writeSide.get(), std::string(static_cast<size_t>(room), '\0'));
+        }
+        nixgrpc::flushLog(); // what was logged before goes where stderr was
+        assert(dup2(err.writeSide.get(), STDERR_FILENO) != -1);
+        std::thread reader;
+        {
+            // Each child writes its pid, records what it is sent, and acks
+            // each request but one for a path ending in "-hold", which it
+            // leaves, and one ending in "-exit", on which it exits.
+            std::optional<nixgrpc::PushProcess> push;
+            push.emplace(nixgrpc::PushProcess::Argv{
+                "sh",
+                "-c",
+                R"(echo $$ > "$0"; while IFS= read -r line; do printf '%s\n' "$line" >> "$1"; case $line in *-exit*) exit ;; *-hold*) continue ;; esac; id=${line#*\"id\":}; printf '{"id":%s,"status":"ok"}\n' "${id%%,*}"; done)",
+                childPid.string(),
+                childIn.string()});
+            std::deque<Call> calls;
+            std::vector<std::thread> callers;
+            auto const call = [&](const std::string & name) -> Call & {
+                Call & one = calls.emplace_back();
+                callers.emplace_back([&push, &path, ours = &one, name] -> void {
+                    ours->tid = gettid();
+                    try {
+                        push->pushWait({path(name)}, [] -> bool { return false; });
+                    } catch (...) {
+                        ours->threw = true;
+                    }
+                    ours->done = true;
+                });
+                return one;
+            };
+            auto const finished = [&](Wait const wait, const char * step) -> bool {
+                if (unanswered.empty() && wait == Wait::childEnded) {
+                    unanswered = std::string("the child ended while ") + step;
+                } else if (unanswered.empty() && wait == Wait::noAnswer) {
+                    unanswered = std::string("no answer within unheldReadings readings while ") + step;
+                }
+                return wait == Wait::done;
+            };
+            auto const returns = [&](Call & one, const char * step) -> bool {
+                return finished(awaitUnheld(childPid, [&] -> bool { return one.done; }), step) && !one.threw;
+            };
+
+            // A build log, sent once the child has its request.
+            auto const sendsLog = [&](const std::string & name) -> bool {
+                push->pushLog(path(name));
+                return finished(
+                    awaitUnheld(childPid, [&] -> bool { return contents(childIn).contains(path(name)); }),
+                    "a build log went to the child");
+            };
+
+            started = returns(call("first"), "a pushWait started the child");
+            if (started) {
+                // Its ack goes to the ack reader ahead of the next request's.
+                afterLog = sendsLog("log.drv") && returns(call("after-log"), "a pushWait was acked after the build log");
+            }
+            if (afterLog && sendsLog("hold.drv")) {
+                Call & exiting = call("exit");
+                failedOnExit = finished(awaitUnheld(childPid, [&] -> bool { return exiting.done; }, /*childMayEnd=*/true), "the child exited")
+                               && exiting.threw;
+            }
+            if (failedOnExit) {
+                // The next child writes its own.
+                std::filesystem::remove(childPid);
+                restarted = returns(call("next"), "a pushWait started the next child");
+            }
+
+            reader = std::thread([&, readSide = err.readSide.get()] -> void { stalled = nix::drainFD(readSide); });
+            for (auto & caller : callers) {
+                caller.join();
+            }
+            push.reset();
+        }
+        // Every line logged goes to the pipe before our stderr is back.
+        nixgrpc::flushLog();
+        // The children had the pipe as their stderr too: they are gone.
+        dup2(ourStderr.get(), STDERR_FILENO);
+        err.writeSide.close();
+        reader.join();
+    }
+    // The pipe was filled with NULs before anything of ours wrote to it.
+    if (auto const start = stalled.find_first_not_of('\0'); start != std::string::npos) {
+        static_cast<void>(std::fputs(stalled.substr(start).c_str(), stderr));
+    }
+    static_cast<void>(std::fputs(
+        ("push-test: started=" + std::to_string(static_cast<int>(started)) + " afterLog="
+         + std::to_string(static_cast<int>(afterLog)) + " failedOnExit=" + std::to_string(static_cast<int>(failedOnExit))
+         + " restarted=" + std::to_string(static_cast<int>(restarted)) + "\n")
+            .c_str(),
+        stderr));
+    if (!unanswered.empty()) {
+        static_cast<void>(std::fputs(("push-test: " + unanswered + "\n").c_str(), stderr));
+    }
+    assert(unanswered.empty() && "a step that waits had no answer: the push-test: line before says which");
+    assert(started && "a pushWait that started the child waited behind a stalled stderr write");
+    assert(afterLog && "a pushWait acked after a build log waited behind a stalled stderr write");
+    assert(failedOnExit && "a pushWait whose child exited waited behind a stalled stderr write");
+    assert(restarted && "a pushWait after the child exited waited behind a stalled stderr write");
+    auto const times = [&](const std::string & line) -> size_t {
+        size_t count = 0;
+        for (size_t at = 0; (at = stalled.find(line, at)) != std::string::npos; at += line.size()) {
+            count++;
+        }
+        return count;
+    };
+    assert(times("event=niks3_push_started") == 2 && "a child's start is missing from our stderr");
+    assert(times("event=build_log_pushed drv=" + path("log.drv")) == 1 && "a build log's upload is missing from our stderr");
+    assert(times("event=build_log_push_failed drv=" + path("hold.drv")) == 1 && "a failed build log upload is missing from our stderr");
+    assert(times("event=niks3_push_exited") == 2 && "a child's exit is missing from our stderr");
     std::filesystem::remove_all(dir);
 }
 
@@ -752,6 +925,7 @@ try {
     }
     aLogDoesNotWaitForTheChild();
     aStalledStderrHoldsUpOnlyItsWriter();
+    aStalledStderrHoldsUpNoPushWait();
     return 0;
 } catch (std::exception & err) {
     replayCaptured();

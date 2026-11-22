@@ -3,18 +3,28 @@
 // metric shows which ones hold.
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <future>
 #include <optional>
+#include <ios>
 #include <print>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include "builder.hh"
+#include "logfmt.hh"
 #include "metrics.hh"
 #include "nix_remote.pb.h"
 #include "scheduler.hh"
@@ -546,6 +556,8 @@ auto attacherTakes(nix::remote::Done::Outcome outcome, const std::array<uint64_t
     return attacher && attacher->attach && attacher->shared->serves(want);
 }
 
+auto aStalledStderrHoldsUpNoPublish() -> bool;
+
 auto run() -> int
 {
     if (!attacherTakes(nix::remote::Done::BUILT, {0, 0, otherSilent})) {
@@ -632,6 +644,10 @@ auto run() -> int
         std::println("FAIL an upload for a claimed drv does not keep its claim");
         return EXIT_FAILURE;
     }
+    if (!aStalledStderrHoldsUpNoPublish()) {
+        std::println("FAIL a stalled stderr holds up a publish");
+        return EXIT_FAILURE;
+    }
     nixgrpc::Metrics metrics{""};
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     std::vector<bool> told;
@@ -662,6 +678,92 @@ auto run() -> int
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
+}
+
+// The thread `tid` sleeps in a write to our stderr.
+auto writesToStderr(pid_t tid) -> bool // NOLINT(misc-include-cleaner): pid_t comes from <sys/types.h>.
+{
+    std::ifstream stat("/proc/self/task/" + std::to_string(tid) + "/stat");
+    std::string line;
+    std::getline(stat, line);
+    auto const end = line.rfind(')');
+    if (end == std::string::npos || end + 2 >= line.size() || line.at(end + 2) != 'S') {
+        return false;
+    }
+    std::ifstream syscall("/proc/self/task/" + std::to_string(tid) + "/syscall");
+    long number = -1;
+    long descriptor = -1;
+    return syscall >> number >> std::hex >> descriptor && number == SYS_write && descriptor == STDERR_FILENO;
+}
+
+// Builder::published tells our stderr that publishing began failing, or works
+// again, under the lock every publish takes. With our stderr a full pipe that
+// nobody reads, a publish that turns it to failing, and then one that turns
+// it back, must each return: one found asleep writing to stderr cannot, as
+// nothing reads the pipe until the test is done. A step count, not a clock,
+// bounds each wait; the first that does not return ends the steps. Then the
+// pipe is read, which lets everything go.
+auto aStalledStderrHoldsUpNoPublish() -> bool
+{
+    constexpr int steps = 1'000'000;
+    nixgrpc::Metrics metrics{""};
+    Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
+    nixgrpc::flushLog(); // what was logged before goes where stderr was
+    int const ourStderr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    std::array<int, 2> err{};
+    if (ourStderr < 0 || pipe2(err.data(), O_CLOEXEC) != 0) {
+        return false;
+    }
+    auto const [readSide, writeSide] = err;
+    std::string const room(static_cast<size_t>(fcntl(writeSide, F_GETPIPE_SZ)), '\0'); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    // NOLINTNEXTLINE(misc-include-cleaner): ssize_t comes from <sys/types.h>.
+    if (write(writeSide, room.data(), room.size()) != static_cast<ssize_t>(room.size()) || dup2(writeSide, STDERR_FILENO) < 0) {
+        return false;
+    }
+    std::vector<std::thread> publishers;
+    std::array<std::atomic<bool>, 2> returned{};
+    bool allReturned = true;
+    for (size_t i = 0; i < returned.size() && allReturned; i++) {
+        std::atomic<pid_t> tid = 0;
+        publishers.emplace_back([&, i] -> void {
+            tid = gettid();
+            builder.published(i == 1);
+            returned.at(i) = true;
+        });
+        bool held = false;
+        for (int step = 0; step < steps && !returned.at(i) && !held; step++) {
+            held = tid != 0 && writesToStderr(tid);
+            std::this_thread::yield();
+        }
+        allReturned = returned.at(i);
+    }
+    std::string said;
+    std::thread reader([&] -> void {
+        constexpr size_t chunkBytes = 4096;
+        std::array<char, chunkBytes> chunk{};
+        for (ssize_t got = 0; (got = read(readSide, chunk.data(), chunk.size())) > 0;) {
+            said.append(chunk.data(), static_cast<size_t>(got));
+        }
+    });
+    for (auto & publisher : publishers) {
+        publisher.join();
+    }
+    nixgrpc::flushLog();
+    dup2(ourStderr, STDERR_FILENO);
+    close(writeSide);
+    reader.join();
+    close(readSide);
+    close(ourStderr);
+    if (!allReturned) {
+        std::println(
+            "a publish waited behind a stalled stderr write (returned {} {})", returned.at(0).load(), returned.at(1).load());
+        return false;
+    }
+    if (!said.contains("event=publish_failing") || !said.contains("event=publishing")) {
+        std::println("a change of publishing is missing from our stderr");
+        return false;
+    }
+    return true;
 }
 
 } // namespace
