@@ -363,6 +363,14 @@ struct Revokable
         rev.set_once_uncalled(true);
         builder.onRevoke(rev);
     }
+
+    // From a scheduler that supersedes it, refuses its Want or cancels it.
+    void revokeOutright()
+    {
+        nix::remote::Revoke rev;
+        rev.set_drv_path("a.drv");
+        builder.onRevoke(rev);
+    }
 };
 
 // A build that does not run yet has no call that could wait for it: a revoke
@@ -405,6 +413,71 @@ auto anAttachedCallKeepsARevokedBuildFromItsAdmission() -> bool
     }
     attacher.reset();
     return owner->shared->uncalled(true);
+}
+
+// How a running build ended cancelled was counted: `revoked` events, and
+// whether its caller heard it was superseded. Whether the owner's cancel poll
+// ended it uncalled, and whether it is marked so.
+struct RevokedEnd
+{
+    double revoked = 0;
+    bool superseded = false;
+    bool polledUncalled = false;
+    bool markedUncalled = false;
+};
+
+// A running build revoked once uncalled, outright, or both, ends cancelled.
+// Both: its owner's caller is gone, so the owner's cancel poll ends it
+// uncalled; an outright Revoke for it then comes before the owner reports it
+// ended. Without a revoke once uncalled the poll, its owner's caller gone
+// too, does not end it uncalled. Each step runs in this order, on this thread.
+auto revokedEnd(bool onceUncalled, bool outright) -> std::optional<RevokedEnd>
+{
+    Revokable rev;
+    auto const owner = rev.builder.claim("a.drv", 1) ? rev.builder.admit("a.drv") : std::nullopt;
+    if (!owner) {
+        return std::nullopt;
+    }
+    if (onceUncalled) {
+        rev.revokeOnceUncalled();
+    }
+    bool const polledUncalled = owner->shared->endsUncalled(true);
+    if (outright) {
+        rev.revokeOutright();
+        if (!owner->shared->revoked) {
+            return std::nullopt;
+        }
+    }
+    rev.builder.finished("a.drv", Done::CANCELLED, {}, {});
+    bool const superseded = rev.builder.endedCancelled(*owner->shared, "a.drv");
+    return RevokedEnd{
+        .revoked = rev.metrics.eventCounter("revoked").Value(),
+        .superseded = superseded,
+        .polledUncalled = polledUncalled,
+        .markedUncalled = owner->shared->endedUncalled};
+}
+
+// One revoke ended the build, counted once however it came; a build no
+// revoke ended counts none.
+auto revokedEndsCountOnce() -> bool
+{
+    bool counted = true;
+    for (bool const onceUncalled : {false, true}) {
+        for (bool const outright : {false, true}) {
+            auto const end = revokedEnd(onceUncalled, outright);
+            double const want = onceUncalled || outright ? 1 : 0;
+            if (!end || end->revoked != want || end->superseded != outright || end->polledUncalled != onceUncalled
+                || end->markedUncalled != onceUncalled) {
+                std::println(
+                    "FAIL revoked once uncalled {} outright {}: counted {} revoked (want {}), superseded {}, "
+                    "ended uncalled {}, marked uncalled {}",
+                    onceUncalled, outright, end ? end->revoked : -1, want, end && end->superseded,
+                    end && end->polledUncalled, end && end->markedUncalled);
+                counted = false;
+            }
+        }
+    }
+    return counted;
 }
 
 constexpr uint64_t silent = 1800; // the build's --max-silent-time
@@ -461,6 +534,10 @@ auto run() -> int
     }
     if (!anAttachedCallKeepsARevokedBuildFromItsAdmission()) {
         std::println("FAIL an attached call does not keep a build revoked once uncalled from its admission on");
+        return EXIT_FAILURE;
+    }
+    if (!revokedEndsCountOnce()) {
+        std::println("FAIL a build a revoke ended does not count one revoke");
         return EXIT_FAILURE;
     }
     if (!earlyCallWaits()) {

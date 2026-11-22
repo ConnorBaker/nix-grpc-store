@@ -1192,12 +1192,7 @@ public:
         } catch (nixgrpc::CancelledWait &) {
             outcome = nix::remote::Done::CANCELLED;
             report();
-            if (adm->shared->endedUncalled) {
-                metrics.event("revoked");
-                nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "revoked_uncalled"}, {"drv", drvName}});
-            }
-            if (adm->shared->revoked) {
-                metrics.event("revoked");
+            if (builder.endedCancelled(*adm->shared, drvName)) {
                 return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
             }
             throw;
@@ -1277,15 +1272,8 @@ public:
         // to attach. It revokes the build once no client wants it any more. A
         // scheduler handing over cannot send it back here, its successor
         // having the socket: it revokes the build once no call waits for it.
-        auto const uncalled = [&] -> bool {
-            if (!shared.uncalled(caller.gone())) {
-                return false;
-            }
-            shared.endedUncalled = true;
-            return true;
-        };
         auto const cancelled = [&] -> bool {
-            return shared.revoked || uncalled() || stopSignal >= nixgrpc::kCancelBuilds;
+            return shared.revoked || shared.endsUncalled(caller.gone()) || stopSignal >= nixgrpc::kCancelBuilds;
         };
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
