@@ -20,6 +20,8 @@
 //   probe:   a derivation nobody built. While the grpc store's
 //            queryMissing runs, its output is added; another grpc store,
 //            and the same one on another thread, must see it valid.
+//   opaque N: N store paths as targets, as `nix path-info` gives its
+//            arguments, every other one valid on the build store.
 //   deep D W: a target only that substituter has, over D levels of W
 //            derivations nobody has, each depending on all of the level
 //            below.
@@ -31,7 +33,7 @@
 //            runs; the same grpc store must find it on another thread,
 //            and on this one once the sort is over.
 //
-// usage: query-missing-client <nix-grpc-store plugin> <host:port> <build> <dir> chain <N> | built <N> | mixed | deep <depth> <width> | nosubst | probe | toposort <N> | toposort-probe
+// usage: query-missing-client <nix-grpc-store plugin> <host:port> <build> <dir> chain <N> | built <N> | opaque <N> | mixed | deep <depth> <width> | nosubst | probe | toposort <N> | toposort-probe
 // <build> is the root of the daemon's local store, <dir>/eval of the
 // evaluation store, and <build>-cache the substituter NIX_CONFIG must name,
 // for the client and the daemon alike: a Nix that leaves what the build
@@ -233,6 +235,21 @@ auto mixed(Graph & graph, Store & build, Store & cache) -> std::vector<DerivedPa
     };
 }
 
+// COUNT store paths given as such (as `nix path-info` gives its arguments),
+// every other one valid on the build store.
+auto opaquePaths(Store & build, std::size_t count) -> std::vector<DerivedPath>
+{
+    std::vector<DerivedPath> targets;
+    for (std::size_t idx = 0; idx < count; ++idx) {
+        auto const path = StorePath::random("opaque-" + std::to_string(idx));
+        if (idx % 2 == 0) {
+            add(build, path);
+        }
+        targets.push_back(DerivedPath::Opaque{path});
+    }
+    return targets;
+}
+
 // A target only the client's substituter has, over DEPTH levels of WIDTH
 // derivations that nobody has: Nix's walk stops at the target.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): depth, then width, as the scenario's arguments
@@ -405,6 +422,8 @@ auto run(const ClientArgs & args) -> int
         targets = chain(graph, std::stoul(args.rest.front()));
     } else if (scenario == "built" && args.rest.size() == 1) {
         targets = builtAlready(graph, *build, std::stoul(args.rest.front()));
+    } else if (scenario == "opaque" && args.rest.size() == 1) {
+        targets = opaquePaths(*build, std::stoul(args.rest.front()));
     } else if (scenario == "deep" && args.rest.size() == 2) {
         targets = deep(graph, *cache, std::stoul(args.rest.at(0)), std::stoul(args.rest.at(1)));
     } else if (scenario == "mixed" && args.rest.empty()) {
@@ -499,7 +518,7 @@ try {
     std::vector<std::string> const args(std::next(argSpan.begin()), argSpan.end());
     constexpr std::size_t fixed = 5;
     if (args.size() < fixed) {
-        std::cerr << "usage: query-missing-client <nix-grpc-store plugin> <host:port> <build> <dir> chain <N> | built <N> | mixed | deep <depth> <width> | nosubst | probe | toposort <N> | toposort-probe\n";
+        std::cerr << "usage: query-missing-client <nix-grpc-store plugin> <host:port> <build> <dir> chain <N> | built <N> | opaque <N> | mixed | deep <depth> <width> | nosubst | probe | toposort <N> | toposort-probe\n";
         return broken;
     }
     auto arg = args.begin();

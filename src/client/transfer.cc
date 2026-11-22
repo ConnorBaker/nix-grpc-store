@@ -213,24 +213,33 @@ auto GrpcStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybe
 // reference of a substitutable output) itself.
 void GrpcStore::askAhead(const std::vector<DerivedPath> & targets, Store & evalStore,
                          std::map<StorePath, bool> & valid) {
+  auto const ask = [&](const StorePathSet & paths) -> StorePathSet {
+    auto held = queryValidPathsRouted(paths, NoSubstitute, {});
+    for (const auto & path : paths) {
+      valid.insert_or_assign(path, held.contains(path));
+    }
+    return held;
+  };
   WalkGraph graph(evalStore);
   std::vector<WalkGraph::Node> roots;
+  // Store paths given as targets (`nix path-info` passes each of its
+  // arguments so): the walk asks each one's validity on its own.
+  StorePathSet opaque;
   for (const auto & target : targets) {
+    if (const auto * path = std::get_if<DerivedPath::Opaque>(&target.raw())) {
+      opaque.insert(path->path);
+    }
     const auto * built = std::get_if<DerivedPath::Built>(&target.raw());
     if (built != nullptr && std::holds_alternative<SingleDerivedPath::Opaque>(built->drvPath->raw())) {
       roots.push_back(*built);
     }
   }
+  if (!opaque.empty()) {
+    ask(opaque);
+  }
   nixgrpc::missingTopDown(
       std::move(roots), [&](const WalkGraph::Node & node) -> std::vector<StorePath> { return graph.keys(node); },
-      [&](const WalkGraph::Node & node) -> std::vector<WalkGraph::Node> { return graph.children(node); },
-      [&](const StorePathSet & paths) -> StorePathSet {
-        auto held = queryValidPathsRouted(paths, NoSubstitute, {});
-        for (const auto & path : paths) {
-          valid.insert_or_assign(path, held.contains(path));
-        }
-        return held;
-      },
+      [&](const WalkGraph::Node & node) -> std::vector<WalkGraph::Node> { return graph.children(node); }, ask,
       nixgrpc::topDownBudget, [&](const StorePathSet & paths) -> StorePathSet { return graph.substitutable(paths); });
 }
 
