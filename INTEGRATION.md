@@ -9,11 +9,12 @@ Each topic branch is a linear stack of commits on upstream `main`, or on the top
 Coverage: each topic branch below was built alone, x86_64-linux only, as `packages.x86_64-linux.default` (which runs the unit tests), and passed. That is all that was run per topic. The full check set (all systems, VM tests, clang-tidy) gates this integration branch, not each topic alone; run it on a topic before that topic goes upstream.
 
 - `scheduler-uncap-max-jobs` was also built alone as `checks.x86_64-linux.clang-tidy`, and passed.
+- Topics 47 onward were built alone the same way, as `packages.x86_64-linux.default`, and passed. That build does not exercise `lost-input-rebuild-hold-test` (its tests are in the farm e2e crate, which compiled alone at the topic; the tests ran in the farm VM checks of the integration gate).
 - clang-tidy (`checks.x86_64-linux.clang-tidy`) has not been run on each topic alone. A review found it fails alone at `single-node-takeover` (a missing include in takeover.cc, added by a later topic), `integ/daemon-floating-ca`, `takeover-placements` and `greeter-stop-before-finalize` (includes in options.cc). It passes on this integration branch.
 - `tunnel-takeover-test`: its own VM test (`checks.x86_64-linux.tunnel-takeover`) fails at its head, as it did at the same commit in the old linear history; later commits in `integ/tests-event-waits` fix it.
 - `attach-other-limits-outputs` built alone as `checks.x86_64-linux.farm-scheduling`: its own test passes; two lost-input tests (`an_input_whose_nar_the_cache_lost_is_built_again_with_other_bytes`, `lost_input_rebuilt_with_other_bytes_reaches_its_user_on_another`) fail without `niks3-fork-pin` (as that topic's commit message says; the same check on a merge of this topic and `niks3-fork-pin` passed). Every topic below `niks3-fork-pin` has the same two failures in farm-scheduling.
 
-The base below is 9 commits behind upstream `main` `f2f5acd8`. Upstream has since merged its own forms of three changes this branch carries as `integ/` topics: `integ/nar-fetcher-fail-session-together`, `integ/nar-fetcher-record-once` and `integ/call-test-interrupt-race`. They are dropped when this branch is next rebuilt on upstream.
+Upstream `main` at `f2f5acd8` is merged into this branch after merge 46 ("Merge upstream main"), with the base below unchanged. That merge drops this side's forms of three changes upstream merged as its own: `integ/nar-fetcher-fail-session-together`, `integ/nar-fetcher-record-once` and `integ/call-test-interrupt-race` (their rows stay in the table, as merged before it; the merge message says what of each is kept). Topics 47 onward that need upstream's newer code sit on `f2f5acd8` ("Stacked on" says so).
 
 Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
 
@@ -67,8 +68,16 @@ Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
 | 44 | `scheduler-uncap-max-jobs` | `b453aa8a0a10d0a25d812e8b89a236685596c5b6` | `pass-clang-tidy`, `require-nix-2-34`, `oidc-config-outside-main` | require-nix-2-34: uses the Nix >= 2.34 settings API; oidc-config-outside-main and pass-clang-tidy: clang-tidy passes on this branch only with both (main()'s complexity; options.cc includes and builder-test fixes) | Take max-jobs as stated, and rank free slots exactly |  |
 | 45 | `greet-with-drain` | `4f9a9ed2dcad994d05f5af077278a47bf681cd13` | `takeover-placements` | changes takeover-placements' greet path | Greet with the drain in the same message as the Hello |  |
 | 46 | `greeter-stop-before-finalize` | `99c8b4566b161765ad9bce9ec7460ce612f92f88` | `keepalive-test-ports` |  | Tests: stop the greeter before the interpreter finalizes |  |
+| 47 | `target-validity-batch` | `5dbb313a79d74b48b54f3943bb9181d1a529ce15` | `topo-sort-prefetch-absent` | changes its test in query-missing-client.cc (and query-missing-batch's transfer.cc, which that topic is stacked on) | Ask the validity of store-path targets in one batch |  |
+| 48 | `farm-admission-by-machines` | `98747b94f6b5cbae8d0396cdafe6cc356b9a7f51` | `scheduler-uncap-max-jobs`, `greet-with-drain` | scheduler-uncap-max-jobs: changes its slot ranking (scheduler.hh, coordinator.cc, options.cc, scheduler-test.cc, keepalive-test.py); greet-with-drain: changes its greet path (builder.cc, dispatcher-test.cc) | Admit a farm's builds by what its machines can build |  |
+| 49 | `build-client-session-name` | `1b3840b7de501dcb9d139f48bd44b7e325b696e7` | `integ/daemon-floating-ca` | changes its daemon setup in main.cc | Name a build's client session to the nix-daemon |  |
+| 50 | `call-test-interrupt-comment` | `27fecec3c4708ca14205e9bc7f28ac0a2bd0ea56` | upstream `main` `f2f5acd8` | changes upstream's interrupt-race test in call-test.cc | Tests: say why interrupts race calls in flight |  |
+| 51 | `push-test-without-clock` | `332b538beda51801af9fc747f2f78f56a4b12ff7` | upstream `main` `f2f5acd8` | changes upstream's push-test.cc and its meson.build entry | Tests: find a build log waiting on the child without a clock |  |
+| 52 | `lost-input-rebuild-hold-test` | `cc6940796dcb58e58d5986f8c5886d69ffe9bb51` | `integ/tests-event-waits` | changes the lost-input farm tests (scheduling.rs, helpers.rs, cutoffs.rs, farm.nix) as rewritten there | Tests: hold a lost input's rebuild until both its users missed it |  |
+| 53 | `revoke-handed-over-build` | `9d2db0620eccacaa32a957f98fbedd359a8f7f12` | `attach-other-limits-outputs`, `greet-with-drain` | attach-other-limits-outputs: changes its builder.hh and builder-test.cc; greet-with-drain: its builder test sends through greet-with-drain's SendFn (a batch of WorkerMsgs), and it changes takeover-placements' handover and dispatcher tests, which greet-with-drain is stacked on | Revoke a handed-over build once no call waits for it |  |
+| 54 | `build-log-drop-outside-stderr` | `b9008fcc508eba837b28e700e287ee3c366b9a2b` | `push-test-without-clock` | its test is the push test rewritten there | Drop a build log without holding the queue across stderr |  |
 
-21 of 46 merges resolve overlaps; each names its files in its message.
+22 of the 54 topic merges resolve overlaps (21 of the first 46, and `farm-admission-by-machines`), and so does the upstream merge; each names its files in its message.
 
 The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
 
