@@ -77,8 +77,9 @@ Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
 | 53 | `revoke-handed-over-build` | `9d2db0620eccacaa32a957f98fbedd359a8f7f12` | `attach-other-limits-outputs`, `greet-with-drain` | attach-other-limits-outputs: changes its builder.hh and builder-test.cc; greet-with-drain: its builder test sends through greet-with-drain's SendFn (a batch of WorkerMsgs), and it changes takeover-placements' handover and dispatcher tests, which greet-with-drain is stacked on | Revoke a handed-over build once no call waits for it |  |
 | 54 | `build-log-drop-outside-stderr` | `b9008fcc508eba837b28e700e287ee3c366b9a2b` | `push-test-without-clock` | its test is the push test rewritten there | Drop a build log without holding the queue across stderr |  |
 | 55 | `vm-test-running-time-bound` | `4942ab4d89ef3d7f21c26bba5f25ac3e591c02ce` | `integ/tests-event-waits` | changes the wait helpers in tests/lib/waits.nix as rewritten there | Tests: bound each VM test by the time it runs |  |
+| 56 | `revoked-counted-once` | `8c81002b512b8b309cb8988767646c53655739bd` | `revoke-handed-over-build` | fixes its double count of a revoked build: changes its revoke accounting in builder.cc, builder.hh and main.cc, and its builder-test.cc | Count a build a revoke ended once |  |
 
-22 of the 55 topic merges resolve overlaps (21 of the first 46, and `farm-admission-by-machines`), and so does the upstream merge; each names its files in its message.
+22 of the 56 topic merges resolve overlaps (21 of the first 46, and `farm-admission-by-machines`), and so does the upstream merge; each names its files in its message.
 
 The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
 
