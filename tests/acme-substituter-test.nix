@@ -25,6 +25,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-acme-substituter";
+  globalTimeout = 600;
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
   # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.

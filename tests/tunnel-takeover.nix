@@ -47,6 +47,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-tunnel-takeover";
+  globalTimeout = 600;
 
   nodes = {
     client = {

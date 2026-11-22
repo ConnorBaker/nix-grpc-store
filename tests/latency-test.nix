@@ -28,6 +28,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-bench-latency";
+  globalTimeout = 1200;
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
   # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.

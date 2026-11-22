@@ -48,6 +48,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-${phase}";
+  globalTimeout = 900;
 
   # The Rust tests in tests/e2e run on the driver host and drive the VM over
   # the vsock ssh backdoor, so independent tests overlap.
