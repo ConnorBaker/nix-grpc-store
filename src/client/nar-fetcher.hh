@@ -273,7 +273,7 @@ public:
     void recordOrder(std::vector<nix::StorePath> order, std::map<nix::StorePath, uint64_t> sizes)
     {
         std::scoped_lock const lock(narMutex);
-        // `nix store make-content-addressed` records its paths, then their closure.
+        // Nix may sort overlapping sets before it copies.
         std::set<nix::StorePath> queued(pending.begin(), pending.end());
         for (auto & path : order) {
             if (!live(path) && queued.insert(path).second) {
@@ -336,8 +336,7 @@ private:
     {
         friend class NarFetcher;
 
-        // Owns and joins this session.
-        NarFetcher & fetcher;
+        NarFetcher & fetcher; // owns and joins this session
         struct Pending
         {
             nix::StorePath path;
@@ -390,8 +389,8 @@ private:
             return reader->Finish();
         }
 
-        // Under the fetcher's lock, so that who sees one of them failed asks
-        // for the others again too (live()), not for their pending failure.
+        // Under the fetcher's lock: a reader that saw one of them fail must
+        // find the others failed too.
         void failAll(std::span<const Pending> items, const std::exception_ptr & cause)
         {
             std::scoped_lock const lock(fetcher.narMutex);
@@ -441,8 +440,7 @@ private:
                                     : nix::Error("gRPC FetchNars failed: %s", status.error_message()));
                     // A stream sends its paths in order: past the whole ones,
                     // only the first can be cut off mid-NAR. A fresh stream
-                    // resumes it where it ended, then sends the rest. Giving
-                    // up fails them all at once (failAll).
+                    // resumes it where it ended, then sends the rest.
                     std::erase_if(pending, [](const Pending & item) -> bool { return item.spool->delivered(); });
                     auto const later = std::ranges::subrange(pending.begin() + (pending.empty() ? 0 : 1), pending.end());
                     auto const cutOff = std::ranges::stable_partition(later, &NarSpool::untouched, &Pending::spool);

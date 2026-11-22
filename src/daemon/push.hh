@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -65,6 +67,8 @@ public:
 
     ~PushProcess()
     {
+        // Before stdin closes: the queued logs still go to the child.
+        logWriter = {};
         {
             auto lck = state.lock();
             lck->stdinFd.reset(); // EOF: child drains and exits
@@ -111,10 +115,40 @@ public:
         return std::move(res.signatures);
     }
 
+    // Uploads the log Nix kept of `drvPath`. Returns at once: a log must not
+    // delay the result of its build. The outcome goes to our own log.
+    void pushLog(std::string drvPath)
+    {
+        std::scoped_lock const lock(logsMutex);
+        if (logs.size() >= maxQueuedLogs) {
+            logLine(LogLevel::info, {{"event", "build_log_dropped"}, {"drv", logs.front()}});
+            logs.pop_front();
+        }
+        logs.push_back(std::move(drvPath));
+        if (!logWriter.joinable()) {
+            logWriter = std::jthread([this](const std::stop_token & stop) -> void { writeLogs(stop); });
+        }
+        logQueued.notify_one();
+    }
+
 private:
     // ack()/fail() run under the State lock, wait() under its own.
     struct Pending
     {
+        void report()
+        {
+            if (log.empty()) {
+                return;
+            }
+            // Every path was acked or failed: the wait returns at once.
+            auto const res = wait([] -> bool { return false; });
+            if (res.status == "ok") {
+                logLine(LogLevel::info, {{"event", "build_log_pushed"}, {"drv", log}});
+            } else {
+                logLine(LogLevel::info, {{"event", "build_log_push_failed"}, {"drv", log}, {"why", res.message}});
+            }
+        }
+
         struct Result
         {
             std::string status = "ok";
@@ -122,8 +156,10 @@ private:
             Signatures signatures;
         };
 
-        explicit Pending(size_t count)
-            : sync(Inner{.left = count})
+        // `log` names the derivation of a build log, which nobody waits for.
+        explicit Pending(size_t count, std::string log = {})
+            : log(std::move(log))
+            , sync(Inner{.left = count})
         {
         }
 
@@ -181,6 +217,7 @@ private:
             size_t left;
             Result res;
         };
+        std::string log;
         nix::Sync<Inner> sync;
         std::condition_variable done;
     };
@@ -197,6 +234,57 @@ private:
     nix::Sync<State> state;
     std::mutex writeMutex;
     std::thread reader;
+
+    // A child that reads slowly may hold up a write, so build logs go
+    // through a thread of their own, and the oldest gives way.
+    static constexpr size_t maxQueuedLogs = 64;
+    std::mutex logsMutex;
+    std::deque<std::string> logs;
+    std::condition_variable_any logQueued;
+    std::jthread logWriter;
+
+    void writeLogs(const std::stop_token & stop)
+    {
+        for (;;) {
+            std::string drvPath;
+            {
+                std::unique_lock lock(logsMutex);
+                logQueued.wait(lock, stop, [&] -> bool { return !logs.empty(); });
+                if (logs.empty()) {
+                    return;
+                }
+                drvPath = std::move(logs.front());
+                logs.pop_front();
+            }
+            try {
+                sendLog(drvPath);
+            } catch (nix::Error & err) {
+                logLine(LogLevel::info, {{"event", "build_log_push_failed"}, {"drv", drvPath}, {"why", err.what()}});
+            }
+        }
+    }
+
+    void sendLog(const std::string & drvPath)
+    {
+        auto const pending = std::make_shared<Pending>(1, drvPath);
+        uint64_t reqId = 0;
+        std::shared_ptr<nix::AutoCloseFD> stdinFd;
+        {
+            auto lck = state.lock();
+            ensureChild(lck);
+            reqId = ++lck->lastId;
+            lck->waiting[reqId] = pending;
+            stdinFd = lck->stdinFd;
+        }
+        nlohmann::json const req{{"id", reqId}, {"log", drvPath}};
+        try {
+            std::scoped_lock const one(writeMutex);
+            nix::writeFull(stdinFd->get(), req.dump() + "\n", false);
+        } catch (...) {
+            state.lock()->waiting.erase(reqId);
+            throw;
+        }
+    }
 
     void ensureChild(nix::Sync<State>::WriteLock & lck)
     {
@@ -249,6 +337,7 @@ private:
                          .message = ack.value("message", ""),
                          .path = ack.value("path", ""),
                          .signatures = ack.value("signatures", std::set<std::string>{})})) {
+                    found->second->report();
                     lck->waiting.erase(found);
                 }
             }
@@ -263,6 +352,7 @@ private:
         logLine(LogLevel::info, {{"event", "niks3_push_exited"}, {"status", nix::statusToString(status)}, {"why", why}});
         for (auto & [reqId, pending] : lck->waiting) {
             pending->fail(why);
+            pending->report();
         }
         lck->waiting.clear();
     }

@@ -103,10 +103,9 @@ void startingAfterInterruptThrows()
 }
 
 // Nix copies an interrupt callback under its lock and calls it outside, so
-// it can run after its Call unregistered it. Cancelling a call in flight
-// returns the caller while TryCancel still holds the context's mutex, and
-// the next Call reuses the stack slot: abseil aborts on the stale unlock.
-// The access is in uninstrumented gRPC, so a sanitizer alone sees nothing.
+// it can run after its Call unregistered it. That breaks only for a call in
+// flight: TryCancel still holds the context's mutex when the next Call
+// reuses the stack slot.
 void interruptRacingTheEndOfACallIsHarmless()
 {
     Fixture const fix;

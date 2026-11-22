@@ -42,6 +42,7 @@
 #include <sys/socket.h>
 
 #include <bzlib.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <grpc/grpc.h>
@@ -716,7 +717,8 @@ public:
                 bz2 += ".bz2";
                 bool const compressed = !nix::pathExists(plain);
                 auto const & path = compressed ? bz2 : plain;
-                auto const file = nixcompat::openFileReadonly(path);
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,bugprone-signed-bitwise,misc-include-cleaner): C API takes int flags, and its header differs per platform.
+                auto const file = nix::AutoCloseFD{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
                 if (!file) {
                     auto const err = errno;
                     if (compressed && err == ENOENT) {
@@ -1299,6 +1301,7 @@ public:
         metrics.event(nixcompat::succeeded(res) ? "built" : "build_failed");
         if (auto const status = nixcompat::failureStatus(res)) {
             metrics.buildFailure(nixcompat::failureStatusName(*status));
+            coord.cache.publishLog(localStore.printStorePath(drvPath));
         }
         if (nixcompat::succeeded(res)) {
             // From the result: a floating content-addressed output has no path

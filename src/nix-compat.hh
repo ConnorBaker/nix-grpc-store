@@ -5,9 +5,7 @@
 // `nix-store` pkg-config dependency).
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdint>
-#include <filesystem>
 #include <map>
 #include <optional>
 #include <set>
@@ -29,8 +27,6 @@
 #include <nix/store/realisation.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/worker-protocol.hh>
-#include <nix/util/file-descriptor.hh>
-#include <nix/util/file-system.hh>
 #include <nix/util/serialise.hh>
 
 // Late 2.36 moved the build operations from Store into a Builder interface.
@@ -430,23 +426,6 @@ inline auto keepGoing() -> bool { return nix::settings.getWorkerSettings().keepG
 inline auto buildTimeout() -> time_t { return nix::settings.getWorkerSettings().buildTimeout; }
 
 inline auto maxSilentTime() -> time_t { return nix::settings.getWorkerSettings().maxSilentTime; }
-
-// Late 2.36 made openFileReadonly() return a Result. Before, a failure
-// was an invalid fd with errno set, which is what this keeps.
-inline auto openFileReadonly(const std::filesystem::path &path) -> nix::AutoCloseFD {
-  constexpr auto unwrap = []<typename F>(F file) -> nix::AutoCloseFD {
-    if constexpr (requires { file.error(); }) {
-      if (!file) {
-        errno = file.error();
-        return {};
-      }
-      return std::move(file.value());
-    } else {
-      return file;
-    }
-  };
-  return unwrap(nix::openFileReadonly(path));
-}
 
 } // namespace nixcompat
 // NOLINTEND(cppcoreguidelines-macro-usage)

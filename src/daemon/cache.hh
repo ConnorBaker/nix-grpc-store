@@ -151,6 +151,16 @@ public:
         return false;
     }
 
+    // Keeps the log of a failed build in the cache, where `nix log` finds it.
+    // A successful build's log goes up with its outputs.
+    void publishLog(const std::string & drvPath)
+    {
+        if (!remote) {
+            return;
+        }
+        remote->push.pushLog(drvPath);
+    }
+
     // Path valid locally afterwards, or throws.
     static void substitute(nix::Store & store, const nix::StorePath & path)
     {

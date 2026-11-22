@@ -93,7 +93,7 @@ struct Fixture
     }
 };
 
-// Without eof, the start of a NAR the stream then breaks off.
+// Without eof the NAR stays unfinished.
 auto sendNar(grpc::ServerWriter<nix::remote::NarFrame> & writer, uint32_t index, const std::string & nar, bool eof = true,
              const std::string & hash = "sha256-one") -> void
 {
@@ -165,7 +165,6 @@ auto fetchFails(nixgrpc::NarFetcher & fetcher, const nix::StorePath & path) -> b
 
 auto pathA() -> nix::StorePath { return {"00000000000000000000000000000000-a"}; }
 auto pathB() -> nix::StorePath { return {"11111111111111111111111111111111-b"}; }
-
 
 // A starved client misses the connect deadline once; the copy must survive.
 void connectFailureIsRetried()
@@ -328,11 +327,10 @@ void nonRetryableFailsAtOnce()
 
 constexpr size_t siblings = 20000;
 
-// One session for A, many siblings and B. Its first call breaks off all but
-// B mid-NAR if `cutOff` and ends with `first`; later calls deliver. Once A
-// failed, path `next` of that order must be fetched anew, not get the failure
-// that was pending for it: the siblings keep the session failing its paths
-// long enough for it to be asked for meanwhile.
+// One session fetches A, many siblings and B. Its first call ends with
+// `first`, after starting every NAR but B's if `cutOff`. Later calls deliver.
+// Once A failed, path `next` of the order must be fetched again. The siblings
+// keep the session busy failing paths while `next` is asked for.
 void freshAfterFailure(const grpc::Status & first, bool cutOff, nixgrpc::RetryPolicy retry, size_t next)
 {
     Fixture fix([&](int call, const auto & request, auto & writer) -> grpc::Status {
@@ -359,8 +357,7 @@ void freshAfterFailure(const grpc::Status & first, bool cutOff, nixgrpc::RetryPo
 }
 
 // A failed fetch is not cached: nix repl keeps the store after ^C and asks
-// for the same path again. Nor are the paths a failed session never
-// delivered, also those it cut off, and also when it retries the rest.
+// for the same path again. The same goes for the other paths of its session.
 void failedFetchIsRetried()
 {
     grpc::Status const denied{grpc::StatusCode::PERMISSION_DENIED, "no"};
@@ -385,9 +382,9 @@ void rerecordedPathIsFetchedOnce()
 
     assert(fetch(*fetcher, pathA()) == narOf(std::string(pathA().to_string())));
     assert(fetch(*fetcher, pathB()) == narOf(std::string(pathB().to_string())));
-    assert(fix.service.requests()
-           == std::vector<std::vector<std::string>>{
-               {std::string(pathA().to_string()), std::string(pathB().to_string())}});
+    std::vector<std::vector<std::string>> const once{
+        {std::string(pathA().to_string()), std::string(pathB().to_string())}};
+    assert(fix.service.requests() == once);
 }
 
 // Each unannounced path gets a session; finished ones must not pile up.

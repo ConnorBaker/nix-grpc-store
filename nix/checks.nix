@@ -6,6 +6,7 @@
   nixosModule,
   niks3,
   tribuchet,
+  flakeletDaemon,
 }:
 let
   inherit (pkgs) lib;
@@ -218,6 +219,11 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     chart = ../deploy/helm/nix-grpc-farm;
     lbModule = ../nixos/lb.nix;
     extraValues = [ k3s.chartValues ];
+  };
+
+  flakelet = import ../tests/flakelet.nix {
+    inherit pkgs flakeletDaemon;
+    module = nixosModule;
   };
 
   tunnel = import ../tests/tunnel.nix {

@@ -80,6 +80,7 @@ stdenv.mkDerivation {
         ../../tests/sandbox-test.cc
         ../../tests/takeover-test.cc
         ../../tests/log-spill-test.cc
+        ../../tests/push-test.cc
         ../../tests/daemon-probe-test.cc
         ../../tests/tunnel-test.cc
         ../../tests/builder-test.cc

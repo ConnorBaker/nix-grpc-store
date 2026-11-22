@@ -136,3 +136,17 @@ fn an_input_only_one_worker_has_still_reaches_the_builder() {
         succeed(CLIENT, &cmd);
     }
 }
+
+/// `nix log` against the cache shows why a build failed.
+#[test]
+fn the_log_of_a_failed_build_reaches_the_cache() {
+    let build = ["--store", &envoy(), "--eval-store", "auto", "-f", &expr("FAIL"), "--argstr", "tag", "logged"];
+    let mut argv = vec!["nix", "build", "--no-link"];
+    argv.extend(build);
+    fail(CLIENT, &argv);
+    let drv = succeed(CLIENT, &["nix", "eval", "--raw", "-f", &expr("FAIL"), "--argstr", "tag", "logged", "drvPath"]);
+    let cache = env("NGS_NIKS3_URL");
+    retry(&[], "the log is in the cache", || {
+        run(CLIENT, &["nix", "log", "--store", &cache, &drv]).combined().contains("BOOM-logged")
+    });
+}
