@@ -103,6 +103,16 @@ private:
     bool daemonAnswered = true;
     std::optional<Elector> elector;
     grpc::HealthCheckServiceInterface * health = nullptr;
+    // Options::farmFile as last looked at.
+    struct FarmSeen
+    {
+        int64_t ctimeNs = 0;
+        int64_t size = 0;
+        int error = 0; // stat's errno
+        auto operator==(const FarmSeen &) const -> bool = default;
+    };
+    std::optional<FarmSeen> farmSeen;
+    void readFarm(Builder & bld);
     void setSchedulerActive(bool active);
     void runRemoteSession(Builder & bld, const std::stop_token & stop);
     void askLocalDaemon(Builder & bld);

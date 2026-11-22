@@ -360,6 +360,18 @@ in
       default = null;
       description = "Concurrent builds. Defaults to `nix.settings.max-jobs`, read again on SIGHUP.";
     };
+    farmFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/run/tribuchet/farm.json";
+      description = ''
+        The farm this builder hands its builds to, as JSON written by whoever
+        runs it: `{"machines": [{"systems": {"<system>": [<features>]}, "jobs": N}]}`.
+        Read at start and whenever it changes. The builder then takes a build
+        only while the machines that could build it have a slot for it.
+        Absent or unreadable, nothing is bounded by it.
+      '';
+    };
     lookupThreads = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 1 1024);
       default = null;

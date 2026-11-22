@@ -17,6 +17,7 @@
 #include "builder.hh"
 #include "metrics.hh"
 #include "nix_remote.pb.h"
+#include "scheduler.hh"
 
 namespace {
 
@@ -39,6 +40,48 @@ auto greetsFirst() -> bool
     builder.setUnavailable(Builder::Unavailable::localDaemonDown, true);
     builder.greet();
     return hellos == std::vector<bool>{true, false};
+}
+
+// The scheduler hears of the builder's farm: in the Hello, and on a change,
+// in a Load with max_jobs, which carries all of it.
+auto tellsFarm() -> bool
+{
+    using Farm = std::vector<nixgrpc::sched::FarmMachine>;
+    Farm const one{{.systems = {{"aarch64-linux", {}}}, .jobs = 1}};
+    Farm const two{
+        {.systems = {{"aarch64-linux", {}}}, .jobs = 2},
+        {.systems = {{"x86_64-linux", {"kvm"}}, {"i686-linux", {}}}, .jobs = 3}};
+    nixgrpc::Metrics metrics{""};
+    Builder builder(
+        {.advertise = "w:0", .systems = {"x86_64-linux", "aarch64-linux"}, .features = {}, .maxJobs = 4, .farm = one},
+        metrics);
+    std::vector<Farm> told;
+    auto const farmOf = [](const auto & machines) -> Farm {
+        Farm farm;
+        for (const auto & machine : machines) {
+            nixgrpc::sched::FarmMachine mach{.systems = {}, .jobs = machine.jobs()};
+            for (const auto & [system, offered] : machine.systems()) {
+                mach.systems.emplace(system, std::vector<std::string>(offered.features().begin(), offered.features().end()));
+            }
+            farm.push_back(std::move(mach));
+        }
+        return farm;
+    };
+    builder.setSend([&](const nix::remote::WorkerMsgs & msgs) -> bool {
+        for (const auto & msg : msgs.msgs()) {
+            if (msg.has_hello()) {
+                told.push_back(farmOf(msg.hello().farm()));
+            } else if (msg.has_load() && msg.load().has_max_jobs()) {
+                told.push_back(farmOf(msg.load().farm()));
+            }
+        }
+        return true;
+    });
+    builder.greet();
+    builder.setFarm(one);
+    builder.setFarm(two);
+    builder.setFarm({});
+    return told == std::vector<Farm>{one, two, {}};
 }
 
 auto expectOf(uint64_t assignId, const std::string & drv = "a.drv") -> nix::remote::Expect
@@ -418,6 +461,10 @@ auto run() -> int
     }
     if (!drainingGivesBackAQuietClaim()) {
         std::println("FAIL a draining builder does not give back a claim whose client went quiet");
+        return EXIT_FAILURE;
+    }
+    if (!tellsFarm()) {
+        std::println("FAIL a builder does not tell the scheduler of its farm");
         return EXIT_FAILURE;
     }
     if (!uploadKeepsTheClaim()) {

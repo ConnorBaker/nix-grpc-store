@@ -296,6 +296,22 @@ message Hello {
   repeated RunningBuild running = 5;
   // See Load.
   bool publish_failing = 6;
+  // The farm it hands its builds to, if it does: a worker that forwards
+  // builds has room for a drv of system s requiring features R only as the
+  // machines of the farm that could build it do (Core::classRoom).
+  repeated FarmMachine farm = 7;
+}
+
+message FarmMachine {
+  // The features it offers for each system it builds.
+  map<string, FarmFeatures> systems = 1;
+  // Builds it takes at once, of all its systems together; 0 while it is
+  // away.
+  uint32 jobs = 2;
+}
+
+message FarmFeatures {
+  repeated string features = 1;
 }
 
 message Done {
@@ -333,6 +349,8 @@ message Load {
   // The worker's capacity, as Hello.max_jobs, which says 0 while draining.
   // Absent from workers that predate it.
   optional uint32 max_jobs = 3;
+  // As Hello.farm, all of it, whenever max_jobs is present.
+  repeated FarmMachine farm = 4;
 }
 
 message WorkerMsg {

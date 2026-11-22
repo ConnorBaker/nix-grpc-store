@@ -351,6 +351,290 @@ void testSetMaxJobs()
     assert((out.size() == 154 && shard.stats()[{.system = "x", .features = ""}].slots == UINT32_MAX));
 }
 
+// Worker::farm: a hub forwards every build to a farm, whose machines differ
+// in what they build: plain x86_64-linux on one kind, kvm tests on another,
+// aarch64-linux on a third. Builds of a class the farm has little room for,
+// even the oldest of the same client, hold no more of the hub's slots than
+// that room, and plain x86_64-linux ones queued behind them still get slots.
+// A class no machine of the farm builds is bounded by the hub's slots alone.
+void testFarmClasses()
+{
+    Core shard;
+    std::vector<Assign> out;
+    std::vector<Core::Superseded> sup;
+    auto const hub = shard.hello(
+        {.addr = "hub",
+         .systems = {"x86_64-linux", "aarch64-linux"},
+         .features = {"big-parallel", "gpu", "kvm", "nixos-test"},
+         .maxJobs = 9,
+         .farm =
+             {{.systems = {{"x86_64-linux", {"big-parallel"}}}, .jobs = 3},
+              {.systems = {{"x86_64-linux", {"big-parallel", "kvm", "nixos-test"}}}, .jobs = 2},
+              {.systems = {{"aarch64-linux", {"big-parallel"}}}, .jobs = 1}},
+         .running = {}},
+        sup);
+    auto const want = [&](const std::string & drv, const char * system, std::vector<std::string> features, double atMs) -> void {
+        shard.want(1, {.drvPath = drv, .inputs = {}, .system = system, .features = std::move(features), .cpHintMs = 0}, atMs);
+    };
+    for (int i = 1; i <= 3; i++) {
+        want("a" + std::to_string(i) + ".drv", "aarch64-linux", {}, 0);
+    }
+    for (int i = 1; i <= 4; i++) {
+        want("k" + std::to_string(i) + ".drv", "x86_64-linux", {"kvm", "nixos-test"}, 100);
+    }
+    for (int i = 1; i <= 6; i++) {
+        want("p" + std::to_string(i) + ".drv", "x86_64-linux", {}, 200);
+    }
+    want("g1.drv", "x86_64-linux", {"gpu"}, 300);
+    shard.dispatch(out);
+    auto const placed = [&] -> std::vector<std::string> {
+        std::vector<std::string> names;
+        names.reserve(out.size());
+        for (const auto & asg : out) {
+            names.push_back(shard.entry(asg.drv)->drvPath);
+        }
+        std::ranges::sort(names);
+        return names;
+    };
+    // aarch64-linux 1, kvm 2, plain 3 (the kvm machine's 2 slots are the kvm
+    // tests'), and the gpu one, which no machine builds.
+    assert((placed() == std::vector<std::string>{"a1.drv", "g1.drv", "k1.drv", "k2.drv", "p1.drv", "p2.drv", "p3.drv"}));
+    assert(std::ranges::all_of(out, [&](const Assign & asg) -> bool { return asg.worker == hub; }));
+    // A kvm test ends: its slot goes to the next kvm test, not to the older
+    // aarch64-linux build, whose machine is still full.
+    shard.done(lease(shard, hub, "k1.drv"), {});
+    shard.dispatch(out);
+    assert(out.size() == 8 && shard.entry(out.back().drv)->drvPath == "k3.drv");
+    // Without a farm, the oldest wait goes first, whatever its class.
+    shard.setFarm(hub, {});
+    shard.done(lease(shard, hub, "p1.drv"), {});
+    shard.dispatch(out);
+    assert(out.size() > 8 && shard.entry(out.at(8).drv)->drvPath == "a2.drv");
+}
+
+auto farmHub(Core & shard, std::vector<FarmMachine> farm, uint32_t maxJobs = 10) -> WorkerId
+{
+    std::vector<Core::Superseded> sup;
+    return shard.hello(
+        {.addr = "hub", .systems = {"x", "y"}, .features = {"big-parallel", "kvm", "nixos-test"}, .maxJobs = maxJobs, .farm = std::move(farm), .running = {}},
+        sup);
+}
+
+auto wantOn(Core & shard, const std::string & drv, const char * system, std::vector<std::string> features, double atMs) -> void
+{
+    shard.want(1, {.drvPath = drv, .inputs = {}, .system = system, .features = std::move(features), .cpHintMs = 0}, atMs);
+}
+
+// Classes whose machines overlap draw from the same slots: plain,
+// big-parallel and nixos-test builds of one machine of 2 slots take 2 in
+// all, not 2 each.
+void testFarmClassesShareMachines()
+{
+    Core shard;
+    std::vector<Assign> out;
+    farmHub(shard, {{.systems = {{"x", {"big-parallel", "nixos-test"}}}, .jobs = 2}});
+    for (int i = 0; i < 2; i++) {
+        wantOn(shard, "p" + std::to_string(i) + ".drv", "x", {}, i);
+        wantOn(shard, "b" + std::to_string(i) + ".drv", "x", {"big-parallel"}, i);
+        wantOn(shard, "n" + std::to_string(i) + ".drv", "x", {"nixos-test"}, i);
+    }
+    shard.dispatch(out);
+    assert(out.size() == 2);
+}
+
+// A build already out moves to another machine that builds it, so that a
+// class only one machine builds gets that machine's slot.
+void testFarmMovesBuildsAlong()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const hub = farmHub(shard, {{.systems = {{"x", {"kvm"}}}, .jobs = 1}, {.systems = {{"x", {}}}, .jobs = 1}});
+    wantOn(shard, "p1.drv", "x", {}, 0); // to the kvm machine, listed first
+    shard.dispatch(out);
+    wantOn(shard, "k1.drv", "x", {"kvm"}, 1);
+    wantOn(shard, "p2.drv", "x", {}, 2);
+    shard.dispatch(out);
+    assert(out.size() == 2 && shard.entry(out.back().drv)->drvPath == "k1.drv");
+    // Both machines' slots are out: p2 waits. One ends: p2 takes its slot.
+    shard.done(lease(shard, hub, "p1.drv"), {});
+    shard.dispatch(out);
+    assert(out.size() == 3 && shard.entry(out.back().drv)->drvPath == "p2.drv");
+}
+
+// Builds out beyond the farm's slots (it shrank under them) take the first
+// slot that frees, even one another class's build left: nothing new fits
+// until they are all on slots.
+void testFarmShrinksUnderItsBuilds()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const hub = farmHub(shard, {{.systems = {{"x", {}}, {"y", {}}}, .jobs = 2}});
+    wantOn(shard, "x1.drv", "x", {}, 0);
+    wantOn(shard, "y1.drv", "y", {}, 1);
+    shard.dispatch(out);
+    assert(out.size() == 2);
+    shard.setFarm(hub, {{.systems = {{"x", {}}, {"y", {}}}, .jobs = 1}});
+    shard.done(lease(shard, hub, "x1.drv"), {});
+    wantOn(shard, "x2.drv", "x", {}, 2);
+    shard.dispatch(out);
+    assert(out.size() == 2 && shard.queued() == 1);
+}
+
+// The same with one class: its build that ends frees no slot while another
+// of it is out beyond the farm's.
+void testFarmShrinksUnderOneClass()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const hub = farmHub(shard, {{.systems = {{"x", {}}}, .jobs = 2}});
+    wantOn(shard, "x1.drv", "x", {}, 0);
+    wantOn(shard, "x2.drv", "x", {}, 1);
+    shard.dispatch(out);
+    assert(out.size() == 2);
+    shard.setFarm(hub, {{.systems = {{"x", {}}}, .jobs = 1}});
+    shard.done(lease(shard, hub, "x1.drv"), {});
+    wantOn(shard, "x3.drv", "x", {}, 2);
+    shard.dispatch(out);
+    assert(out.size() == 2 && shard.queued() == 1);
+}
+
+// A machine of several systems has one set of slots for all of them.
+void testFarmMachineOfSeveralSystems()
+{
+    Core shard;
+    std::vector<Assign> out;
+    farmHub(shard, {{.systems = {{"x", {}}, {"y", {}}}, .jobs = 1}});
+    wantOn(shard, "x.drv", "x", {}, 0);
+    wantOn(shard, "y.drv", "y", {}, 1);
+    shard.dispatch(out);
+    assert(out.size() == 1);
+}
+
+// A machine the farm lists for a class but with no room (jobs 0: away, or
+// its build slots all down) is not "no machine builds it": its builds wait
+// for it, as the farm keeps them waiting, and others go ahead.
+void testFarmMachineWithoutRoom()
+{
+    Core shard;
+    std::vector<Assign> out;
+    farmHub(shard, {{.systems = {{"x", {}}}, .jobs = 4}, {.systems = {{"y", {}}}, .jobs = 0}}, 4);
+    for (int i = 1; i <= 3; i++) {
+        wantOn(shard, "a" + std::to_string(i) + ".drv", "y", {}, 0);
+    }
+    wantOn(shard, "p.drv", "x", {}, 100);
+    shard.dispatch(out);
+    assert(out.size() == 1 && shard.entry(out.front().drv)->drvPath == "p.drv");
+}
+
+// nix-daemon runs builtin:fetchurl itself: it takes none of the farm's slots.
+void testFarmLeavesBuiltinsOut()
+{
+    Core shard;
+    std::vector<Assign> out;
+    farmHub(shard, {{.systems = {{"x", {}}}, .jobs = 1}});
+    shard.want(1, {.drvPath = "fetch.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .builtin = true}, 0);
+    wantOn(shard, "p.drv", "x", {}, 1);
+    shard.dispatch(out);
+    assert(out.size() == 2);
+}
+
+// A drv a Hello reports before anyone says its system counts on the farm
+// once a Want says it.
+void testFarmOfAReportedDrv()
+{
+    Core shard;
+    std::vector<Assign> out;
+    std::vector<Core::Superseded> sup;
+    shard.hello(
+        {.addr = "hub",
+         .systems = {"x86_64-linux", "aarch64-linux"},
+         .features = {},
+         .maxJobs = 4,
+         .farm = {{.systems = {{"aarch64-linux", {}}}, .jobs = 1}},
+         .running = {{"r.drv", 7}}},
+        sup);
+    wantOn(shard, "r.drv", "aarch64-linux", {}, 0);
+    wantOn(shard, "a.drv", "aarch64-linux", {}, 0);
+    shard.dispatch(out);
+    assert(out.empty() && shard.queued() == 1);
+}
+
+// A builtin first known from a Hello is a class of its own once its Want
+// says so: lost and queued again behind a plain build the full farm holds
+// back, it is still placed.
+void testFarmOfAReportedBuiltin()
+{
+    Core shard;
+    std::vector<Assign> out;
+    std::vector<Core::Superseded> sup;
+    auto const farm = std::vector<FarmMachine>{{.systems = {{"x", {}}}, .jobs = 1}};
+    shard.hello({.addr = "hub", .systems = {"x"}, .features = {}, .maxJobs = 4, .farm = farm, .running = {{"f.drv", 7}}},
+                sup);
+    shard.want(1, {.drvPath = "f.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .builtin = true}, 0);
+    wantOn(shard, "p1.drv", "x", {}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && shard.entry(out[0].drv)->drvPath == "p1.drv");
+    // Ahead of f.drv, by its critical path.
+    shard.want(1, {.drvPath = "p2.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 1e9}, 0);
+    shard.hello(
+        {.addr = "hub", .systems = {"x"}, .features = {}, .maxJobs = 4, .farm = farm,
+         .running = {{"p1.drv", out[0].assignId}}},
+        sup);
+    out.clear();
+    shard.dispatch(out);
+    assert(out.size() == 1 && shard.entry(out[0].drv)->drvPath == "f.drv");
+}
+
+// The worker with the inputs is passed over while its farm has no room for
+// the drv, however many slots it has itself.
+void testFarmBeatsLocality()
+{
+    Core shard;
+    std::vector<Assign> out;
+    std::vector<Core::Superseded> sup;
+    auto const w0 = shard.hello(
+        {.addr = "w0", .systems = {"x", "y"}, .features = {}, .maxJobs = 10,
+         .farm = {{.systems = {{"y", {}}}, .jobs = 1}}, .running = {}},
+        sup);
+    wantOn(shard, "b.drv", "y", {}, 0);
+    shard.dispatch(out);
+    shard.done(lease(shard, w0, "b.drv"), {{"b-out", 1'000'000'000'000}});
+    wantOn(shard, "c.drv", "y", {}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == w0);
+    auto const w1 = shard.hello({.addr = "w1", .systems = {"x", "y"}, .features = {}, .maxJobs = 2, .running = {}}, sup);
+    shard.want(1, {.drvPath = "d.drv", .inputs = {"b-out"}, .system = "y", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker == w1);
+}
+
+// A drv given back is not placed on another worker whose farm has no room
+// for it, however many slots that worker has itself (Core::sparing).
+void testFarmOnAGiveBack()
+{
+    Core shard;
+    std::vector<Assign> out;
+    std::vector<Core::Superseded> sup;
+    auto const giver = shard.hello({.addr = "giver", .systems = {"y"}, .features = {}, .maxJobs = 5, .running = {}}, sup);
+    wantOn(shard, "d1.drv", "y", {}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == giver);
+    auto const full = shard.hello(
+        {.addr = "full", .systems = {"y"}, .features = {}, .maxJobs = 10,
+         .farm = {{.systems = {{"y", {}}}, .jobs = 1}}, .running = {}},
+        sup);
+    wantOn(shard, "d2.drv", "y", {}, 1);
+    shard.setDraining(giver, true);
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == full);
+    shard.setDraining(giver, false);
+    shard.giveBack(lease(shard, giver, "d1.drv"), GaveBack::drv);
+    shard.dispatch(out);
+    // Not on `full`, whose farm has no room; and as another worker offers
+    // it, not back on the giver either: it waits (sparing).
+    assert(out.size() == 2 && shard.queued() == 1);
+}
+
 void testFeatures()
 {
     Core shard;
@@ -1464,6 +1748,18 @@ try {
     testDraining();
     testSetMaxJobs();
     testMostFreeIsExact();
+    testFarmClasses();
+    testFarmClassesShareMachines();
+    testFarmMovesBuildsAlong();
+    testFarmMachineOfSeveralSystems();
+    testFarmShrinksUnderItsBuilds();
+    testFarmShrinksUnderOneClass();
+    testFarmMachineWithoutRoom();
+    testFarmLeavesBuiltinsOut();
+    testFarmOfAReportedDrv();
+    testFarmOfAReportedBuiltin();
+    testFarmBeatsLocality();
+    testFarmOnAGiveBack();
     testFeatures();
     testStuckFeatureSet();
     testFeatureSetsWithCommas();

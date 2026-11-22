@@ -349,6 +349,13 @@ if build_server
     timeout : 300,
   )
 
+  test('farm', executable('farm-test',
+    sources : ['tests/farm-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep, json_dep] + absl_dep,
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('scheduler', executable('scheduler-test',
     sources : ['tests/scheduler-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
