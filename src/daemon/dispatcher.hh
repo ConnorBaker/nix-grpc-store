@@ -212,7 +212,8 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void wakeWatchersLocked();
     // Per-system gauges. O(entries), so at most once a second unless forced.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(
+        sched::WorkerId wid, const std::string & drvPath, bool onceUncalled = false);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void tickLocked();
     // Revoke or forget the builds kept for a client whose linger or hold is over.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void expireLingersLocked();

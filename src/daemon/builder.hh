@@ -48,6 +48,21 @@ struct Expected
         std::mutex mutex;
         std::condition_variable cv;
         std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along, or nobody wants it
+        // A scheduler handing over revoked it once no call waits for it
+        // (Revoke.once_uncalled).
+        std::atomic<bool> revokeOnceUncalled{false};
+        // Attached calls waiting for its result. Builder::admit counts one
+        // under its lock, before the call can wait (Waiting).
+        std::atomic<uint32_t> attachedWaiting{0};
+        // The owner ended the build because uncalled() held.
+        std::atomic<bool> endedUncalled{false};
+
+        // Whether no call waits for a build revoked once uncalled: its
+        // owner's caller is gone (`ownerGone`) and no attached call waits.
+        [[nodiscard]] auto uncalled(bool ownerGone) const -> bool
+        {
+            return revokeOnceUncalled && ownerGone && attachedWaiting == 0;
+        }
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
         static constexpr uint64_t checkMode = 2; // nix::bmCheck
@@ -76,6 +91,43 @@ struct Expected
             const std::scoped_lock lock(mutex);
             cv.notify_all();
         }
+    };
+
+    // An attached call counted in Shared::attachedWaiting until it ends.
+    class Waiting
+    {
+    public:
+        Waiting() = default;
+        explicit Waiting(std::shared_ptr<Shared> shared)
+            : shared_(std::move(shared))
+        {
+            shared_->attachedWaiting++;
+        }
+        Waiting(const Waiting &) = delete;
+        auto operator=(const Waiting &) -> Waiting & = delete;
+        Waiting(Waiting && other) noexcept
+            : shared_(std::exchange(other.shared_, nullptr))
+        {
+        }
+        auto operator=(Waiting && other) noexcept -> Waiting &
+        {
+            if (this != &other) {
+                release();
+                shared_ = std::exchange(other.shared_, nullptr);
+            }
+            return *this;
+        }
+        ~Waiting() { release(); }
+
+    private:
+        void release()
+        {
+            if (shared_) {
+                shared_->attachedWaiting--;
+                shared_.reset();
+            }
+        }
+        std::shared_ptr<Shared> shared_;
     };
 
     std::shared_ptr<Shared> shared = std::make_shared<Shared>();
@@ -114,6 +166,8 @@ public:
         std::shared_ptr<Expected::Shared> shared;
         uint64_t assignId = 0;
         bool attach = false;
+        // An attaching call waits from here on, counted before it can.
+        Expected::Waiting waiting;
     };
 
     // A call for the drv: any BuildDerivation, also one answered NOT_FOUND,

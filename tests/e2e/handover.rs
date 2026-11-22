@@ -81,6 +81,11 @@ fn build_argv<'a>(store: &'a str, slow: &'a str, tag: &'a str, hold: bool) -> Ve
 // A build through gRPC in unit `tag` that runs until `release`d; returns
 // once it runs.
 fn start_build(tag: &str) {
+    start_build_with(tag, &[]);
+}
+
+// start_build with more options for its `nix build`.
+fn start_build_with(tag: &str, extra: &[&str]) {
     let slow = env("NGS_SLOW_EXPR");
     let store = store();
     let out = format!(r#""$@" > /root/{tag}.out"#);
@@ -96,6 +101,7 @@ fn start_build(tag: &str) {
         "sh",
     ];
     argv.extend(build_argv(&store, &slow, tag, true));
+    argv.extend_from_slice(extra);
     succeed(&argv);
     retry(&[(MACHINE, tag)],"the build started", || starts(tag) > 0);
 }
@@ -120,6 +126,25 @@ fn release(tag: &str) {
     retry(&[(MACHINE, tag)],&format!("{tag} released"), || try_release(tag));
 }
 
+// Re-checks `cond` until it holds, failing the test once it has been
+// checked for `secs` in steps of 500 ms: for what follows another event at
+// once, which a fault would otherwise have the test wait for forever,
+// since the VM test has no global timeout (tests/lib/waits.nix cancels
+// it). A build left running by a fault keeps its generation alive, and
+// with it every later wait for that generation's exit in this module.
+// Counted, not timed: a pause of the whole sandbox (a farm freezing it)
+// pauses the nodes too, and spends at most one step of it, the sleep that
+// spans it ending at the thaw.
+fn within(secs: u64, what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..secs * 2 {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(cond(), "not within {secs}s: {what}");
+}
+
 fn starts(tag: &str) -> usize {
     query(MACHINE, &["journalctl", "-u", tag])
         .lines()
@@ -130,7 +155,11 @@ fn starts(tag: &str) -> usize {
 // Waits for the build in unit `tag` and checks it ran once, succeeded, and
 // left a valid output.
 fn finished_once(tag: &str) {
-    retry(&[], &format!("{tag} ended"), || ended(tag));
+    // Started again is a fault at once: it would only end later.
+    retry(&[], &format!("{tag} ended"), || {
+        assert_eq!(starts(tag), 1, "build {tag} was started again");
+        ended(tag)
+    });
     let result = unit_result(MACHINE, tag);
     assert_eq!(
         result,
@@ -236,7 +265,9 @@ pub mod upgrade {
         finished_once("long");
 
         // 5. The old process is gone and the new generation serves.
-        retry(&[], "the old generation exited", || !alive(&old));
+        // With its one build over, it has nothing left to drain (it exited
+        // within 0.4 s in earlier runs).
+        within(120, "the old generation exited", || !alive(&old));
         let new = main_pid();
         assert_ne!(new, old);
         let new_exe = exe(&new);
@@ -277,7 +308,8 @@ pub mod upgrade {
         release("stopped-new");
         finished_once("stopped-old");
         finished_once("stopped-new");
-        retry(&[], "the stopped daemon ended", || ended(UNIT));
+        // Within 1.5 s in earlier runs.
+        within(120, "the stopped daemon ended", || ended(UNIT));
         assert_eq!(
             journal_count(MACHINE, UNIT, "SIGKILL"),
             kills,
@@ -307,13 +339,87 @@ pub mod upgrade {
         assert!(alive(&first) && alive(&second), "a predecessor left early");
         release("chain");
         finished_once("chain");
-        retry(&[], "both predecessors exited", || {
+        // Within 1.4 s in earlier runs.
+        within(120, "both predecessors exited", || {
             !alive(&first) && !alive(&second)
         });
         assert_eq!(main_pid(), third);
         wait_journal_above(UNIT, &format!("event=predecessor_exited pid={second}$"), 0, &[UNIT]);
         assert_eq!(unit_state(UNIT), "active");
         quick_build("chain-later");
+    }
+
+    // The client of a build that runs across a takeover is sent to the new
+    // generation and follows its build on: its call stays on the old one.
+    // The old one's linger for that client runs out (longer than the hold,
+    // Core::holdMs, so the linger binds) while the build runs; the build
+    // must still finish once.
+    #[test]
+    fn a_build_followed_across_a_takeover_outlives_the_old_generations_linger() {
+        warm("warm-follow");
+        let expired = journal_count(MACHINE, UNIT, "event=linger_expired drv=.*-slow-follow.drv state=assigned");
+        start_build_with("follow", &["--option", "grpc-linger", "70"]);
+        take_over_into(other("next", "base"));
+        wait_journal_above(
+            UNIT,
+            "event=linger_expired drv=.*-slow-follow.drv state=assigned",
+            expired,
+            &[UNIT, "follow"],
+        );
+        // Revoked there once no call waits for it: its client's does. The
+        // mark comes with the linger's end (under 2 ms later in earlier
+        // runs); a revoke outright never marks it, and its client builds
+        // again.
+        within(60, "the followed build marked to be revoked once uncalled", || {
+            journal_count(MACHINE, UNIT, "event=revoke_once_uncalled drv=.*-slow-follow.drv") > 0
+        });
+        // Marked, it runs on while its client's call waits: held for
+        // `FOLLOW_HOLD_STEPS` steps after the mark, through as many of the
+        // builder's cancel polls (every 200 ms), it is neither ended nor
+        // started again.
+        for _ in 0..FOLLOW_HOLD_STEPS {
+            assert_eq!(
+                journal_count(MACHINE, UNIT, "event=revoked_uncalled drv=.*-slow-follow.drv"),
+                0,
+                "the followed build was revoked while its client waited"
+            );
+            assert_eq!(starts("follow"), 1, "build follow was started again");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        release("follow");
+        finished_once("follow");
+    }
+
+    // Steps of 500 ms a followed build is held after its mark: 20 s at the
+    // least, 100 of the builder's cancel polls.
+    const FOLLOW_HOLD_STEPS: u32 = 40;
+
+    // The client of a build that runs across a takeover goes for good. Once
+    // its linger on the old generation is over, its call there gone, the
+    // build is revoked, and the old generation, with nothing left to drain,
+    // exits.
+    #[test]
+    fn a_build_nobody_follows_after_a_takeover_is_revoked_once_its_linger_is_over() {
+        warm("warm-orphan");
+        let expired = journal_count(MACHINE, UNIT, "event=linger_expired drv=.*-slow-orphan.drv state=assigned");
+        start_build_with("orphan", &["--option", "grpc-linger", "70"]);
+        let old = main_pid();
+        take_over_into(other("next", "base"));
+        succeed(&["systemctl", "kill", "--signal=KILL", "orphan"]);
+        wait_journal_above(
+            UNIT,
+            "event=linger_expired drv=.*-slow-orphan.drv state=assigned",
+            expired,
+            &[UNIT],
+        );
+        // Its call is gone, so the build ends within a poll of the revoke
+        // (0.011 to 0.203 s after the linger's end in earlier runs), and the
+        // old generation with it (0.02 to 4.3 s later in earlier runs).
+        within(60, "the orphan's build revoked once uncalled", || {
+            journal_count(MACHINE, UNIT, "event=revoked_uncalled drv=.*-slow-orphan.drv") > 0
+        });
+        within(120, "the old generation exited", || !alive(&old));
+        warm("after-orphan");
     }
 
     // A new generation with an idle timeout outlives its draining
@@ -326,8 +432,9 @@ pub mod upgrade {
         let new = take_over_into("idle");
         release("idle-long");
         finished_once("idle-long");
-        // 20 s idle timeout, counted from the last call.
-        retry(&[], "the daemon idled out", || ended(UNIT));
+        // 20 s idle timeout, counted from the last call (28.5 s at most in
+        // earlier runs).
+        within(120, "the daemon idled out", || ended(UNIT));
         assert!(!alive(&old) && !alive(&new));
         let log = query(MACHINE, &["journalctl", "-u", UNIT, "--no-pager"]);
         let at = |what: &str| {

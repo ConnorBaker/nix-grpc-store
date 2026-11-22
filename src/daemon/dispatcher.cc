@@ -111,13 +111,13 @@ void Dispatcher::tickLocked()
         dispatchLocked();
         placeabilityChangedLocked();
     }
-    // A scheduler handing over lets its builds run on.
     for (const auto & [wid, drvPath] : revokes) {
         // Its client's hold is over, as a lease's linger (linger_expired).
         logLine(LogLevel::info, {{"event", "hold_expired"}, {"drv", drvPath}});
-        if (!lettingGo) {
-            revokeOn(wid, drvPath);
-        }
+        // A scheduler handing over sent its clients to the new one, and one
+        // that follows its build still waits on the call it made here: such a
+        // build runs on until that call is gone.
+        revokeOn(wid, drvPath, lettingGo);
     }
     if (core.wake(nowMs())) {
         membershipChangedLocked();
@@ -496,11 +496,12 @@ void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
          {"revoke", core.worker(loser).addr}});
 }
 
-void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath)
+void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath, bool onceUncalled)
 {
     if (auto const wit = workers.find(wid); wit != workers.end()) {
         SchedCmd cmd;
         cmd.mutable_revoke()->set_drv_path(drvPath);
+        cmd.mutable_revoke()->set_once_uncalled(onceUncalled);
         wit->second->send(cmd);
     }
 }
@@ -518,10 +519,8 @@ void Dispatcher::expireLingersLocked()
             continue;
         }
         logLine(LogLevel::info, {{"event", "linger_expired"}, {"drv", ent->drvPath}, {"state", "assigned"}});
-        // A scheduler handing over lets its builds run on.
-        if (!lettingGo) {
-            revokeOn(wid, ent->drvPath);
-        }
+        // As for a hold (tickLocked).
+        revokeOn(wid, ent->drvPath, lettingGo);
     }
     // Nothing else need happen for a while: without this the gauges kept
     // a forgotten build `lingering` until some other event exported them.
@@ -772,9 +771,10 @@ void Dispatcher::onRelease(Client & client, const nix::remote::Release & release
         held = core.release(lease, now, now + config.maxLingerMs, revokes);
     }
     for (auto [drv, wid] : revokes) {
-        // A scheduler handing over lets its builds run on.
-        if (const auto & ent = core.entry(drv); ent && !lettingGo) {
-            revokeOn(wid, ent->drvPath);
+        // A scheduler handing over revokes a build once no call waits for it
+        // (as at an expiry, tickLocked).
+        if (const auto & ent = core.entry(drv); ent) {
+            revokeOn(wid, ent->drvPath, lettingGo);
         }
     }
     logLine(
@@ -801,9 +801,12 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
     std::vector<sched::DrvId> kept;
     core.clientGone(client.id, now, revokes, kept);
     for (auto [drv, wid] : revokes) {
-        // A scheduler handing over lets its builds run on.
-        if (const auto & ent = core.entry(drv); ent && !lettingGo) {
-            revokeOn(wid, ent->drvPath);
+        // A scheduler handing over sent its clients to the new one: one that
+        // follows its build there still waits on the call it made here, so
+        // the build is revoked once no call waits for it (as at an expiry,
+        // tickLocked).
+        if (const auto & ent = core.entry(drv); ent) {
+            revokeOn(wid, ent->drvPath, lettingGo);
         }
     }
     // Kept, queued or assigned, for a client that will be back: until its
