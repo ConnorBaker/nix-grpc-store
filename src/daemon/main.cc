@@ -625,6 +625,7 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryPathInfos", nixgrpc::Role::readOnly);
+            metrics.countPathsAsked("QueryPathInfos", static_cast<size_t>(request->paths_size()));
             auto const localStore = local.shared();
             for (const auto & name : request->paths()) {
                 nix::StorePath const path(name);
