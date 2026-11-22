@@ -1,3 +1,5 @@
+use std::thread;
+
 use super::helpers::*;
 use crate::harness::*;
 
@@ -1173,8 +1175,8 @@ fn farm_gives(path: &str) {
 
 /// An input the farm counts as held whose NAR the cache lost: the dependant
 /// below `tag`'s job cannot get it anywhere. Returns its path and NAR.
-fn lost_input(tag: &str, nondet: bool) -> (String, String) {
-    let inp = input_only_in_the_cache(tag, nondet);
+fn lost_input(tag: &str, nondet: bool, held: bool) -> (String, String) {
+    let inp = input_only_in_the_cache(tag, nondet, held);
     let nar = nar_of(&inp);
     lose(&nar);
     // The farm still counts it as held: niks3 lists it as a closure root.
@@ -1219,7 +1221,7 @@ fn lost_input_is_built_for_a_build_hook_s_job() {
         })
         .expect("no tag whose input's derivation sorts first");
     let tag = tag.as_str();
-    let (inp, nar) = lost_input(tag, false);
+    let (inp, nar) = lost_input(tag, false, false);
     // The client has it, built again here: the hook does not upload it,
     // since the farm counts it as held.
     let again = succeed(
@@ -1283,7 +1285,7 @@ fn lost_input_is_built_for_a_build_hook_s_job() {
 #[test]
 fn lost_input_is_built_for_its_user_on_the_same_worker() {
     farm_ready();
-    let (inp, nar) = lost_input("lostsame", false);
+    let (inp, nar) = lost_input("lostsame", false, false);
     // Nothing drains here, so a give-back of worker1's own is a placement
     // that expired unclaimed (Builder::tick).
     let no_shows = || events(WORKER1, "give_back");
@@ -1308,7 +1310,7 @@ fn lost_input_is_built_for_its_user_on_the_same_worker() {
 #[test]
 fn lost_input_rebuilt_on_one_worker_reaches_its_user_on_another() {
     farm_ready();
-    let (inp, nar) = lost_input("lostcross", false);
+    let (inp, nar) = lost_input("lostcross", false, false);
     // The input builds on worker1 alone (vip), its user on worker2 alone (w2).
     let built = build_dep_job(&envoy(), "lostcross", r#"["w2"]"#, false);
     assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
@@ -1328,7 +1330,7 @@ fn lost_input_rebuilt_with_other_bytes_reaches_its_user_on_another() {
     farm_ready();
     // As the test above, but the input has other bytes on every build, so
     // its rebuild's NAR is another object than the one the cache lost.
-    let (inp, nar) = lost_input("lostbytes", true);
+    let (inp, nar) = lost_input("lostbytes", true, false);
     let built = build_dep_job(&envoy(), "lostbytes", r#"["w2"]"#, true);
     assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
     assert!(
@@ -1344,36 +1346,120 @@ fn lost_input_rebuilt_with_other_bytes_reaches_its_user_on_another() {
     farm_gives(built.stdout.trim());
 }
 
+/// From the last of a run's builds to its client's exit, which has only
+/// its outputs to fetch then (about 0.6 s, from its last BuildDerivation to
+/// its disconnect), counted in the polls of `retry` (500 ms each): 120 s.
+/// Counted, not timed: a pause of the whole sandbox (a farm freezing it)
+/// pauses the client too, and spends at most one poll of it, the sleep
+/// that spans it ending at the thaw.
+const LAST_BUILD_TO_EXIT_POLLS: u32 = 240;
+
+/// From the input's rebuild running to both its users having missed it
+/// (the second miss came about 1.5 s after the rebuild was placed), counted
+/// in the same polls: 120 s.
+const BOTH_MISSED_POLLS: u32 = 240;
+
 #[test]
 fn lost_input_missed_by_two_users_at_once_is_built_once() {
     farm_ready();
-    let (inp, nar) = lost_input("losttwo", false);
+    // Held: its rebuild runs until both users missed it. A user that comes
+    // to the input once its rebuild is in the cache gets it on the retry
+    // without cached narinfos (gatherInputs), and misses nothing.
+    let (inp, nar) = lost_input("losttwo", false, true);
     let lost = |w| events(w, "input_lost");
     let (lost1, lost2) = (lost(WORKER1), lost(WORKER2));
     let builds = || events(WORKER1, "built") + events(WORKER2, "built");
     let builds0 = builds();
     // One user per worker, so both try the input at once.
     let users = format!(
-        r#"map (u: (import {} {{ tag = "losttwo"; salt = u.salt; features = [ "vip" ]; jobFeatures = u.features; }}).job) [ {{ salt = "1"; features = [ "vip" ]; }} {{ salt = "2"; features = [ "w2" ]; }} ]"#,
+        r#"map (u: (import {} {{ tag = "losttwo"; salt = u.salt; features = [ "vip" ]; jobFeatures = u.features; held = true; }}).job) [ {{ salt = "1"; features = [ "vip" ]; }} {{ salt = "2"; features = [ "w2" ]; }} ]"#,
         expr("DEP")
     );
-    let built = run(
-        CLIENT,
-        &[
-            "nix",
-            "build",
-            "-L",
-            "--no-link",
-            "--print-out-paths",
-            "--store",
-            &envoy(),
-            "--eval-store",
-            "auto",
-            "--impure",
-            "--expr",
-            &users,
-        ],
-    );
+    let built = thread::scope(|s| {
+        let built = s.spawn(|| {
+            run(
+                CLIENT,
+                &[
+                    "nix",
+                    "build",
+                    "-L",
+                    "--no-link",
+                    "--print-out-paths",
+                    "--store",
+                    &envoy(),
+                    "--eval-store",
+                    "auto",
+                    "--impure",
+                    "--expr",
+                    &users,
+                ],
+            )
+        });
+        // The rebuild, on worker1 alone (vip), is released once it runs and
+        // both users missed the input. A user that never names it leaves the
+        // rebuild held, and the client with it: once the rebuild has run for
+        // `BOTH_MISSED_POLLS`, it is released, the client stopped, and the
+        // test failed. Polls count only while the rebuild runs: a rebuild
+        // that never starts still waits here.
+        let mut fault = None;
+        let mut polls = 0;
+        retry(&[], "both users missed the input, its rebuild running", || {
+            if built.is_finished() {
+                return true;
+            }
+            if fault.is_none() {
+                let running = run(WORKER1, BUILDER).code == 0;
+                if running && lost(WORKER1) > lost1 && lost(WORKER2) > lost2 {
+                    return true;
+                }
+                polls += u32::from(running);
+                if polls > BOTH_MISSED_POLLS {
+                    fault = Some(format!(
+                        "not both users missed the input {BOTH_MISSED_POLLS} polls into its rebuild"
+                    ));
+                }
+            }
+            if fault.is_some() {
+                release_slow();
+                run(CLIENT, &["pkill", "-f", "nix buil[d] -L --no-link"]);
+            }
+            false
+        });
+        // Released until the users' build is over. Once the input and its
+        // two users are built, a client waiting on a job nobody answers, or
+        // on a further build, gives no event: it fails the test once it
+        // outlives them by `LAST_BUILD_TO_EXIT_POLLS`, and is stopped, so
+        // the test ends instead of holding its VM. A run that hangs before
+        // its third build still waits here.
+        let mut polls = 0;
+        retry(&[], "the users' build over, its held builds released", || {
+            if built.is_finished() {
+                return true;
+            }
+            if fault.is_none() {
+                release_slow();
+                if builds() - builds0 >= 3 {
+                    polls += 1;
+                }
+                if polls > LAST_BUILD_TO_EXIT_POLLS && !built.is_finished() {
+                    fault = Some(format!(
+                        "the client still running {LAST_BUILD_TO_EXIT_POLLS} polls after its last build"
+                    ));
+                }
+            }
+            if fault.is_some() {
+                run(CLIENT, &["pkill", "-f", "nix buil[d] -L --no-link"]);
+            }
+            false
+        });
+        // A client stopped here panics its thread (the ssh command lost),
+        // with its output: the fault is the test's failure.
+        let built = built.join();
+        if let Some(fault) = fault {
+            panic!("{fault}");
+        }
+        built.expect("the users' build")
+    });
     assert_eq!(built.code, 0, "the build failed: {}", built.stderr);
     assert!(
         lost(WORKER1) > lost1 && lost(WORKER2) > lost2,

@@ -163,7 +163,7 @@ let
     mk' top "farm-top" [ a b ]
   '';
   depExpr = pkgs.writeText "dep.nix" ''
-    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features, nondet ? false }:
+    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features, nondet ? false, held ? false }:
     rec {
       input = if inputPath != null then builtins.storePath inputPath else derivation {
         name = "local-input-''${tag}";
@@ -171,7 +171,9 @@ let
         requiredSystemFeatures = features;
         builder = "/bin/sh";
         # nondet: other bytes on every build, as many real builds have.
-        args = [ "-c" (if nondet then "read u < /proc/sys/kernel/random/uuid; echo ''${tag} $u > $out" else "echo ''${tag} > $out") ];
+        # held: runs until a test releases it, as slow.nix does; the same
+        # bytes either way.
+        args = [ "-c" ((if held then "/bin/sh -c ': | { exec 3<>/proc/self/fd/0; read x <&3; }' slow-holding; " else "") + (if nondet then "read u < /proc/sys/kernel/random/uuid; echo ''${tag} $u > $out" else "echo ''${tag} > $out")) ];
       };
       referrer = derivation {
         name = "refers-to-input-''${tag}";
