@@ -63,6 +63,16 @@ struct Expected
         {
             return revokeOnceUncalled && ownerGone && attachedWaiting == 0;
         }
+        // Owner only: whether to end the build because uncalled() holds,
+        // noting that this is why it ended.
+        [[nodiscard]] auto endsUncalled(bool ownerGone) -> bool
+        {
+            if (!uncalled(ownerGone)) {
+                return false;
+            }
+            endedUncalled = true;
+            return true;
+        }
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
         static constexpr uint64_t checkMode = 2; // nix::bmCheck
@@ -245,6 +255,11 @@ public:
     void finishBuiltHere();
     // A call that claimed `drvPath` returns, however it went.
     void callEnded(const std::string & drvPath);
+    // The owner's build ended cancelled, after its finished(). Counts a revoke
+    // that ended it as one `revoked` event: the owner may have ended it
+    // uncalled and an outright Revoke for it still come before it gets here.
+    // True if one came outright: its caller hears it was superseded.
+    auto endedCancelled(const Expected::Shared & shared, const std::string & drvPath) -> bool;
 
     // A call for a drv, from claim() to callEnded().
     class Call

@@ -173,6 +173,19 @@ auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
     return adm;
 }
 
+auto Builder::endedCancelled(const Expected::Shared & shared, const std::string & drvPath) -> bool
+{
+    bool const uncalled = shared.endedUncalled;
+    bool const outright = shared.revoked;
+    if (uncalled) {
+        logLine(LogLevel::info, {{"event", "revoked_uncalled"}, {"drv", drvPath}});
+    }
+    if (uncalled || outright) {
+        metrics.event("revoked");
+    }
+    return outright;
+}
+
 void Builder::finished(
     const std::string & drvPath,
     nix::remote::Done::Outcome outcome,
