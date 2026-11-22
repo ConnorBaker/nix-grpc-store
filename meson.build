@@ -430,6 +430,13 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('backend', executable('backend-test',
+    sources : ['tests/backend-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+    dependencies : [dispatcher_dep, nix_util_dep, nix_store_dep],
+  ))
+
   test('build-log', executable('build-log-test',
     sources : ['tests/build-log-test.cc'],
     include_directories : [src_inc],

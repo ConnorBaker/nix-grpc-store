@@ -354,3 +354,72 @@ fn add_path_through_envoy() {
     succeed(&["test", "-e", p.trim()]);
     assert_journal("nix-grpc-daemon", "event=rpc method=Connect");
 }
+
+/// A build names the client it is for to its nix-daemon connection, as
+/// Nix's `build-client`: an anonymous caller's session (x-nix-session, 32
+/// hex digits from the plugin). nix-grpc-daemon-recorded reaches
+/// nix-daemon through a relay that keeps what it sends.
+#[test]
+fn a_build_names_its_client_session_to_the_daemon() {
+    wait_for_unit("nix-grpc-daemon-recorded.service");
+    wait_for_open_port(50055);
+    write_file(
+        "/tmp/client-session.nix",
+        &drv_expr("client-session", "echo named > $out"),
+    );
+    succeed(&[
+        "nix",
+        "build",
+        "--store",
+        "grpc://127.0.0.1:50055?insecure=1",
+        "--eval-store",
+        "local",
+        "--impure",
+        "--no-link",
+        "-f",
+        "/tmp/client-session.nix",
+    ]);
+    // A worker-protocol string: its length as 8 bytes, then the bytes,
+    // padded to 8 with NULs.
+    succeed(&[
+        "grep",
+        "-caP",
+        r"build-client\x00{4} \x00{7}[0-9a-f]{32}",
+        "/run/nix-grpc-recorded/sent",
+    ]);
+}
+
+/// A caller its certificate names (CN localhost) names its builds
+/// `<name>/<session>`: it can name its own sessions only.
+#[test]
+fn a_named_caller_names_its_builds_under_its_name() {
+    wait_for_unit("nix-grpc-daemon-recorded-tls.service");
+    wait_for_open_port(50056);
+    let d = cert_dir();
+    let store = format!(
+        "grpc://localhost:50056?ca-cert={d}/ca.pem&client-cert={d}/client.pem&client-key={d}/client.key"
+    );
+    write_file(
+        "/tmp/client-named.nix",
+        &drv_expr("client-named", "echo named > $out"),
+    );
+    succeed(&[
+        "nix",
+        "build",
+        "--store",
+        &store,
+        "--eval-store",
+        "local",
+        "--impure",
+        "--no-link",
+        "-f",
+        "/tmp/client-named.nix",
+    ]);
+    // "localhost/" and 32 hex digits: 42 bytes, '*'.
+    succeed(&[
+        "grep",
+        "-caP",
+        r"build-client\x00{4}\*\x00{7}localhost/[0-9a-f]{32}",
+        "/run/nix-grpc-recorded/sent",
+    ]);
+}

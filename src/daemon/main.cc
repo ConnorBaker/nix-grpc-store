@@ -375,10 +375,25 @@ private:
         if (rpc.caller.role < nixgrpc::Role::write) {
             return;
         }
-        auto const & meta = rpc.context->client_metadata();
-        if (auto const found = meta.find("x-nix-session"); found != meta.end()) {
-            sessions.hold(std::string_view(found->second.data(), found->second.size()), paths);
+        if (auto const session = sessionOf(*rpc.context); !session.empty()) {
+            sessions.hold(session, paths);
         }
+    }
+
+    // The client's session, empty if it names none.
+    static auto sessionOf(const grpc::ServerContext & context) -> std::string
+    {
+        auto const & meta = context.client_metadata();
+        auto const found = meta.find("x-nix-session");
+        return found == meta.end() ? std::string{} : std::string(found->second.data(), found->second.size());
+    }
+
+    // Who a build is for (buildClient), empty without a well-formed session.
+    static auto clientOf(const Rpc & rpc) -> std::string
+    {
+        auto const named = rpc.caller.kind == nixgrpc::Caller::Kind::named;
+        return nixgrpc::buildClient(
+            named ? std::optional<std::string_view>(rpc.caller.name) : std::nullopt, sessionOf(*rpc.context));
     }
 
 public:
@@ -1120,7 +1135,7 @@ public:
         const nix::BasicDerivation & drv,
         uint64_t assignId,
         nix::BuildMode mode,
-        nixgrpc::Backends::Limits limits,
+        const nixgrpc::Backends::Limits & limits,
         nixgrpc::Metrics::Inputs & inputs,
         nix::remote::BuildDerivationDone & done) -> grpc::Status
     {
@@ -1234,7 +1249,7 @@ public:
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         nix::BuildMode mode,
-        nixgrpc::Backends::Limits limits,
+        const nixgrpc::Backends::Limits & limits,
         const nixgrpc::BuildEventSink & log) -> std::variant<nix::BuildResult, grpc::Status>
     {
         nix::BuildResult res;
@@ -1264,7 +1279,7 @@ public:
         const nix::StorePath & drvPath,
         const nix::BasicDerivation & drv,
         nix::BuildMode mode,
-        nixgrpc::Backends::Limits limits,
+        const nixgrpc::Backends::Limits & limits,
         const nixgrpc::BuildEventSink & log,
         nixgrpc::Metrics::Inputs & inputs,
         const std::map<std::string, nix::StorePath> & outPaths,
@@ -1371,7 +1386,9 @@ public:
             nixcompat::readDrv(drvSource, *localStore, drv, nix::Derivation::nameFromPath(drvPath));
             auto const mode = static_cast<nix::BuildMode>(request->build_mode());
             nixgrpc::Backends::Limits const limits{
-                .buildTimeout = request->build_timeout(), .maxSilentTime = request->max_silent_time()};
+                .buildTimeout = request->build_timeout(),
+                .maxSilentTime = request->max_silent_time(),
+                .client = clientOf(rpc)};
 
             std::vector<nix::StorePath> held{drvPath};
             std::ranges::copy(nixcompat::drvInputs(drv), std::back_inserter(held));

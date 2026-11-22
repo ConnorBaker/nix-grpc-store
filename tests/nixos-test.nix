@@ -260,6 +260,48 @@ pkgs.testers.runNixOSTest {
         '';
       };
 
+      # Records what a daemon sends its nix-daemon: nix-grpc-daemon-recorded
+      # and nix-grpc-daemon-recorded-tls reach nix-daemon through it, and it
+      # appends every byte the connections send to /run/nix-grpc-recorded/sent.
+      systemd.services.nix-daemon-recorder = {
+        wantedBy = [ "multi-user.target" ];
+        after = [ "nix-daemon.socket" ];
+        serviceConfig = {
+          RuntimeDirectory = "nix-grpc-recorded";
+          ExecStart = "${pkgs.python3}/bin/python3 ${./lib/daemon-recorder.py} /run/nix-grpc-recorded/socket /nix/var/nix/daemon-socket/socket /run/nix-grpc-recorded/sent";
+        };
+      };
+
+      systemd.services.nix-grpc-daemon-recorded = {
+        wantedBy = [ "multi-user.target" ];
+        after = [ "nix-daemon-recorder.service" ];
+        requires = [ "nix-daemon-recorder.service" ];
+        serviceConfig.ExecStart = ''
+          ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50055 \
+            --proxy-socket /run/nix-grpc-recorded/socket
+        '';
+      };
+
+      # The same, for callers named by their client certificate.
+      systemd.services.nix-grpc-daemon-recorded-tls = {
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "nix-daemon-recorder.service"
+          "nix-grpc-certs.service"
+        ];
+        requires = [
+          "nix-daemon-recorder.service"
+          "nix-grpc-certs.service"
+        ];
+        serviceConfig.ExecStart = ''
+          ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50056 \
+            --proxy-socket /run/nix-grpc-recorded/socket \
+            --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
+            --client-ca ${certDir}/ca.pem \
+            --allow localhost=write
+        '';
+      };
+
       systemd.services.nix-grpc-daemon-spiffe = {
         wantedBy = [ "multi-user.target" ];
         after = [
