@@ -119,16 +119,24 @@ public:
     // delay the result of its build. The outcome goes to our own log.
     void pushLog(std::string drvPath)
     {
-        std::scoped_lock const lock(logsMutex);
-        if (logs.size() >= maxQueuedLogs) {
-            logLine(LogLevel::info, {{"event", "build_log_dropped"}, {"drv", logs.front()}});
-            logs.pop_front();
+        std::optional<std::string> dropped;
+        {
+            std::scoped_lock const lock(logsMutex);
+            if (logs.size() >= maxQueuedLogs) {
+                dropped = std::move(logs.front());
+                logs.pop_front();
+            }
+            logs.push_back(std::move(drvPath));
+            if (!logWriter.joinable()) {
+                logWriter = std::jthread([this](const std::stop_token & stop) -> void { writeLogs(stop); });
+            }
+            logQueued.notify_one();
         }
-        logs.push_back(std::move(drvPath));
-        if (!logWriter.joinable()) {
-            logWriter = std::jthread([this](const std::stop_token & stop) -> void { writeLogs(stop); });
+        // Not under logsMutex: a write to our stderr that its reader holds up
+        // must not hold up the log writer, nor another pushLog, with it.
+        if (dropped) {
+            logLine(LogLevel::info, {{"event", "build_log_dropped"}, {"drv", *dropped}});
         }
-        logQueued.notify_one();
     }
 
 private:
