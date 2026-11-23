@@ -67,12 +67,14 @@
 // Generic definitions for the std::vector serialiser wrappers used by
 // BuildPaths, which libnixstore does not instantiate explicitly.
 #include <nix/store/worker-protocol-impl.hh> // IWYU pragma: keep
+#include <nix/util/environment-variables.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/hash.hh>
 #include <nix/util/ref.hh>
 #include <nix/util/repair-flag.hh>
+#include <nix/util/users.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/terminal.hh>
@@ -650,8 +652,8 @@ public:
                 nix::StorePath const path(name);
                 std::shared_ptr<const nix::ValidPathInfo> info;
                 try {
-                    substituteIfRemote(*localStore, path);
-                    info = localStore->queryPathInfo(path).get_ptr();
+                    auto const remote = offeredIfRemote(*localStore, path);
+                    info = remote ? remote->info.get_ptr() : localStore->queryPathInfo(path).get_ptr();
                 } catch (nix::Error & err) {
                     if (nixgrpc::LocalStore::lost(err)) {
                         throw;
@@ -855,11 +857,12 @@ public:
     }
 
     // Outputs built on another node live only in the cache. Clients read them back through us.
-    void substituteIfRemote(nix::Store & store, const nix::StorePath & path) const
+    auto offeredIfRemote(nix::Store & store, const nix::StorePath & path) const -> std::optional<nixgrpc::Cache::Offered>
     {
-        if (coord.cache.hasRemote()) {
-            nixgrpc::Cache::substitute(store, path);
+        if (!coord.cache.hasRemote() || store.isValidPath(path)) {
+            return std::nullopt;
         }
+        return coord.cache.offered(store, path);
     }
 
     static auto parseTargets(nix::Store & store, const auto & strings) -> std::vector<nix::DerivedPath>
@@ -1504,9 +1507,10 @@ public:
 
             for (int idx = 0; idx < request->paths_size(); ++idx) {
                 nix::StorePath const path(request->paths(idx));
-                substituteIfRemote(*localStore, path);
-                tagged.setPath(
-                    static_cast<uint32_t>(idx), localStore->queryPathInfo(path)->narHash.to_string(nix::HashFormat::SRI, true));
+                auto const remote = offeredIfRemote(*localStore, path);
+                nix::Store & from = remote ? *remote->store : *localStore;
+                auto const info = remote ? remote->info : from.queryPathInfo(path);
+                tagged.setPath(static_cast<uint32_t>(idx), info->narHash.to_string(nix::HashFormat::SRI, true));
                 if (skip != 0) { // path 0 only: past it, skip is 0
                     // The client has this much of the NAR already.
                     nix::remote::NarFrame resumed;
@@ -1515,7 +1519,7 @@ public:
                         throw nix::Error("gRPC stream closed by peer");
                     }
                 }
-                localStore->narFromPath(path, counting);
+                from.narFromPath(path, counting);
                 if (skip != 0) {
                     return {grpc::StatusCode::OUT_OF_RANGE, "resume offset past the end of " + request->paths(idx)};
                 }
@@ -1891,6 +1895,26 @@ namespace {
 
 constexpr std::string_view unixPrefix = "unix:";
 
+// Nix saves substituter lookups in the home directory. Our user has none.
+// We use systemd's cache directory, or a temporary one if it is not set.
+auto lookupCache() -> std::unique_ptr<nix::AutoDelete>
+{
+    if (nix::getEnv("NIX_CACHE_HOME") || nix::getEnv("XDG_CACHE_HOME")) {
+        return nullptr;
+    }
+    std::unique_ptr<nix::AutoDelete> temporary;
+    std::filesystem::path dir;
+    if (auto const kept = nix::getEnv("CACHE_DIRECTORY")) {
+        dir = std::filesystem::path(kept->substr(0, kept->find(':'))) / "nix";
+        std::filesystem::create_directories(dir);
+    } else {
+        dir = nix::createTempDir(std::filesystem::temp_directory_path(), "nix-grpc-daemon-lookups");
+        temporary = std::make_unique<nix::AutoDelete>(dir);
+    }
+    nix::setEnv("NIX_CACHE_HOME", dir.c_str());
+    return temporary;
+}
+
 // What the daemon may write, execute, connect to and listen on after startup.
 auto sandboxPolicy(const nixgrpc::Options & options, bool listenFdsEmpty) -> nixgrpc::sandbox::Policy
 {
@@ -1899,6 +1923,9 @@ auto sandboxPolicy(const nixgrpc::Options & options, bool listenFdsEmpty) -> nix
     nixgrpc::sandbox::Policy policy;
     policy.execPaths.push_back(CanonicalPath::from(options.storeDir));
     policy.writePaths.push_back(CanonicalPath::from(fs::temp_directory_path()));
+    if (auto const lookups = nix::getCacheDir(); fs::exists(lookups)) {
+        policy.writePaths.push_back(CanonicalPath::from(lookups));
+    }
     for (auto const & path : options.sandboxWrite) {
         policy.writePaths.push_back(CanonicalPath::from(path));
     }
@@ -1993,6 +2020,7 @@ try {
 
     // Required before nix::openStore() in the native RPC handlers.
     nix::initLibStore();
+    auto const lookups = lookupCache();
 
     const std::span args(argv, static_cast<size_t>(argc));
     auto options = nixgrpc::parseOptions({args.begin(), args.end()});

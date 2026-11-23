@@ -6,6 +6,8 @@
 #include <array>
 #include <chrono>
 #include <functional>
+#include <optional>
+#include <string>
 #include <string_view>
 
 #include <grpcpp/support/status.h>
@@ -40,6 +42,19 @@ inline auto tlsRejected(std::string_view msg) -> bool
     return std::ranges::any_of(needles, [&](std::string_view needle) -> bool { return msg.contains(needle); });
 }
 
+// The detail when gRPC could not get the call's credentials, such as an
+// unreadable token file. It reports that as UNAVAILABLE whatever our
+// plugin answered, and no retry helps.
+inline auto credentialsFailed(const grpc::Status & status) -> std::optional<std::string>
+{
+    static constexpr std::string_view prefix = "Getting metadata from plugin failed with error: ";
+    auto const & msg = status.error_message();
+    if (status.error_code() != grpc::StatusCode::UNAVAILABLE || !msg.starts_with(prefix)) {
+        return std::nullopt;
+    }
+    return msg.substr(prefix.size());
+}
+
 // A worker or the balancer restarting under us, not reachable right now, or a
 // worker out of disk. The daemon sends UNAVAILABLE only for those; TLS setup
 // failures are config errors.
@@ -48,7 +63,7 @@ inline auto goneAway(const grpc::Status & status) -> bool
     auto const & msg = status.error_message();
     switch (status.error_code()) {
     case grpc::StatusCode::UNAVAILABLE:
-        return transportError(msg) || !tlsRejected(msg);
+        return !credentialsFailed(status) && (transportError(msg) || !tlsRejected(msg));
     case grpc::StatusCode::CANCELLED:
         // The daemon shut down, exiting idle or handing over to its
         // successor, before a handler took the call. gRPC words that with
@@ -66,6 +81,10 @@ inline auto goneAway(const grpc::Status & status) -> bool
 // on another one.
 inline auto workerLeft(const grpc::Status & status) -> bool
 {
+    // Our own credentials, which no other worker takes either.
+    if (credentialsFailed(status)) {
+        return false;
+    }
     switch (status.error_code()) {
     case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
     case grpc::StatusCode::ABORTED:             // superseded: the scheduler already sent where to go
@@ -85,6 +104,9 @@ inline auto workerLeft(const grpc::Status & status) -> bool
 // the stream already delivered can retry this safely.
 inline auto streamBroken(const grpc::Status & status) -> bool
 {
+    if (credentialsFailed(status)) {
+        return false;
+    }
     auto const & msg = status.error_message();
     switch (status.error_code()) {
     case grpc::StatusCode::UNKNOWN:

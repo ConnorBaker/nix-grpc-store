@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -11,6 +12,7 @@
 #include <initializer_list>
 #include <optional>
 #include <ratio>
+#include <span>
 #include <string>
 #include <set>
 #include <string_view>
@@ -173,7 +175,12 @@ Dispatcher::Lock::~Lock()
 {
     std::vector<std::function<void()>> run;
     run.swap(disp.deferred);
+    std::string logged;
+    logged.swap(disp.logged);
     disp.mutex.unlock();
+    if (!logged.empty()) {
+        static_cast<void>(std::fputs(logged.c_str(), stderr));
+    }
     for (auto const & func : run) {
         // A destructor must not throw. Deferred work is stream I/O kick-off,
         // a failure there ends that stream and is not ours to report.
@@ -287,7 +294,9 @@ void Dispatcher::membershipChangedLocked()
     auto next = std::make_shared<Membership>();
     for (size_t wid = 0; wid < core.workerCount(); wid++) {
         const auto & wkr = core.worker(static_cast<sched::WorkerId>(wid));
-        if (!wkr.up) {
+        // A name without a port is a builder behind a tunnel. The balancer
+        // finds it by that name and has nothing to dial.
+        if (!wkr.up || !wkr.addr.contains(':')) {
             continue;
         }
         for (const auto & system : wkr.systems) {
@@ -318,10 +327,20 @@ auto Dispatcher::nowMs() const -> double
     return std::chrono::duration<double, std::milli>(Clock::now() - epoch).count();
 }
 
-void Dispatcher::debugLog(std::initializer_list<LogField> fields) const
+void Dispatcher::log(LogLevel level, std::span<const LogField> fields)
+{
+    appendLogLine(logged, level, fields);
+}
+
+void Dispatcher::log(LogLevel level, std::initializer_list<LogField> fields)
+{
+    log(level, std::span<const LogField>(fields.begin(), fields.size()));
+}
+
+void Dispatcher::debugLog(std::initializer_list<LogField> fields)
 {
     if (config.logLevel == LogLevel::debug) {
-        logLine(LogLevel::debug, fields);
+        log(LogLevel::debug, fields);
     }
 }
 
@@ -430,10 +449,12 @@ auto Dispatcher::dispatchOnceLocked() -> bool
             waited = &metrics.queueWait(ent->system);
         }
         waited->Observe((nowMs() - ent->enqMs) / msPerSecond);
-        debugLog(
+        log(
+            LogLevel::info,
             {{"event", "assigned"},
              {"drv", ent->drvPath},
-             {"worker", wkr.addr},
+             {"assign_id", std::to_string(asg.assignId)},
+             {"addr", wkr.addr},
              {"clients", std::to_string(asg.clients.size())}});
     }
     return dropped;
@@ -457,6 +478,7 @@ void Dispatcher::exportStats(bool force)
             metrics.schedSystem(key.system, key.features, "queued", sst.queued),
             metrics.schedSystem(key.system, key.features, "unplaceable", sst.unplaceable),
             metrics.schedSystem(key.system, key.features, "running", sst.running),
+            metrics.schedSystem(key.system, key.features, "workers", sst.workers),
             metrics.schedSystem(key.system, key.features, "slots", sst.slots),
             metrics.schedSystem(key.system, key.features, "free", sst.free),
             metrics.schedSystem(key.system, key.features, "lingering", sst.lingering),
@@ -488,7 +510,7 @@ void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
     }
     revokeOn(loser, ent->drvPath);
     metrics.event("superseded");
-    logLine(
+    log(
         LogLevel::info,
         {{"event", "superseded"},
          {"drv", ent->drvPath},
@@ -887,7 +909,7 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
         supersede(sup.drv, sup.loser);
     }
     placeabilityChangedLocked();
-    logLine(
+    log(
         LogLevel::info,
         {{"event", "worker_hello"},
          {"addr", hel.addr()},
@@ -922,6 +944,18 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
         counted = &metrics.eventCounter("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
     }
     counted->Increment();
+    // A worker logs only the builds it finished, and not on this host: this
+    // line is the one place that has every outcome next to its worker.
+    std::vector<LogField> fields{
+        {"event", "done"},
+        {"drv", done.drv_path()},
+        {"assign_id", std::to_string(done.assign_id())},
+        {"addr", core.worker(wid).addr},
+        {"outcome", nix::remote::Done::Outcome_Name(done.outcome())}};
+    if (done.reason() != nix::remote::Done::REASON_UNSPECIFIED) {
+        fields.emplace_back("reason", nix::remote::Done::Reason_Name(done.reason()));
+    }
+    log(LogLevel::info, fields);
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
         // The client uploads a missing input to this worker, which can then run the drv.
         bool const blameless =
@@ -929,7 +963,7 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
         bool const held = core.giveBack(lease, blameless ? sched::GaveBack::worker : sched::GaveBack::drv);
         if (held && done.reason() == nix::remote::Done::TRANSIENT_FAILURE) {
             if (auto const rest = core.failed(wid, nowMs())) {
-                logLine(
+                log(
                     LogLevel::info,
                     {{"event", "rested"},
                      {"addr", core.worker(wid).addr},
@@ -984,7 +1018,7 @@ void Dispatcher::workerGone(Worker & worker)
     if (!worker.id) {
         return;
     }
-    logLine(LogLevel::info, {{"event", "worker_gone"}, {"addr", core.worker(*worker.id).addr}});
+    log(LogLevel::info, {{"event", "worker_gone"}, {"addr", core.worker(*worker.id).addr}});
     core.workerGone(*worker.id, nowMs());
     workers.erase(*worker.id);
     membershipChangedLocked();

@@ -371,6 +371,28 @@ def test_external_worker_advertises_the_address_of_its_node() -> None:
     assert "--advertise=$(HOST_IP):50052" in arm["args"]
 
 
+def test_the_daemon_reads_what_the_spire_helper_writes() -> None:
+    spec = pod("spire", "worker-x86")
+    conf = pick("spire", "ConfigMap", "-worker-x86-spiffe-helper")["data"]
+    lines = conf["helper.conf"].splitlines()
+    written = dict(line.replace('"', "").split(" = ", 1) for line in lines[:5])
+    directory = written["cert_dir"]
+
+    def file(key: str) -> str:
+        return f"{directory}/{written[key]}"
+
+    args = container("spire", "worker-x86", "nix-grpc-daemon")["args"]
+    assert f"--tls-cert={file('svid_file_name')}" in args
+    assert f"--tls-key={file('svid_key_file_name')}" in args
+    assert f"--client-ca={file('svid_bundle_file_name')}" in args
+    assert f"--niks3-token-file={directory}/niks3-token" in args
+    assert 'jwt_svid_file_name = "niks3-token"' in conf["helper.conf"]
+    # The files exist before the daemon starts.
+    assert "daemon_mode = false" in conf["helper-once.conf"]
+    assert named(spec["initContainers"], "svid-init") is not None
+    assert named(spec["containers"], "spiffe-helper") is not None
+
+
 def test_extra_volumes_reach_the_nix_daemon_container_only() -> None:
     for group in ("x86", "arm"):
         spec = pod("extra-volumes", f"worker-{group}")
@@ -384,6 +406,24 @@ def test_extra_volumes_reach_the_nix_daemon_container_only() -> None:
         }
         assert mounted == {"nix-daemon": "/etc/nix/secrets"}
     assert named(pod("default", "worker-x86")["volumes"], "nix-secrets") is None
+
+
+def test_a_store_on_the_node_gets_a_directory_per_group_and_a_node_per_pod() -> None:
+    for group in ("x86", "arm"):
+        spec = pod("store-host-path", f"worker-{group}")
+        assert named(spec["volumes"], "nix") == {
+            "name": "nix",
+            "hostPath": {
+                "path": f"/mnt/local/nix/default/t/{group}",
+                "type": "DirectoryOrCreate",
+            },
+        }
+        (term,) = dig(
+            spec, "affinity", "podAntiAffinity", "requiredDuringSchedulingIgnoredDuringExecution"
+        )
+        assert term["topologyKey"] == HOSTNAME
+        assert term["labelSelector"]["matchLabels"]["nix-grpc-farm/group"] == group
+    assert dig(pod("default", "worker-x86"), "affinity", "podAntiAffinity") is None
 
 
 @pytest.mark.parametrize("name", ["default", "cert-manager"])

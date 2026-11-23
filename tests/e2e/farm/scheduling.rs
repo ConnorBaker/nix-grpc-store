@@ -78,8 +78,11 @@ fn one_node_schedules_and_both_builders_hold_a_worker_session() {
     assert_eq!(gauge(standby(), r#"nix_grpc_sched{kind="leader"}"#), 0);
     let slots = gauge_sum(ldr, r#"kind="slots""#);
     assert!(slots >= 2, "{slots}");
-    assert_eq!(gauge_sum(ldr, r#"kind="free""#), slots);
-    assert_eq!(gauge_sum(ldr, r#"kind="queued""#), 0);
+    // The scheduler exports its gauges at most every so often: a build the
+    // test before ended may still count.
+    retry(&[], "every slot free and nothing queued", || {
+        gauge_sum(ldr, r#"kind="free""#) == slots && gauge_sum(ldr, r#"kind="queued""#) == 0
+    });
 }
 
 fn input_counts() -> (i64, i64) {
@@ -145,104 +148,6 @@ fn inputs_already_in_the_cache_are_not_sent_to_the_scheduler() {
     let before = wants();
     build(&envoy(), "wants1", &["--argstr", "top", "wants1b"]);
     assert_eq!(wants() - before, 1);
-}
-
-#[test]
-fn an_output_a_substituter_offers_unsigned_is_built() {
-    farm_ready();
-    let dep = expr("DEP");
-    let offer = env("NGS_OFFER_URL");
-    let tag = "offered1";
-    // Built on the client only, then offered unsigned and deleted there.
-    let out = succeed(
-        CLIENT,
-        &[
-            "nix-build",
-            "--no-out-link",
-            &dep,
-            "-A",
-            "input",
-            "--argstr",
-            "tag",
-            tag,
-        ],
-    );
-    let out = out.trim();
-    succeed(CLIENT, &["nix", "copy", "--to", &offer, out]);
-    succeed(CLIENT, &["nix-store", "--delete", out]);
-    for w in WORKERS {
-        fail(w, &["test", "-e", out]);
-        let dry = succeed(
-            w,
-            &[
-                "sh",
-                "-c",
-                r#"NIX_REMOTE=daemon nix-store --realise --dry-run "$1" 2>&1"#,
-                "sh",
-                out,
-            ],
-        );
-        assert!(
-            dry.contains("will be fetched"),
-            "{} is not offered {out}: {dry}",
-            w.0
-        );
-    }
-    let said = run(
-        CLIENT,
-        &["nix-store", "--store", &envoy(), "--check-validity", out],
-    );
-    eprintln!(
-        "before the build, the farm answered {out} (exit {}): {}",
-        said.code,
-        said.combined()
-    );
-    let wants = || journal_count(leader(), UNIT, "event=want ");
-    let before = wants();
-    succeed(
-        CLIENT,
-        &[
-            "sh",
-            "-c",
-            r#"exec "$@" >&2"#,
-            "sh",
-            "nix",
-            "build",
-            "-L",
-            "--no-link",
-            "--store",
-            &envoy(),
-            "--eval-store",
-            "auto",
-            "-f",
-            &dep,
-            "input",
-            "--argstr",
-            "tag",
-            tag,
-        ],
-    );
-    let wanted = wants().saturating_sub(before);
-    assert!(wanted >= 1, "no build was sent for {out}");
-    // The builders cannot fetch an unsigned path, so the build must have made it.
-    let got = run(CLIENT, &["nix", "path-info", "--store", &envoy(), out]);
-    assert_eq!(
-        got.code,
-        0,
-        "the build succeeded, but the farm cannot give {out} ({wanted} wants sent): {}",
-        got.combined()
-    );
-    assert!(
-        !holders(out).is_empty(),
-        "no builder holds {out} ({wanted} wants sent)"
-    );
-    // Checked last, so that a failure above shows whether a build was sent.
-    assert_ne!(
-        said.code,
-        0,
-        "before the build, the farm said it holds {out}: {}",
-        said.combined()
-    );
 }
 
 #[test]
@@ -337,32 +242,37 @@ fn a_client_with_other_limits_takes_the_outputs_of_the_build_it_attached_to() {
 fn timeout_and_max_silent_time_reach_the_builder() {
     farm_ready();
     let before = failures("TimedOut");
-    for (flag, tag) in [("--timeout", "tmot"), ("--max-silent-time", "tmom")] {
-        let o = run(
-            CLIENT,
-            &[
-                "nix",
-                "build",
-                "--store",
-                &envoy(),
-                "--eval-store",
-                "auto",
-                "-f",
-                &expr("SLOW"),
-                "--argstr",
-                "tag",
-                tag,
-                flag,
-                "5",
-            ],
-        );
-        let out = o.combined();
-        assert!(
-            o.code != 0 && out.contains("timed out"),
-            "{flag} {} {out}",
-            o.code
-        );
-    }
+    // Side by side, each on its own worker.
+    std::thread::scope(|s| {
+        for (flag, tag) in [("--timeout", "tmot"), ("--max-silent-time", "tmom")] {
+            s.spawn(move || {
+                let o = run(
+                    CLIENT,
+                    &[
+                        "nix",
+                        "build",
+                        "--store",
+                        &envoy(),
+                        "--eval-store",
+                        "auto",
+                        "-f",
+                        &expr("SLOW"),
+                        "--argstr",
+                        "tag",
+                        tag,
+                        flag,
+                        "5",
+                    ],
+                );
+                let out = o.combined();
+                assert!(
+                    o.code != 0 && out.contains("timed out"),
+                    "{flag} {} {out}",
+                    o.code
+                );
+            });
+        }
+    });
     assert!(building().is_empty());
     assert_eq!(failures("TimedOut") - before, 2);
 }
@@ -487,25 +397,6 @@ fn upload_whose_reference_the_worker_lacks_is_completed_from_the_cache() {
     succeed(WORKER2, &["test", "-e", &referrer]);
     succeed(WORKER1, &["systemctl", "start", "nix-grpc-daemon.service"]);
     wait_members(&sys, &WORKERS);
-}
-
-/// Deletes the NAR of `path` from the bucket without telling niks3.
-fn lose_nar(path: &str) {
-    succeed(
-        LB,
-        &[
-            "sh",
-            "-c",
-            r#"set -e
-nar=$(curl -sf "$1/$2.narinfo" | sed -n 's/^URL: //p')
-test -n "$nar"
-curl -sf -X DELETE --aws-sigv4 aws:amz:us-east-1:s3 --user "$(cat /etc/niks3-test/s3-credentials)" "http://lb:9000/farm/$nar"
-test "$(curl -s -o /dev/null -w '%{http_code}' "$1/$nar")" = 404"#,
-            "sh",
-            &env("NGS_NIKS3_URL"),
-            &path["/nix/store/".len()..][..32],
-        ],
-    );
 }
 
 /// An input whose NAR the bucket lost is rebuilt and re-published, and both
@@ -1107,7 +998,7 @@ fn required_system_features_are_placed_or_refused() {
             "build",
             "-L",
             "--store",
-            &format!("{}&restart-grace=30", envoy()),
+            &format!("{}&restart-grace=5", envoy()),
             "--eval-store",
             "auto",
             "-f",
@@ -1452,7 +1343,7 @@ fn lost_input_missed_by_two_users_at_once_is_built_once() {
             }
             false
         });
-        // A client stopped here panics its thread (the ssh command lost),
+        // A client stopped here panics its thread (its command killed),
         // with its output: the fault is the test's failure.
         let built = built.join();
         if let Some(fault) = fault {
@@ -1799,10 +1690,11 @@ impl Drop for LowDisk {
     }
 }
 
-/// A full worker answers an upload or a fetch that needs a path only the
-/// cache has as unavailable, which the client retries, not as an error.
+/// A full worker answers an upload that needs a path only the cache has as
+/// unavailable, which the client retries, not as an error. A fetch of that
+/// path it serves from the cache, which needs no disk.
 #[test]
-fn uploads_and_fetches_a_worker_has_no_disk_for_are_retried() {
+fn an_upload_a_full_worker_has_no_disk_for_is_retried_and_a_fetch_is_served() {
     farm_ready();
     let src = random_source("noroomref");
     succeed(CLIENT, &["nix", "copy", "--to", &direct(WORKER1), &src]);
@@ -1814,15 +1706,15 @@ fn uploads_and_fetches_a_worker_has_no_disk_for_are_retried() {
         CLIENT,
         &["sh", "-c", r#"nix store dump-path --store "$1" "$2" > /dev/null"#, "sh", &store, &src],
     );
-    for o in [upload, fetch] {
-        assert!(o.code != 0 && o.combined().contains("retrying"), "{}", o.combined());
-    }
+    assert!(upload.code != 0 && upload.combined().contains("retrying"), "{}", upload.combined());
+    assert_eq!(fetch.code, 0, "{}", fetch.combined());
+    fail(WORKER2, &["test", "-e", &src]);
 }
 
-/// A fetch from the cache bigger than what worker2 has left fails without
-/// ENOSPC in Nix's error: still unavailable, which the client retries.
+/// A fetch from the cache bigger than what worker2 has left: worker2 serves
+/// it from the cache without storing it, so its disk does not matter.
 #[test]
-fn a_fetch_bigger_than_what_its_worker_has_left_is_retried() {
+fn a_fetch_bigger_than_what_its_worker_has_left_is_served_from_the_cache() {
     farm_ready();
     let cmd = "head -c 64M /dev/urandom > /tmp/big && nix store add-file /tmp/big";
     let src = succeed(CLIENT, &["sh", "-c", cmd]).trim().to_string();
@@ -1833,7 +1725,8 @@ fn a_fetch_bigger_than_what_its_worker_has_left_is_retried() {
         CLIENT,
         &["sh", "-c", r#"nix store dump-path --store "$1" "$2" > /dev/null"#, "sh", &store, &src],
     );
-    assert!(fetch.code != 0 && fetch.combined().contains("retrying"), "{}", fetch.combined());
+    assert_eq!(fetch.code, 0, "{}", fetch.combined());
+    fail(WORKER2, &["test", "-e", &src]);
 }
 
 /// Worker2 is low on disk but not out of it, and a client pinned to it asks

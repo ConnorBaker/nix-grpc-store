@@ -52,11 +52,10 @@ private:
 
 // Opens a tunnel and answers the balancer's pings until it starts a request,
 // then returns the socket with that request unread. Calls `accepted` once the
-// balancer took the tunnel. Returns no socket when
-// `stop` interrupted. Throws when the tunnel cannot be opened or the balancer
+// balancer took the tunnel. Returns no socket when `stop` interrupted. Throws when the tunnel cannot be opened or the balancer
 // closes it.
 auto open(const Target & target, const Tls & tls, const Identity & self, const Wake & stop, const std::function<void()> & accepted = {})
-    -> nix::AutoCloseFD;
+    -> std::optional<nix::AutoCloseFD>;
 
 enum class End : uint8_t {
     closed,
@@ -67,8 +66,8 @@ enum class End : uint8_t {
 // the same socket is in use elsewhere.
 auto waitClosed(int sock, const Wake & stop) -> End;
 
-// The common name of the certificate in `file`: the farm's access rules know
-// the builder by it, and so does the balancer.
+// The name the balancer knows the builder by: the common name of the
+// certificate in `file`, or without one the last segment of its SPIFFE ID.
 auto certName(const std::string & file) -> std::string;
 
 } // namespace nixgrpc::tunnel

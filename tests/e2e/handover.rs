@@ -108,7 +108,7 @@ fn start_build_with(tag: &str, extra: &[&str]) {
 
 // Lets the running build of `tag` end: its builder reads a line from the
 // fifo in its build directory. Nix starts a builder with its base name as
-// argv[0], so the command line is `sh -c mkfifo ...`. The ssh shell's own
+// argv[0], so the command line is `sh -c mkfifo ...`. This probe's own
 // command line does not start as the builder's does, so pgrep finds the
 // builder alone. The fifo is opened without blocking: with no reader (the
 // builder not there yet, or gone) the open fails, ENXIO, instead of
@@ -783,7 +783,7 @@ pub mod failures {
     #[test]
     fn the_offer_refuses_another_unit_and_another_user() {
         warm("warm-refused");
-        // Same user, another cgroup: this ssh session's.
+        // Same user, another cgroup: that of the e2e agent's unit.
         refused(
             "exec setpriv --reuid=nix-grpc-daemon --regid=nix-grpc-daemon --clear-groups",
             "another cgroup",

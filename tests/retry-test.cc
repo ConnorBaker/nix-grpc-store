@@ -48,11 +48,16 @@ void classifiesFarmErrors()
     // Whatever the daemon says with UNAVAILABLE is worth a retry.
     assert(nixgrpc::goneAway(unavailable("publish failed: niks3 push exited with 1")));
     assert(nixgrpc::goneAway(unavailable("no healthy upstream")));
+    // gRPC's words for a token file that cannot be read. Its text may hold any path.
+    assert(!nixgrpc::goneAway(unavailable("Getting metadata from plugin failed with error: reading token file: error: "
+                                          "opening file \"/run/unreachable/token\": No such file or directory")));
     // A call that reached a daemon as it exited idle, before any handler took it.
     assert(nixgrpc::goneAway({grpc::StatusCode::CANCELLED, ""}));
     // The NAR fetcher's own status once it shut down (nar-fetcher.hh).
     assert(!nixgrpc::goneAway({grpc::StatusCode::CANCELLED, "NAR fetcher shut down"}));
     assert(nixgrpc::streamBroken({grpc::StatusCode::UNKNOWN, "Stream removed (Socket closed)"}));
+    assert(!nixgrpc::streamBroken(unavailable("Getting metadata from plugin failed with error: token file '/run/Stream removed/token' is empty or multi-line")));
+    assert(!nixgrpc::workerLeft(unavailable("Getting metadata from plugin failed with error: token file '/run/token' is empty or multi-line")));
 }
 
 // What the store calls and FetchNars retry. Schedule asks none of these:

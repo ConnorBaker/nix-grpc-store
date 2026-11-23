@@ -91,6 +91,8 @@ let
       ];
       # The recovery test uploads a floating content-addressed derivation.
       nix.settings.experimental-features = [ "ca-derivations" ];
+      # Without cache.nixos.org, which the VM cannot reach.
+      nix.settings.substituters = lib.mkForce [ config.services.nix-grpc-daemon.niks3.cacheUrl ];
       services.nix-grpc-daemon = {
         enable = true;
         listen = "[::]:50051";
@@ -110,6 +112,10 @@ let
         accessRules = [
           {
             cn = "ci-*";
+            role = "trusted";
+          }
+          {
+            cn = "spiffe://farm.test/ci/*";
             role = "trusted";
           }
           {
@@ -305,15 +311,15 @@ pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm-${part}";
   globalTimeout = 3600;
 
+  # For the vsock device the agent of tests/e2e listens on.
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
-  # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
-  defaults.boot.initrd.kernelModules = [ "vmw_vsock_virtio_transport" ];
+  defaults.imports = [ (import ./lib/e2e-agent.nix { inherit e2eTests; }) ];
 
   nodes = {
     worker1 = {
       imports = [ (worker "worker1") ];
-      testCerts.certs.worker1 = cert "worker-1" "DNS:worker1,DNS:lb,IP:${ip.worker1}";
+      testCerts.certs.worker1 = cert "worker-1" "DNS:worker1,DNS:lb,IP:${ip.worker1},URI:spiffe://farm.test/worker/1";
       nix.settings.system-features = [ "vip" ];
       # Rewritten under the running daemon by the max-jobs e2e test.
       nix.extraOptions = "!include /run/nix-max-jobs.conf";
@@ -323,7 +329,7 @@ pkgs.testers.runNixOSTest {
     };
     worker2 = {
       imports = [ (worker "worker2") ];
-      testCerts.certs.worker2 = cert "worker-2" "DNS:worker2,DNS:lb,IP:${ip.worker2}";
+      testCerts.certs.worker2 = cert "worker-2" "DNS:worker2,DNS:lb,IP:${ip.worker2},URI:spiffe://farm.test/worker/2";
       # Pins a build to worker2, like vip does for worker1.
       nix.settings.system-features = [ "w2" ];
       services.nix-grpc-daemon.extraSystems = [ "riscv64-linux" ];
@@ -373,6 +379,7 @@ pkgs.testers.runNixOSTest {
               certFile = "${certs}/lb-client.pem";
               keyFile = "${certs}/lb-client.key";
               caFile = "${certs}/ca.pem";
+              spiffeId = "spiffe://farm.test/worker/";
             };
           };
         };
@@ -413,6 +420,7 @@ pkgs.testers.runNixOSTest {
         testCerts.certs = {
           ci = cert "ci-1" "DNS:client";
           stranger = cert "stranger" "DNS:client";
+          svid = cert "svid-1" "URI:spiffe://farm.test/ci/one";
           # From a CA nobody in the farm trusts.
           foreign = cert "foreign" "DNS:client" // { ca = "foreign-ca"; };
         };
@@ -426,12 +434,13 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
-    ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/e2e.nix { inherit e2eTests; }}
     ${import ./lib/waits.nix}
     start_all()
     for n, a in [(client, "${ip.client}"), (lb, "${ip.lb}"), (worker1, "${ip.worker1}"), (worker2, "${ip.worker2}")]:
         wait_unit(n, "network-addresses-eth1.service")
         n.succeed(f"ip -4 addr show | grep -qF {a}/ || {{ ip -4 addr >&2; false; }}")
+    wait_unit(client, "test-certs.service")
     wait_unit(lb, "niks3.service")
     wait_unit(lb, "envoy.service")
     wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")

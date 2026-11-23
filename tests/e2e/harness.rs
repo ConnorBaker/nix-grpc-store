@@ -1,47 +1,34 @@
 use std::env as std_env;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{self, Read};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::{Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::wire;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Node(pub &'static str);
 
 pub const MACHINE: Node = Node("machine");
 
+/// Between two looks at a condition. A look costs a round trip of about 20ms.
+const POLL: Duration = Duration::from_millis(100);
+
 pub fn env(key: &str) -> String {
     std_env::var(key).unwrap_or_else(|_| panic!("missing env var {key}"))
-}
-
-fn ssh_args(node: Node) -> Vec<String> {
-    let mut args = vec!["-F".into(), env("NGS_SSH_CONFIG")];
-    for opt in [
-        "User=root",
-        "StrictHostKeyChecking=no",
-        "UserKnownHostsFile=/dev/null",
-        // No ConnectTimeout or ServerAlive: a VM that is gone ends the vsock
-        // connection, an event; one that answers nothing hangs the run.
-        "LogLevel=ERROR",
-    ] {
-        args.push("-o".into());
-        args.push(opt.into());
-    }
-    args.push(format!(
-        "vsock-mux/{}",
-        env(&format!("NGS_{}_SOCK", node.0.to_uppercase()))
-    ));
-    args
 }
 
 pub struct Out {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// ssh itself failed (exit 255) and the command never reported its
-    /// status, so we do not know whether it ran to the end. A command that
-    /// returns 255 on its own still reports, so it is not mistaken for this.
+    /// The connection to the node failed and the command never reported its
+    /// status, so we do not know whether it ran to the end.
     pub lost: bool,
+    /// The node took the command, so it may have run.
+    started: bool,
 }
 
 impl Out {
@@ -50,61 +37,56 @@ impl Out {
     }
 }
 
-fn drain<R: Read + Send + 'static>(mut r: R) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = r.read_to_end(&mut b);
-        String::from_utf8_lossy(&b).into_owned()
-    })
+/// Asks vhost-device-vsock, which listens on `sock` for one VM, for the
+/// agent's port on that VM. No deadline: a VM that is gone ends the
+/// connection, an event; one that answers nothing hangs the run.
+fn connect(sock: &Path) -> io::Result<UnixStream> {
+    use std::io::Write;
+    let stream = UnixStream::connect(sock)?;
+    (&stream).write_all(format!("CONNECT {}\n", wire::PORT).as_bytes())?;
+    let mut answer = Vec::new();
+    let mut byte = [0u8; 1];
+    while byte[0] != b'\n' {
+        (&stream).read_exact(&mut byte)?;
+        answer.push(byte[0]);
+    }
+    if !answer.starts_with(b"OK ") {
+        return Err(io::Error::other(format!(
+            "no agent: {}",
+            String::from_utf8_lossy(&answer).trim()
+        )));
+    }
+    Ok(stream)
 }
 
-/// Runs `cmd` on `node` to its end, however long it takes.
-fn run_once(node: Node, cmd: &str) -> Out {
-    let mut child = Command::new(env("NGS_SSH"))
-        .args(ssh_args(node))
-        .arg(format!(
-            "( set -euo pipefail\n{cmd}\n)\necho \"{RC_MARK}$?\"\n"
-        ))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ssh");
-    // Readers keep a chatty command from filling the pipe and blocking.
-    let out = drain(child.stdout.take().unwrap());
-    let err = drain(child.stderr.take().unwrap());
-    let status = child.wait().expect("wait");
-    let mut stdout = out.join().unwrap();
-    // ssh exits 255 when the remote command dies from a signal, so the
-    // command's own status travels in the output.
-    let (code, lost) = match stdout.rfind(RC_MARK) {
-        Some(at) => {
-            let rc = stdout[at + RC_MARK.len()..].trim().parse().unwrap_or(-1);
-            stdout.truncate(at);
-            (rc, false)
-        }
-        None => (status.code().unwrap_or(-1), status.code() == Some(255)),
-    };
+/// Runs `argv` through the agent behind `sock` to its end, however long it
+/// takes.
+fn exchange(sock: &Path, argv: &[&str]) -> Out {
+    let mut started = false;
+    let mut output = wire::Output::default();
+    let code = (|| {
+        let stream = connect(sock)?;
+        started = true;
+        wire::write_args(&mut &stream, argv)?;
+        wire::receive(&mut &stream, &mut &stream, &mut output)
+    })();
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if let Err(e) = &code {
+        stderr.push_str(&e.to_string());
+    }
     Out {
-        code,
-        stdout,
-        stderr: err.join().unwrap(),
-        lost,
+        code: code.as_ref().map_or(-1, |c| *c),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr,
+        lost: code.is_err(),
+        started,
     }
 }
 
-const RC_MARK: &str = "__NGS_RC=";
-
-fn connect_failed(stderr: &str) -> bool {
-    [
-        "banner exchange",
-        "Connection refused",
-        "Connection timed out",
-        "Connection closed by remote host",
-        "kex_exchange_identification",
-    ]
-    .iter()
-    .any(|m| stderr.contains(m))
+/// Runs `argv` on `node` to its end, however long it takes.
+fn run_once(node: Node, argv: &[&str]) -> Out {
+    let sock = env(&format!("NGS_{}_SOCK", node.0.to_uppercase()));
+    exchange(Path::new(&sock), argv)
 }
 
 static READY: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
@@ -124,60 +106,45 @@ fn ensure_ready(node: Node) {
     if ready.contains(&node.0) {
         return;
     }
-    // No deadline: a backdoor that never comes up hangs the run.
-    while run_once(node, "true").code != 0 {
-        thread::sleep(Duration::from_millis(500));
+    // No deadline: an agent that never comes up hangs the run.
+    while run_once(node, &["true"]).code != 0 {
+        thread::sleep(POLL);
     }
     ready.push(node.0);
 }
 
-/// Runs `attempt` again while ssh fails, with no count. A repeatable command
-/// is retried even if it may have started; any other only if ssh could not
-/// connect, so it cannot run twice.
+/// Runs `attempt` again while the connection fails, with no count. A
+/// repeatable command is retried even if it may have started; any other only
+/// if the node never took it, so it cannot run twice.
 fn retrying(repeatable: bool, mut attempt: impl FnMut() -> Out) -> Out {
     let mut o = attempt();
-    while o.lost && (repeatable || connect_failed(&o.stderr)) {
+    while o.lost && (repeatable || !o.started) {
         thread::sleep(Duration::from_secs(2));
         o = attempt();
     }
     o
 }
 
-/// Quotes `arg` for the remote shell, so it arrives as one word.
-fn quote(arg: &str) -> String {
-    let plain = !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c));
-    if plain {
-        arg.to_string()
-    } else {
-        format!("'{}'", arg.replace('\'', r"'\''"))
-    }
-}
-
-/// The remote command line for `argv`. ssh hands it to the login shell.
+/// `argv` for failure messages. The node gets the arguments themselves.
 fn shell_join(argv: &[&str]) -> String {
-    argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+    argv.join(" ")
 }
 
-fn run_ssh(node: Node, argv: &[&str], repeatable: bool) -> Out {
+fn run_agent(node: Node, argv: &[&str], repeatable: bool) -> Out {
     let cmd = shell_join(argv);
-    let cmd = cmd.as_str();
     ensure_ready(node);
-    let o = retrying(repeatable, || run_once(node, cmd));
+    let o = retrying(repeatable, || run_once(node, argv));
     assert!(
         !o.lost,
-        "[{}] ssh connection lost: {cmd}\n{}",
+        "[{}] connection lost: {cmd}\n{}",
         node.0,
         o.combined()
     );
     o
 }
-
 /// Runs `argv` on `node` to its end, whatever its status.
 pub fn run(node: Node, argv: &[&str]) -> Out {
-    run_ssh(node, argv, false)
+    run_agent(node, argv, false)
 }
 
 /// An argv of `String`s as one of `&str`s.
@@ -187,7 +154,7 @@ pub fn strs(args: &[String]) -> Vec<&str> {
 
 fn expect_ok(node: Node, argv: &[&str], repeatable: bool) -> String {
     let cmd = shell_join(argv);
-    let o = run_ssh(node, argv, repeatable);
+    let o = run_agent(node, argv, repeatable);
     assert_eq!(
         o.code,
         0,
@@ -226,8 +193,8 @@ pub fn fail(node: Node, argv: &[&str]) -> String {
 /// gives no event of. One that never comes hangs the test.
 pub fn wait_until_succeeds(node: Node, argv: &[&str]) {
     println!("[e2e] waiting: [{}] {}", node.0, shell_join(argv));
-    while run_ssh(node, argv, true).code != 0 {
-        thread::sleep(Duration::from_millis(500));
+    while run_agent(node, argv, true).code != 0 {
+        thread::sleep(POLL);
     }
 }
 
@@ -243,7 +210,7 @@ pub fn wait_for_unit(node: Node, unit: &str) {
                 node.0,
                 journal(node, unit)
             ),
-            _ => thread::sleep(Duration::from_millis(500)),
+            _ => thread::sleep(POLL),
         }
     }
 }
@@ -318,7 +285,7 @@ fn grep_pattern(pattern: &str) -> String {
     format!("{body}{anchor}")
 }
 
-/// Filters on the node: long journals over the vsock ssh sometimes stall.
+/// Filters on the node, so a long journal need not cross to the host.
 pub fn journal_matches(node: Node, unit: &str, pattern: &str) -> Vec<String> {
     let regex = grep_pattern(pattern);
     let argv = [
@@ -330,7 +297,7 @@ pub fn journal_matches(node: Node, unit: &str, pattern: &str) -> Vec<String> {
         "--grep",
         &regex,
     ];
-    let o = run_ssh(node, &argv, true);
+    let o = run_agent(node, &argv, true);
     // 1: no line matched.
     assert!(
         o.code <= 1,
@@ -431,6 +398,8 @@ pub fn retry(clients: &[(Node, &str)], what: &str, mut f: impl FnMut() -> bool) 
             }
             panic!("[{}] {c} ended before: {what}\n{}", node.0, journal(node, c));
         }
+        // Not `POLL`: the farm tests count these polls as 500 ms each
+        // (scheduling.rs, LAST_BUILD_TO_EXIT_POLLS and BOTH_MISSED_POLLS).
         thread::sleep(Duration::from_millis(500));
     }
 }
@@ -462,42 +431,108 @@ pub fn unit_result(node: Node, unit: &str) -> String {
 mod tests {
     use super::*;
 
-    fn out(lost: bool, stderr: &str) -> Out {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn out(lost: bool, started: bool) -> Out {
         Out {
-            code: if lost { 255 } else { 0 },
+            code: if lost { -1 } else { 0 },
             stdout: String::new(),
-            stderr: stderr.into(),
+            stderr: String::new(),
             lost,
+            started,
         }
     }
 
-    fn calls(repeatable: bool, stderr: &str) -> u32 {
+    fn calls(repeatable: bool, started: bool) -> u32 {
         let mut n = 0;
         retrying(repeatable, || {
             n += 1;
-            out(n < 3, stderr)
+            out(n < 3, started)
         });
         n
     }
 
     #[test]
     fn a_repeatable_command_is_retried_after_any_drop() {
-        assert_eq!(calls(true, "Connection reset by peer"), 3);
+        assert_eq!(calls(true, true), 3);
     }
 
     #[test]
-    fn another_command_is_retried_only_if_ssh_never_connected() {
-        assert_eq!(calls(false, "Connection reset by peer"), 1);
-        assert_eq!(calls(false, "Connection refused"), 3);
+    fn another_command_is_retried_only_if_the_node_never_took_it() {
+        assert_eq!(calls(false, true), 1);
+        assert_eq!(calls(false, false), 3);
+    }
+
+    /// Stands in for vhost-device-vsock and, if `agent`, the agent behind it.
+    fn node(agent: bool) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let sock = std::env::temp_dir().join(format!(
+            "ngs-{}-{}.sock",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = UnixListener::bind(&sock).unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                thread::spawn(move || {
+                    let mut hello = String::new();
+                    BufReader::new(&stream).read_line(&mut hello).unwrap();
+                    assert_eq!(hello, format!("CONNECT {}\n", wire::PORT));
+                    if !agent {
+                        return;
+                    }
+                    stream.write_all(b"OK 1073741824\n").unwrap();
+                    let argv = wire::read_args(&mut stream).unwrap();
+                    let mut acks = stream.try_clone().unwrap();
+                    let _ = wire::serve(&[], &argv, &mut stream, || acks.read_exact(&mut [0u8; 1]));
+                });
+            }
+        });
+        sock
     }
 
     #[test]
-    fn arguments_reach_the_remote_shell_as_single_words() {
-        assert_eq!(shell_join(&["ls", "-l", "/nix/store"]), "ls -l /nix/store");
-        assert_eq!(
-            shell_join(&["echo", "a b", "", "it's", "$HOME", "x;y"]),
-            r#"echo 'a b' '' 'it'\''s' '$HOME' 'x;y'"#
+    fn a_command_reports_its_status_and_both_streams() {
+        let o = exchange(
+            &node(true),
+            &["bash", "-c", "echo out; echo err >&2; exit 3"],
         );
+        assert_eq!(
+            (o.code, o.stdout.as_str(), o.stderr.as_str()),
+            (3, "out\n", "err\n")
+        );
+        assert!(!o.lost);
+    }
+
+    #[test]
+    fn output_larger_than_one_piece_arrives_whole() {
+        let argv = ["head", "-c", "300000", "/dev/zero"];
+        let o = exchange(&node(true), &argv);
+        assert_eq!((o.code, o.stdout.len()), (0, 300000));
+    }
+
+    #[test]
+    fn arguments_reach_the_command_untouched() {
+        let argv = ["printf", "<%s>", "a b", "", "it's", "$HOME", "x;y\n*"];
+        let o = exchange(&node(true), &argv);
+        assert_eq!(o.stdout, "<a b><><it's><$HOME><x;y\n*>");
+    }
+
+    #[test]
+    fn a_command_killed_by_a_signal_reports_it_like_a_shell() {
+        let o = exchange(&node(true), &["bash", "-c", "kill -KILL $$"]);
+        assert_eq!(o.code, 137);
+        assert!(!o.lost);
+    }
+
+    #[test]
+    fn a_node_without_an_agent_never_took_the_command() {
+        let o = exchange(&node(false), &["true"]);
+        assert!(o.lost && !o.started, "{}", o.stderr);
     }
 
     #[test]

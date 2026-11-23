@@ -478,3 +478,22 @@ pub fn restart_daemon(w: Node) {
     wait_members(&system(), &WORKERS);
     retry(&[], "scheduler settled", settled);
 }
+
+/// Deletes the NAR of `path` from the bucket without telling niks3.
+pub fn lose_nar(path: &str) {
+    succeed(
+        LB,
+        &[
+            "sh",
+            "-c",
+            r#"set -e
+nar=$(curl -sf "$1/$2.narinfo" | sed -n 's/^URL: //p')
+test -n "$nar"
+curl -sf -X DELETE --aws-sigv4 aws:amz:us-east-1:s3 --user "$(cat /etc/niks3-test/s3-credentials)" "http://lb:9000/farm/$nar"
+test "$(curl -s -o /dev/null -w '%{http_code}' "$1/$nar")" = 404"#,
+            "sh",
+            &env("NGS_NIKS3_URL"),
+            &path["/nix/store/".len()..][..32],
+        ],
+    );
+}

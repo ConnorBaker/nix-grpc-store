@@ -160,6 +160,28 @@ unused store paths. The threshold is measured against the node's disk,
 not per pod.
 `store.sizeLimit` is not a quota: going over it evicts the pod.
 
+With `store.storageClass` and `store.size`, `/nix` is a volume of its own
+(a generic ephemeral volume, created and deleted with the pod). Both
+thresholds then measure the store alone, a full store fails a build
+and does not evict the pod, and `store.sizeLimit` has no use.
+
+With `store.hostPath`, `/nix` is a directory on the node, for example on a
+local disk the cluster does not manage:
+
+```yaml
+workerDefaults:
+  store:
+    hostPath: /mnt/local/nix-grpc-farm
+```
+
+Each group keeps its store in `<hostPath>/<namespace>/<release>/<group>`,
+created if missing, and both thresholds measure the disk that holds it.
+The store outlives the pod: a later pod of the group on that node starts
+with its cache unless the image changed, and nothing deletes the
+directory when the group is removed. Only one pod of a group runs per
+node, so a group needs as many nodes as replicas, and a rollout needs a
+free one.
+
 For nodes with a 500 GB disk and two workers each:
 
 ```yaml
@@ -313,6 +335,41 @@ tls:
   lb: {existingSecret: farm-lb-tls}          # kubernetes.io/tls, CN lb
   worker: {existingSecret: farm-worker-tls}  # kubernetes.io/tls, CN worker,
                                              # SAN farm-nix-grpc-farm-scheduler-0.farm.svc, …
+```
+
+### Identities from SPIRE
+
+Workers that join a farm outside the cluster (`scheduler.external`) can
+take their identity from a [SPIRE](https://spiffe.io) agent on the node
+instead of `tls.worker.existingSecret`:
+
+```yaml
+scheduler:
+  external: farm.example.com:50051
+tls:
+  worker:
+    spire:
+      agentSocket: /run/spire/agent/public/api.sock
+      niks3Token: true          # push with the JWT-SVID, no niks3.auth Secret
+auth:
+  trustedProxies: ["spiffe://example.org/farm/lb/*"]
+  accessRules:
+    - {cn: "spiffe://example.org/farm/client/*", role: trusted}
+```
+
+An init container fetches the X.509-SVID, its key and the trust bundle
+with spiffe-helper before the daemon starts, and a sidecar renews them.
+The bundle is the daemon's client CA, so the farm's balancer must present
+an SVID too. `niks3Token` writes the JWT-SVID for `niks3.serverURL` next
+to the certificate, and niks3 must trust the SPIRE server's OIDC issuer.
+
+SPIRE needs a registration entry for the pods, selected by namespace and
+service account (`serviceAccount.name`):
+
+```
+spire-server entry create -spiffeID spiffe://example.org/farm/worker/k8s \
+  -parentID <the nodes' agent or alias ID> \
+  -selector k8s:ns:farm -selector k8s:sa:farm-nix-grpc-farm
 ```
 
 ### Run a standby scheduler

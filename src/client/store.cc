@@ -156,11 +156,19 @@ auto GrpcStore::connectHint(const std::string & msg) const -> std::string
 
 auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> GrpcStatusError
 {
+  if (auto const detail = nixgrpc::credentialsFailed(status)) {
+    // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
+    return GrpcStatusError(status, "gRPC %s on '%s' failed: %s", opName, config->authority.to_string(), *detail);
+  }
   std::string hint;
   auto const code = status.error_code();
-  if (!config->insecure &&
-      (code == grpc::StatusCode::UNAUTHENTICATED || code == grpc::StatusCode::UNAVAILABLE)) {
+  if (!config->insecure && code == grpc::StatusCode::UNAVAILABLE) {
     hint = connectHint(status.error_message());
+  } else if (!config->insecure && code == grpc::StatusCode::UNAUTHENTICATED && !haveClientCert) {
+    // The handshake went through, the server wants to know who we are.
+    hint = "\nhint: no client certificate or token was sent. Set 'client-cert'/'client-key' or "
+           "'token-file', or install client.crt/client.key or token in "
+           "$XDG_DATA_HOME/nix-grpc-store or /var/lib/nix-grpc-store.";
   }
   // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
   return GrpcStatusError(status, "gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),

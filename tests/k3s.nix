@@ -185,6 +185,12 @@ let
       publicKeys = [ signingPublicKey ];
       auth.serviceAccountToken.enabled = true;
     };
+    # The VM has no route to cache.nixos.org and every build would wait for
+    # its lookup to time out.
+    upstreamCaches = {
+      urls = [ ];
+      publicKeys = [ ];
+    };
     auth.workloadIdentity = {
       enabled = true;
       allowedServiceAccounts = [ "ci:builder" ];
@@ -290,8 +296,12 @@ pkgs.testers.runNixOSTest {
       services.k3s = {
         enable = true;
         role = "server";
-        # The gc subtest fills the disk on purpose.
-        extraFlags = [ "--kubelet-arg=eviction-hard=nodefs.available<1%,imagefs.available<1%" ];
+        extraFlags = [
+          # The gc subtest fills the disk on purpose.
+          "--kubelet-arg=eviction-hard=nodefs.available<1%,imagefs.available<1%"
+          # A changed Secret reaches its volume within this, a minute by default.
+          "--kubelet-arg=sync-frequency=5s"
+        ];
         disable = [
           "traefik"
           "metrics-server"
@@ -430,7 +440,6 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a renewed balancer certificate is served without a rollout"):
         kubectl("create secret tls farm-lb-tls --cert=${certs}/lb-renewed.crt --key=${certs}/lb-renewed.key --dry-run=client -o yaml | kubectl -n farm apply -f -")
-        # kubelet syncs Secret volumes about once a minute.
         lb_pod = kubectl("get pods -l app.kubernetes.io/component=lb -o jsonpath='{.items[0].metadata.name}'")
         wait_succeeds(machine, f"kubectl -n farm exec {lb_pod} -- cat /etc/envoy/tls/lb/tls.crt | openssl x509 -noout -ext subjectAltName | grep -q renewed.example")
         wait_succeeds(

@@ -56,12 +56,12 @@ struct Farm
         },
         {});
 
-    void hello(Dispatcher::Worker & session, const std::string & addr, uint32_t slots = 2)
+    void hello(Dispatcher::Worker & session, const std::string & addr, uint32_t slots = 2, const std::string & system = "x")
     {
         nix::remote::WorkerMsgs msgs;
         auto * hel = msgs.add_msgs()->mutable_hello();
         hel->set_addr(addr);
-        hel->add_systems("x");
+        hel->add_systems(system);
         hel->set_max_jobs(slots);
         disp.workerMsgs(session, msgs);
     }
@@ -1361,6 +1361,22 @@ void testFarmPlacesABuiltinWhenFull()
     assert((hub.expected == std::vector<std::string>{"a.drv", "f.drv"}));
 }
 
+// A builder behind a tunnel has no address the balancer could dial. Queries
+// and uploads for its system go to the builders that have one.
+void aSystemWithOnlyTunnelledBuildersGetsTheDialledOnes()
+{
+    Farm farm;
+    Session dialled;
+    Session tunnelled;
+    farm.hello(dialled.conn, "10.0.0.1:50052");
+    farm.hello(tunnelled.conn, "worker/arm-1", 2, "arm");
+    auto const members = farm.disp.membership();
+    auto const arm = Dispatcher::membersFor(*members, "arm");
+    assert(arm.size() == 1 && arm.at(0).addr == "10.0.0.1:50052");
+    farm.disp.workerGone(dialled.conn);
+    farm.disp.workerGone(tunnelled.conn);
+}
+
 } // namespace
 
 auto main() -> int
@@ -1372,6 +1388,7 @@ try {
     testReplacedSessionAfterTheWorkerLeft();
     testLateFirstHelloEndsInAReconnect();
     loadRestoresSlotsAfterDrainingHello();
+    aSystemWithOnlyTunnelledBuildersGetsTheDialledOnes();
     aSystemWithoutBuildersGetsEveryBuilder();
     aClientThatCannotReachItsWorkerIsSentElsewhere(false);
     aClientThatCannotReachItsWorkerIsSentElsewhere(true);

@@ -65,7 +65,7 @@ const RETRY_MARKERS: [&str; 4] = [
     ", reconnecting",
 ];
 
-/// Runs `argv` on the VM and returns the elapsed seconds, so ssh latency stays out of it.
+/// Runs `argv` on the VM and returns the elapsed seconds, so the round trip to the VM stays out of it.
 fn timed(argv: &[&str]) -> f64 {
     let script = r#"s=$(date +%s%N); rc=0; "$@" >/root/timed.log 2>&1 || rc=$?; e=$(date +%s%N);
                     echo $(( (e - s) / 1000000 )); exit $rc"#;

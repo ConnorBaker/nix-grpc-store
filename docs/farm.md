@@ -449,7 +449,7 @@ what the derivations require (`features=""` for none, otherwise sorted
 and comma-joined like `features="big-parallel,kvm"`), where an impure
 derivation counts as requiring `impure-derivations` too, which no
 builder offers (Step 1). `running`,
-`slots` and `free` are labelled with what the builders offer, under
+`workers`, `slots` and `free` are labelled with what the builders offer, under
 their native system. So a plain x86_64 group scales on
 `{system="x86_64-linux",features=""}` and a kvm group on
 `{system="x86_64-linux",features="kvm"}` independently. What a builder
@@ -593,14 +593,21 @@ cost of one scheduler restart.
 event=rpc method=BuildDerivation cn=ci-build01 duration_s=42 …
 ```
 
-Set `logLevel = "debug"` on the scheduler to also log each request and
-assignment.
+The scheduler logs where each build went and how it ended, also for a
+build that failed or was given back:
+
+```
+event=assigned drv=/nix/store/…-foo.drv assign_id=7 addr=10.0.0.5:50052 clients=1
+event=done drv=/nix/store/…-foo.drv assign_id=7 addr=10.0.0.5:50052 outcome=FAILED
+```
+
+Set `logLevel = "debug"` on the scheduler to also log each request.
 
 **Metrics.** Set `services.nix-grpc-daemon.metricsListen` on workers and
 scrape envoy's admin port (`/stats/prometheus`). The scheduler adds
 `nix_grpc_sched{kind="queued|workers|rested|clients|leader"}` and, per system
 and feature set,
-`nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|slots|free|lingering"}`.
+`nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|workers|slots|free|lingering"}`.
 Only the node holding the lock has `leader` 1 and non-zero values, so
 aggregate with `max by (system, kind)` over the scheduler nodes. A
 Grafana dashboard for all of it ships as `deploy/helm/nix-grpc-farm/files/farm.json`

@@ -1477,7 +1477,8 @@ public:
         size_t lingering = 0;
         // Keyed by what the worker offers (native system).
         size_t running = 0; // assigned, until the worker's Done
-        size_t slots = 0;   // maxJobs of workers that take work
+        size_t workers = 0; // that take work
+        size_t slots = 0;   // their maxJobs
         size_t free = 0;
     };
 
@@ -1529,6 +1530,7 @@ public:
             if (!wkr.takesWork()) {
                 continue;
             }
+            sst.workers++;
             sst.slots += wkr.maxJobs;
             sst.free += wkr.maxJobs - std::min<size_t>(wkr.maxJobs, wkr.running.size());
         }

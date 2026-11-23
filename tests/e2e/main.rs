@@ -11,3 +11,4 @@ mod latency;
 mod lifecycle;
 mod transfer;
 mod upload;
+mod wire;

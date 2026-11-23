@@ -9,7 +9,7 @@
   module,
   mockOidc,
   e2eTests,
-  # "main", "upload" or "floating"
+  # "main", "upload", "floating" or "bench"
   phase ? "main",
 }:
 
@@ -50,12 +50,12 @@ pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-${phase}";
   globalTimeout = 900;
 
-  # The Rust tests in tests/e2e run on the driver host and drive the VM over
-  # the vsock ssh backdoor, so independent tests overlap.
+  # The Rust tests in tests/e2e run on the driver host and drive the VM through
+  # an agent on vsock, so independent tests overlap. The backdoor brings the
+  # vsock device.
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
-  # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
-  defaults.boot.initrd.kernelModules = [ "vmw_vsock_virtio_transport" ];
+  defaults.imports = [ (import ./lib/e2e-agent.nix { inherit e2eTests; }) ];
 
   nodes.machine =
     { config, lib, ... }:
@@ -323,7 +323,7 @@ pkgs.testers.runNixOSTest {
     };
 
   testScript = ''
-    ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/e2e.nix { inherit e2eTests; }}
     ${import ./lib/waits.nix}
     wait_unit(machine, "nix-daemon.socket")
     wait_unit(machine, "nix-grpc-daemon.socket")
@@ -353,9 +353,8 @@ pkgs.testers.runNixOSTest {
         )
         machine.fail("test -e /nix/var/log/nix/drvs/zy/old-retention.drv.bz2")
         machine.succeed("test -e /nix/var/log/nix/drvs/zx/fresh-retention.drv.bz2")
-
-    with subtest("benchmarks"):
-        run_e2e({"machine": machine}, env, "bench::", "--test-threads=1")
+  '' + pkgs.lib.optionalString (phase == "bench") ''
+    run_e2e({"machine": machine}, env, "bench::", "--test-threads=1")
   '' + pkgs.lib.optionalString (phase == "upload") ''
     with subtest("concurrent uploads of one input"):
         run_e2e({"machine": machine}, env, "upload::", "--test-threads=1")

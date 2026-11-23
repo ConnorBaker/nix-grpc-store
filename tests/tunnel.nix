@@ -50,7 +50,7 @@ let
         accessRules = map (cn: {
           inherit cn;
           role = "trusted";
-        }) [ "ci-*" "lb-*" "worker-*" ];
+        }) [ "ci-*" "lb-*" "worker-*" "spiffe://farm.test/worker/*" ];
         niks3 = {
           package = niks3.packages.${system}.niks3;
           url = niks3Url;
@@ -68,7 +68,7 @@ let
   # balancer tells them apart by host name.
   tunnelled = feature: {
     imports = [ builder ];
-    testCerts.certs.node = cert "worker-2" "DNS:tunnelled,DNS:tunnelled.test";
+    testCerts.certs.node = pkgs.lib.mkDefault (cert "worker-2" "DNS:tunnelled,DNS:tunnelled.test");
     nix.settings.system-features = [ feature ];
     services.nix-grpc-daemon.roles = [ "builder" ];
     services.nix-grpc-daemon.tunnel.balancers = [ "lb:${toString tunnelPort}" ];
@@ -100,6 +100,11 @@ pkgs.testers.runNixOSTest {
 
     tunnelled1 = tunnelled "one";
     tunnelled2 = tunnelled "two";
+    # Known by its SPIFFE ID alone, as with a certificate from SPIRE.
+    tunnelled3 = {
+      imports = [ (tunnelled "three") ];
+      testCerts.certs.node = cert null "DNS:tunnelled,URI:spiffe://farm.test/worker/svid";
+    };
 
     lb = {
       imports = [
@@ -116,6 +121,7 @@ pkgs.testers.runNixOSTest {
         scheduler = [ "${dialledIp}:50051" ];
         healthCheckInterval = "1s";
         tunnel.listen = "[::]:${toString tunnelPort}";
+        tunnel.spiffeId = "spiffe://farm.test/worker/";
         tls = tls // {
           upstream = {
             inherit (tls) certFile keyFile;
@@ -153,7 +159,7 @@ pkgs.testers.runNixOSTest {
     start_all()
     wait_unit(lb, "niks3.service")
     wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")
-    for node in [dialled, tunnelled1, tunnelled2]:
+    for node in [dialled, tunnelled1, tunnelled2, tunnelled3]:
         node.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 
     wait_unit(client, "test-certs.service")
@@ -176,6 +182,9 @@ pkgs.testers.runNixOSTest {
         tunnelled2.succeed(f"test -e {build('mixed2', 'two')}")
         assert requests("tunnelled") > 0, "the build did not go through a tunnel"
         assert requests("tunnelled-any") == 0, "store queries left the dialled builder"
+
+    with subtest("a builder known by its SPIFFE ID alone gets its build through a tunnel"):
+        tunnelled3.succeed(f"test -e {build('svid', 'three')}")
 
     with subtest("a client's certificate opens no tunnel"):
         # As the builders do it, for the set that gets what any builder may answer.

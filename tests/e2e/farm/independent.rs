@@ -30,11 +30,34 @@ fn outputs_carry_the_cache_signature() {
     );
 }
 
+/// Storing the path would block on a client that runs on the same machine.
+#[test]
+fn a_worker_serves_a_path_it_lacks_without_storing_it() {
+    farm_ready();
+    let out = build(&envoy(), "served", &[]);
+    for w in WORKERS {
+        succeed(CLIENT, &["nix", "path-info", "--store", &direct(w), &out]);
+        let dump = format!("nix store dump-path --store '{}' {out} >/dev/null", direct(w));
+        succeed(CLIENT, &["sh", "-c", &dump]);
+    }
+    assert_eq!(holders(&out).len(), 1, "{:?}", holders(&out));
+}
+
 /// Queries and uploads do not need a builder of the client's system.
 #[test]
 fn a_system_without_builders_is_served_by_the_default_one() {
     farm_ready();
     let store = format!("{}&system=s390x-linux", envoy());
+    succeed(CLIENT, &["nix", "store", "info", "--store", &store]);
+}
+
+/// The balancer forwards a client's SPIFFE ID, so a node's rule matches it.
+#[test]
+fn a_spiffe_rule_matches_a_client_behind_the_balancer() {
+    farm_ready();
+    let certs = certs();
+    let store =
+        format!("grpc://lb:50051?client-cert={certs}/svid.pem&client-key={certs}/svid.key");
     succeed(CLIENT, &["nix", "store", "info", "--store", &store]);
 }
 
@@ -137,6 +160,18 @@ fn an_input_only_one_worker_has_still_reaches_the_builder() {
     }
 }
 
+/// Nix asks what is missing before it uploads the derivation.
+#[test]
+fn a_derivation_the_farm_has_not_seen_is_announced_as_a_build() {
+    farm_ready();
+    let argv = [
+        "nix", "build", "--dry-run", "--store", &envoy(), "--eval-store", "auto", "-f", &expr("JOB"), "--argstr",
+        "tag", "announced",
+    ];
+    let out = run(CLIENT, &argv).combined();
+    assert!(out.contains("will be built") && !out.contains("don't know how to build"), "{out}");
+}
+
 /// `nix log` against the cache shows why a build failed.
 #[test]
 fn the_log_of_a_failed_build_reaches_the_cache() {
@@ -149,4 +184,102 @@ fn the_log_of_a_failed_build_reaches_the_cache() {
     retry(&[], "the log is in the cache", || {
         run(CLIENT, &["nix", "log", "--store", &cache, &drv]).combined().contains("BOOM-logged")
     });
+}
+
+#[test]
+fn an_output_a_substituter_offers_unsigned_is_built() {
+    farm_ready();
+    let dep = expr("DEP");
+    let offer = env("NGS_OFFER_URL");
+    let tag = "offered1";
+    // Built on the client only, then offered unsigned and deleted there.
+    let out = succeed(
+        CLIENT,
+        &[
+            "nix-build",
+            "--no-out-link",
+            &dep,
+            "-A",
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+        ],
+    );
+    let out = out.trim();
+    succeed(CLIENT, &["nix", "copy", "--to", &offer, out]);
+    succeed(CLIENT, &["nix-store", "--delete", out]);
+    for w in WORKERS {
+        fail(w, &["test", "-e", out]);
+        let dry = succeed(
+            w,
+            &[
+                "sh",
+                "-c",
+                r#"NIX_REMOTE=daemon nix-store --realise --dry-run "$1" 2>&1"#,
+                "sh",
+                out,
+            ],
+        );
+        assert!(
+            dry.contains("will be fetched"),
+            "{} is not offered {out}: {dry}",
+            w.0
+        );
+    }
+    let said = run(
+        CLIENT,
+        &["nix-store", "--store", &envoy(), "--check-validity", out],
+    );
+    eprintln!(
+        "before the build, the farm answered {out} (exit {}): {}",
+        said.code,
+        said.combined()
+    );
+    let wants = || journal_count(leader(), UNIT, "event=want ");
+    let before = wants();
+    succeed(
+        CLIENT,
+        &[
+            "sh",
+            "-c",
+            r#"exec "$@" >&2"#,
+            "sh",
+            "nix",
+            "build",
+            "-L",
+            "--no-link",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &dep,
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+        ],
+    );
+    let wanted = wants().saturating_sub(before);
+    assert!(wanted >= 1, "no build was sent for {out}");
+    // The builders cannot fetch an unsigned path, so the build must have made it.
+    let got = run(CLIENT, &["nix", "path-info", "--store", &envoy(), out]);
+    assert_eq!(
+        got.code,
+        0,
+        "the build succeeded, but the farm cannot give {out} ({wanted} wants sent): {}",
+        got.combined()
+    );
+    assert!(
+        !holders(out).is_empty(),
+        "no builder holds {out} ({wanted} wants sent)"
+    );
+    // Checked last, so that a failure above shows whether a build was sent.
+    assert_ne!(
+        said.code,
+        0,
+        "before the build, the farm said it holds {out}: {}",
+        said.combined()
+    );
 }

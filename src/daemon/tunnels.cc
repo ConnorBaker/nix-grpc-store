@@ -143,13 +143,21 @@ void Tunnels::stirAll(bool anyOnly)
 
 void Tunnels::supervise()
 {
+    // What each balancer's last lookup failed with, to say it once.
+    std::vector<std::string> failed(config.balancers.size());
     while (!stopping) {
         for (size_t index = 0; index < config.balancers.size(); index++) {
+            auto & said = failed.at(index);
             try {
                 refresh(index, config.balancers.at(index));
+                said.clear();
             } catch (nix::Error & err) {
                 // Keeps the addresses it had.
-                logLine(LogLevel::info, {{"event", "tunnel_resolve_failed"}, {"error", nix::filterANSIEscapes(err.info().msg.str(), true)}});
+                auto error = nix::filterANSIEscapes(err.info().msg.str(), true);
+                if (error != said) {
+                    logLine(LogLevel::info, {{"event", "tunnel_resolve_failed"}, {"error", error}});
+                    said = std::move(error);
+                }
             }
         }
         (void) pause.wait(config.resolveEvery);
@@ -237,6 +245,8 @@ auto Tunnels::leaves(const Slot & slot) const -> bool
 void Tunnels::run(Slot & slot, Group & group)
 {
     unsigned failures = 0;
+    // The last error, to say each one once.
+    std::string said;
     while (!stopping) {
         // Cleared before the flags are read, so that no change is missed.
         slot.stir.clear();
@@ -256,15 +266,15 @@ void Tunnels::run(Slot & slot, Group & group)
             // A tunnel that lasted was not a failure to open one.
             if (std::chrono::steady_clock::now() - since >= maxPause) {
                 failures = 0;
+                said.clear();
             }
         } catch (nix::Error & err) {
-            if (failures == 0) {
+            auto error = nix::filterANSIEscapes(err.info().msg.str(), true);
+            if (error != said) {
                 logLine(
                     LogLevel::info,
-                    {{"event", "tunnel_failed"},
-                     {"balancer", slot.target.host},
-                     {"address", slot.target.address},
-                     {"error", nix::filterANSIEscapes(err.info().msg.str(), true)}});
+                    {{"event", "tunnel_failed"}, {"balancer", slot.target.host}, {"address", slot.target.address}, {"error", error}});
+                said = std::move(error);
             }
         }
         if (!group.listed) {
@@ -310,11 +320,11 @@ void Tunnels::hold(Slot & slot, Group & group)
         return;
     }
     // The second descriptor shows when the new owner's socket ended, and can end it.
-    const nix::AutoCloseFD watch{dup(sock.get())};
+    const nix::AutoCloseFD watch{dup(sock->get())};
     if (!watch) {
         throw nix::SysError("dup");
     }
-    if (!handOver(std::move(sock))) {
+    if (!handOver(std::move(*sock))) {
         left = true;
         return;
     }

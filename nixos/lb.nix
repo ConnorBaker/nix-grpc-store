@@ -62,16 +62,24 @@ let
           ];
         }
         // (
-          if sni == null then
+          if sni == null && cfg.tls.upstream.spiffeId == null then
             { validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile; }
           else
             {
               combined_validation_context = {
                 default_validation_context.match_typed_subject_alt_names = [
-                  {
-                    san_type = "DNS";
-                    matcher.exact = sni;
-                  }
+                  (
+                    if sni != null then
+                      {
+                        san_type = "DNS";
+                        matcher.exact = sni;
+                      }
+                    else
+                      {
+                        san_type = "URI";
+                        matcher.prefix = cfg.tls.upstream.spiffeId;
+                      }
+                  )
                 ];
                 validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile;
               };
@@ -308,12 +316,21 @@ let
 
   # The common name of the builder's certificate if `tunnel.names` lists it.
   # Envoy gives the subject as text, common name first.
+  # With `tunnel.spiffeId` a certificate without common name is known by
+  # what follows that prefix in its SPIFFE ID.
   peerName =
     let
       pattern = lib.replaceStrings [ "." "*" ] [ "\\." "[^,+/\\\\]*" ];
       names = lib.concatMapStringsSep "|" pattern cfg.tunnel.names;
+      prefix = lib.replaceStrings [ "." ] [ "\\." ] cfg.tunnel.spiffeId;
+      byName = "re.extract(connection.subject_peer_certificate, r'^CN=(${names})(,|$)', r'\\1')";
+      bySpiffeId = "re.extract(connection.uri_san_peer_certificate, r'^${prefix}([A-Za-z0-9._-]+)$', r'\\1')";
     in
-    "%CEL(re.extract(connection.subject_peer_certificate, r'^CN=(${names})(,|$)', r'\\1'))%";
+    if cfg.tunnel.spiffeId == null then
+      "%CEL(${byName})%"
+    else
+      # A certificate without URI has no such field to test, so ask for the name.
+      "%CEL(connection.subject_peer_certificate.startsWith('CN=') ? ${byName} : ${bySpiffeId})%";
 
   # A builder joins the set its ALPN name asks for, under its certificate's name.
   tunnelChain = protocol: validation: {
@@ -531,6 +548,18 @@ in
           the same CA, such as `ci-1`, is then refused.
         '';
       };
+      spiffeId = lib.mkOption {
+        type = lib.types.nullOr (lib.types.strMatching "spiffe://[a-z0-9._-]+/([A-Za-z0-9._-]+/)*");
+        default = null;
+        example = "spiffe://example.org/farm/worker/";
+        description = ''
+          Which certificates may open a tunnel, by SPIFFE ID, next to
+          those of `tunnel.names`. A certificate may if its ID is this
+          prefix followed by one more segment, and that segment is the
+          builder's name. Meant for certificates without a common name, as
+          SPIRE issues them.
+        '';
+      };
       threads = lib.mkOption {
         type = lib.types.ints.between 1 256;
         default = 4;
@@ -566,8 +595,8 @@ in
         type = lib.types.nullOr lib.types.path;
         default = null;
         description = ''
-          Verify client certificates against this CA and forward the subject to
-          workers in `x-forwarded-client-cert`. Clients without a certificate
+          Verify client certificates against this CA and forward the subject and
+          SPIFFE ID to workers in `x-forwarded-client-cert`. Clients without a certificate
           are still accepted so bearer tokens keep working. The header is
           always overwritten, a client cannot inject one.
         '';
@@ -596,6 +625,17 @@ in
           default = null;
           description = "SNI and name to verify on worker certificates. Unset verifies the chain only.";
         };
+        spiffeId = lib.mkOption {
+          type = lib.types.nullOr (lib.types.strMatching "spiffe://.+/");
+          default = null;
+          example = "spiffe://example.org/farm/worker/";
+          description = ''
+            Verify workers by SPIFFE ID in place of {option}`sni`: the ID in a
+            worker's certificate must start with this prefix. Use it when
+            {option}`caFile` is the bundle of a trust domain, which signs
+            other workloads too.
+          '';
+        };
       };
     };
   };
@@ -611,6 +651,10 @@ in
       scheduler = lib.mkDefault (lib.head cfg.workers.${cfg.defaultSystem});
     };
     assertions = [
+      {
+        assertion = cfg.tls.upstream.sni == null || cfg.tls.upstream.spiffeId == null;
+        message = "services.nix-grpc-farm-lb.tls.upstream.sni and spiffeId exclude each other";
+      }
       {
         assertion = (cfg.tls.certFile == null) == (cfg.tls.keyFile == null);
         message = "services.nix-grpc-farm-lb.tls.certFile and keyFile go together";
@@ -691,7 +735,11 @@ in
                           };
                         };
                         forward_client_cert_details = "SANITIZE_SET";
-                        set_current_client_cert_details.subject = true;
+                        # The URI too: a node matches `spiffe://` rules on it.
+                        set_current_client_cert_details = {
+                          subject = true;
+                          uri = true;
+                        };
                         route_config.virtual_hosts = [
                           {
                             name = "farm";

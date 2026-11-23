@@ -285,6 +285,16 @@ auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets) -> Missin
   for (const auto & path : reply.unknown()) {
     res.unknown.insert(StorePath(path));
   }
+  // Nix asks before it uploads the derivation. The farm does not know it
+  // yet and will build it once it does.
+  for (const auto & target : targets) {
+    if (const auto * built = std::get_if<DerivedPath::Built>(&target.raw())) {
+      if (const auto * drv = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw());
+          drv != nullptr && res.unknown.erase(drv->path) > 0) {
+        res.willBuild.insert(drv->path);
+      }
+    }
+  }
   res.downloadSize = reply.download_size();
   res.narSize = reply.nar_size();
   return res;

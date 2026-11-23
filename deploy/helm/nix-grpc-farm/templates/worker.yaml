@@ -1,6 +1,10 @@
 {{- include "farm.validate" . }}
 {{- $root := . }}
 {{- $oidc := include "farm.oidcProviders" . }}
+{{- $spire := .Values.tls.worker.spire }}
+{{- $clientCA := include "farm.tlsSecret" (list . "clientCA") }}
+{{- /* TLS towards the balancer: a certificate from a Secret, or the SVID */}}
+{{- $tls := or (include "farm.tlsSecret" (list . "worker")) $spire.agentSocket }}
 {{- range $g, $overrides := .Values.workers }}
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ($overrides | default dict) }}
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
@@ -11,6 +15,13 @@
 {{- if not (include "farm.tlsSecret" (list $root "worker")) }}{{ fail (printf "workers.%s.tunnel.balancers needs tls.worker: the balancer knows a builder by its certificate" $g) }}{{ end }}
 {{- end }}
 {{- $affinity := deepCopy ($w.affinity | default dict) }}
+{{- if $w.store.hostPath }}
+{{- if $w.store.storageClass }}{{ fail (printf "workers.%s: store.hostPath and store.storageClass both place /nix, pick one" $g) }}{{ end }}
+{{- if hasKey $affinity "podAntiAffinity" }}{{ fail (printf "workers.%s: store.hostPath sets the podAntiAffinity, drop affinity.podAntiAffinity" $g) }}{{ end }}
+{{- /* Two pods of the group on one node would share the store. A pod that is
+     still terminating counts too, so a rollout never overlaps them. */}}
+{{- $_ := set $affinity "podAntiAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (list (dict "topologyKey" "kubernetes.io/hostname" "labelSelector" (dict "matchLabels" ($sel | fromYaml))))) }}
+{{- end }}
 {{- if $w.advertise }}
 {{- if hasKey $affinity "nodeAffinity" }}{{ fail (printf "workers.%s: advertise sets the nodeAffinity, drop affinity.nodeAffinity" $g) }}{{ end }}
 {{- $_ := set $affinity "nodeAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (dict "nodeSelectorTerms" (list (dict "matchExpressions" (list (dict "key" "kubernetes.io/hostname" "operator" "In" "values" (keys $w.advertise | sortAlpha))))))) }}
@@ -58,6 +69,21 @@ data:
     {{- with $w.extraNixConf }}
     {{- . | nindent 4 }}
     {{- end }}
+{{- if $spire.agentSocket }}
+---
+# spiffe-helper keeps the SVID files; the init container runs the same
+# config once so the daemon finds them at start.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $svc }}-spiffe-helper
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+data:
+  helper.conf: |
+    {{- include "farm.spiffeHelperConf" (dict "root" $root "daemon" true) | nindent 4 }}
+  helper-once.conf: |
+    {{- include "farm.spiffeHelperConf" (dict "root" $root "daemon" false) | nindent 4 }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -81,7 +107,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: {{ print $w $root.Values.niks3 $root.Values.upstreamCaches $root.Values.sandbox $oidc | sha256sum }}
+        checksum/config: {{ print $w $root.Values.niks3 $root.Values.upstreamCaches $root.Values.sandbox $oidc $spire | sha256sum }}
         {{- with $w.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -119,7 +145,7 @@ spec:
       {{- end }}
       {{- include "farm.spread" (dict "spread" $w.spread "selector" $sel) | nindent 6 }}
       initContainers:
-        # /nix is an emptyDir so the store is writable and sized. Seed it
+        # /nix is a volume so the store is writable and sized. Seed it
         # from the image. The image's DB registration comes along.
         - name: seed-store
           image: {{ include "farm.image" $root }}
@@ -139,6 +165,13 @@ spec:
           volumeMounts:
             - {name: nix, mountPath: /vol}
             - {name: build, mountPath: /build}
+        {{- if $spire.agentSocket }}
+        - name: svid-init
+          image: {{ $spire.image }}
+          args: [-config, /etc/spiffe-helper/helper-once.conf]
+          securityContext: {{- include "farm.spiffeHelperSecurityContext" $root | nindent 12 }}
+          volumeMounts: {{- include "farm.spiffeHelperMounts" $root | nindent 12 }}
+        {{- end }}
       containers:
         - name: nix-daemon
           image: {{ include "farm.image" $root }}
@@ -210,7 +243,7 @@ spec:
             # What the balancer reaches this pod at, so x-nix-worker pins here.
             - --advertise=$({{ if $w.hostPort }}HOST_IP):{{ $w.hostPort }}{{ else }}POD_IP):50051{{ end }}
             {{- end }}
-            - --scheduler={{ if not (include "farm.tlsSecret" (list $root "worker")) }}http://{{ end }}{{ include "farm.schedulerFor" $root }}
+            - --scheduler={{ if not $tls }}http://{{ end }}{{ include "farm.schedulerFor" $root }}
             # civetweb binds [::] v6-only. Pod IPs are v4 on most clusters.
             - --metrics-listen=0.0.0.0:9464
             - --worker-name=$(NODE_NAME)/$(POD_NAME)
@@ -219,16 +252,19 @@ spec:
             {{- with $root.Values.niks3.cacheURL }}
             - --niks3-cache-url={{ . }}
             {{- end }}
-            - --niks3-token-file=/secrets/niks3/token
+            - --niks3-token-file={{ if $spire.niks3Token }}/svid/niks3-token{{ else }}/secrets/niks3/token{{ end }}
             {{- with $root.Values.niks3.pushFlags }}
             - --niks3-push=niks3 push {{ join " " . }}
             {{- end }}
-            {{- if (include "farm.tlsSecret" (list $root "worker")) }}
+            {{- if $spire.agentSocket }}
+            - --tls-cert=/svid/svid.pem
+            - --tls-key=/svid/svid.key
+            {{- else if (include "farm.tlsSecret" (list $root "worker")) }}
             - --tls-cert=/secrets/tls/tls.crt
             - --tls-key=/secrets/tls/tls.key
             {{- end }}
-            {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
-            - --client-ca=/secrets/ca/ca.crt
+            {{- if or $clientCA $spire.agentSocket }}
+            - --client-ca={{ if $spire.agentSocket }}/svid/bundle.pem{{ else }}/secrets/ca/ca.crt{{ end }}
             {{- range $root.Values.auth.trustedProxies }}
             - --trusted-proxy={{ . }}
             {{- end }}
@@ -272,7 +308,7 @@ spec:
               hostPort: {{ . }}
               {{- end }}
           {{- /* kubelet gRPC probes are plaintext; with TLS fall back to TCP and let envoy judge health. */}}
-          {{- $probe := ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) (not (empty (include "farm.tlsSecret" (list $root "worker")))) }}
+          {{- $probe := ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) (not (empty $tls)) }}
           # Covers the store seed and niks3 becoming reachable.
           startupProbe: {{- toYaml (merge (dict "periodSeconds" 5 "failureThreshold" 120) $probe) | nindent 12 }}
           # Ready only while the local nix-daemon answers, not just the gRPC port.
@@ -286,11 +322,15 @@ spec:
             - {name: nix, mountPath: /nix, subPath: nix}
             - {name: spool, mountPath: /spool}
             - {name: nixconf, mountPath: /etc/nix/nix.conf.d}
+            {{- if not $spire.niks3Token }}
             - {name: niks3-token, mountPath: /secrets/niks3, readOnly: true}
-            {{- if (include "farm.tlsSecret" (list $root "worker")) }}
+            {{- end }}
+            {{- if $spire.agentSocket }}
+            - {name: svid, mountPath: /svid, readOnly: true}
+            {{- else if (include "farm.tlsSecret" (list $root "worker")) }}
             - {name: tls, mountPath: /secrets/tls, readOnly: true}
             {{- end }}
-            {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
+            {{- if $clientCA }}
             - {name: ca, mountPath: /secrets/ca, readOnly: true}
             {{- end }}
             {{- if $oidc }}
@@ -319,9 +359,33 @@ spec:
           {{- with $root.Values.gc.resources }}
           resources: {{- toYaml . | nindent 12 }}
           {{- end }}
+        {{- if $spire.agentSocket }}
+        - name: spiffe-helper
+          image: {{ $spire.image }}
+          args: [-config, /etc/spiffe-helper/helper.conf]
+          securityContext: {{- include "farm.spiffeHelperSecurityContext" $root | nindent 12 }}
+          volumeMounts: {{- include "farm.spiffeHelperMounts" $root | nindent 12 }}
+        {{- end }}
       volumes:
         - name: nix
+          {{- if $w.store.hostPath }}
+          hostPath:
+            # The anti-affinity only keeps pods of one group apart, so other
+            # groups, releases and namespaces need a directory of their own.
+            path: {{ printf "%s/%s/%s/%s" (trimSuffix "/" $w.store.hostPath) $root.Release.Namespace $root.Release.Name $g }}
+            type: DirectoryOrCreate
+          {{- else if $w.store.storageClass }}
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: {{ $w.store.storageClass }}
+                resources:
+                  requests:
+                    storage: {{ required "store.size is required with store.storageClass" $w.store.size }}
+          {{- else }}
           emptyDir: {{- if $w.store.sizeLimit }} {sizeLimit: {{ $w.store.sizeLimit }}} {{- else }} {} {{- end }}
+          {{- end }}
         - name: spool
           emptyDir: {{- if $w.spool.sizeLimit }} {sizeLimit: {{ $w.spool.sizeLimit }}} {{- else }} {} {{- end }}
         - name: build
@@ -341,6 +405,7 @@ spec:
         {{- with $w.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- if not $spire.niks3Token }}
         - name: niks3-token
           {{- if $root.Values.niks3.auth.serviceAccountToken.enabled }}
           projected:
@@ -354,11 +419,23 @@ spec:
             secretName: {{ $root.Values.niks3.auth.existingSecret }}
             items: [{key: token, path: token}]
           {{- end }}
+        {{- end }}
+        {{- if $spire.agentSocket }}
+        - name: spire-agent-socket
+          # the directory, not the socket: an agent restart replaces the file
+          hostPath: {path: {{ dir $spire.agentSocket }}, type: Directory}
+        - name: svid
+          emptyDir: {medium: Memory}
+        - name: spiffe-helper
+          configMap:
+            name: {{ $svc }}-spiffe-helper
+        {{- else }}
         {{- with (include "farm.tlsSecret" (list $root "worker")) }}
         - name: tls
           secret: {secretName: {{ . }}}
         {{- end }}
-        {{- with (include "farm.tlsSecret" (list $root "clientCA")) }}
+        {{- end }}
+        {{- with $clientCA }}
         - name: ca
           secret: {secretName: {{ . }}, items: [{key: ca.crt, path: ca.crt}]}
         {{- end }}
