@@ -78,8 +78,9 @@ Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
 | 54 | `build-log-drop-outside-stderr` | `b9008fcc508eba837b28e700e287ee3c366b9a2b` | `push-test-without-clock` | its test is the push test rewritten there | Drop a build log without holding the queue across stderr |  |
 | 55 | `vm-test-running-time-bound` | `4942ab4d89ef3d7f21c26bba5f25ac3e591c02ce` | `integ/tests-event-waits` | changes the wait helpers in tests/lib/waits.nix as rewritten there | Tests: bound each VM test by the time it runs |  |
 | 56 | `revoked-counted-once` | `8c81002b512b8b309cb8988767646c53655739bd` | `revoke-handed-over-build` | fixes its double count of a revoked build: changes its revoke accounting in builder.cc, builder.hh and main.cc, and its builder-test.cc | Count a build a revoke ended once |  |
+| 57 | `bench-latency-step-counts` | `5914a72f7661aa11c7ead5dc1052d9d090dbc092` | `vm-test-running-time-bound` | changes tests/latency-test.nix as rewritten there, and the latency e2e test as `integ/tests-event-waits` under it left it | Tests: bench-latency asserts round-trip steps (RPCs by method, paths asked, connections), not wall time; the daemon counts the paths QueryPathInfos requests name |  |
 
-22 of the 56 topic merges resolve overlaps (21 of the first 46, and `farm-admission-by-machines`), and so does the upstream merge; each names its files in its message.
+22 of the 57 topic merges resolve overlaps (21 of the first 46, and `farm-admission-by-machines`), and so does the upstream merge; each names its files in its message.
 
 The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
 
