@@ -53,11 +53,14 @@ pkgs.testers.runNixOSTest {
       services.nix-grpc-daemon = {
         enable = true;
         listen = "127.0.0.1:50051";
+        # The RPC counts the test asserts on.
+        metricsListen = "127.0.0.1:9464";
         trustClients = true;
         package = config.programs.nix-grpc-store.package;
       };
 
       boot.kernelModules = [ "sch_netem" ];
+      environment.systemPackages = [ pkgs.curl ];
     };
 
   testScript = ''

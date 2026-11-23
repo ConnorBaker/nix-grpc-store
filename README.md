@@ -499,6 +499,7 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | metric | labels | counts |
 |---|---|---|
 | `nix_grpc_rpcs_total` | method, cn | RPCs handled |
+| `nix_grpc_paths_asked_total` | method | store paths named in QueryPathInfos requests |
 | `nix_grpc_tunnel_bytes_total` | direction, cn | uncompressed tunnel bytes |
 | `nix_grpc_nar_bytes_total` | direction, cn | uncompressed NAR bytes imported/exported |
 | `nix_grpc_build_info` | version, worker, system, features | constant 1, for joins and version skew |
