@@ -16,6 +16,8 @@ Coverage: each topic branch below was built alone, x86_64-linux only, as `packag
 
 Upstream `main` at `f2f5acd8` is merged into this branch after merge 46 ("Merge upstream main"), with the base below unchanged. That merge drops this side's forms of three changes upstream merged as its own: `integ/nar-fetcher-fail-session-together`, `integ/nar-fetcher-record-once` and `integ/call-test-interrupt-race` (their rows stay in the table, as merged before it; the merge message says what of each is kept). Topics 47 onward that need upstream's newer code sit on `f2f5acd8` ("Stacked on" says so).
 
+Upstream `main` at `a40124f4` is merged after merge 58 ("Merge upstream main a40124f4"), with the base below unchanged. No topic is upstream at `a40124f4` (no patch-id of a topic commit matches one of upstream's new commits, and none of upstream's new commits does what a whole topic does), so every row stays. Upstream's e2e tests now run their commands through an agent on vsock instead of ssh; that merge moves this branch's harness onto the agent. The topic branches alone still use ssh, as upstream did at their bases.
+
 Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
 
 ## Merged branches
@@ -81,7 +83,7 @@ Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
 | 57 | `bench-latency-step-counts` | `5914a72f7661aa11c7ead5dc1052d9d090dbc092` | `vm-test-running-time-bound` | changes tests/latency-test.nix as rewritten there, and the latency e2e test as `integ/tests-event-waits` under it left it | Tests: bench-latency asserts round-trip steps (RPCs by method, paths asked, connections), not wall time; the daemon counts the paths QueryPathInfos requests name |  |
 | 58 | `takeover-liveness-to-main` | `5ad4b1c986b940641726691ef3246454f7c4ec57` | `revoked-counted-once` | changes single-node-takeover's takeover handshake (takeover.cc, takeover.hh, takeover-test.cc) and the serve loop and handover tests as later topics left them (main.cc, handover.rs: tests-event-waits, revoke-handed-over-build, revoked-counted-once) | Takeover: the main process watches every older generation itself; a handed-over generation exits once drained, unless its successor predates that (rollback); sessions expire while draining; --session-ttl |  |
 
-23 of the 58 topic merges resolve overlaps (21 of the first 46, `farm-admission-by-machines` and `takeover-liveness-to-main`), and so does the upstream merge; each names its files in its message.
+23 of the 58 topic merges resolve overlaps (21 of the first 46, `farm-admission-by-machines` and `takeover-liveness-to-main`), and so do both upstream merges; each names its files in its message.
 
 The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
 
