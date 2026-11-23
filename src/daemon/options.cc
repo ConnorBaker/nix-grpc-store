@@ -232,6 +232,13 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
                 throw nix::Error("--take-over expects the PID of the unit's main process");
             }
             options.takeOverFrom = pid;
+        } else if (arg == "--session-ttl") {
+            auto secs = parseInt<unsigned>(next());
+            // 0 would end each session at the next tick, between its calls.
+            if (!secs || *secs == 0) {
+                throw nix::Error("--session-ttl expects a positive number of seconds");
+            }
+            options.sessionTtl = std::chrono::seconds(*secs);
         } else if (arg == "--max-linger") {
             auto secs = parseInt<unsigned>(next());
             if (!secs) {

@@ -69,6 +69,7 @@ stdenv.mkDerivation {
         ../../tests/farm-client-test.sh
         ../../tests/oidc-test.cc
         ../../tests/oidc-test.sh
+        ../../tests/session-ttl-test.sh
         ../../tests/acl-test.cc
         ../../tests/build-log-test.cc
         ../../tests/xfcc-test.cc

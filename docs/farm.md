@@ -477,18 +477,22 @@ builder to take new builds while it drains. There a reload, and so
 takes over the socket and the scheduler, becomes the unit's main
 process, and the old process finishes the builds it runs beside it and
 then exits (`event=handed_over` and `event=predecessor_exited` in the
-journal). New builds go to the new generation from the moment the
-reload returns. The new one does not stop or idle out before the old
-one has exited, so its builds keep their process, and a stop drains
-both. Until then the node runs the builds of both, up to twice
-`max-jobs`; a reload while an older one still drains adds another
-generation. If the new generation crashes, systemd stops the unit and
-the old one's builds go with it: their clients build them again. If it
-cannot start, the reload fails and the old one serves on. If it hangs
-once it has the sockets, systemd's reload timeout does not end it: the
-old one serves on after 120 s, and if the hung one had started
-accepting, it keeps taking a share of new connections until it is
-killed. A reload can also report failure although the takeover went
+journal). New builds go to the new generation from the moment the reload
+returns. The unit's main process, the newest generation, does not stop
+or idle out before every older one has exited, so their builds keep
+their process, and a stop drains them all. Until then the node runs the
+builds of both, up to twice `max-jobs`; a reload while an older one
+still drains adds another generation. A generation that is no longer the
+main process exits once its own builds are over, whatever older ones
+still run: the main process watches each of them itself. After a
+rollback to a daemon too old for that, the generation it took over from
+waits for the older ones instead. If the new generation crashes, systemd
+stops the unit and the old one's builds go with it: their clients build
+them again. If it cannot start, the reload fails and the old one serves
+on. If it hangs once it has the sockets, systemd's reload timeout does
+not end it: the old one serves on after 120 s, and if the hung one had
+started accepting, it keeps taking a share of new connections until it
+is killed. A reload can also report failure although the takeover went
 through, when systemd's timeout falls after the new generation last
 checked the reload and before systemd read MAINPID=; `event=handed_over`
 says which process serves. By hand, upgrade with `systemctl reload`:

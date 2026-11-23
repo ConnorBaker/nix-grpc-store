@@ -19,9 +19,15 @@
 // makes it the unit's main process (MAINPID=), and once systemd has read that
 // and the new one still lives, drains as an ordinary process of the unit;
 // otherwise it serves on. The connection between the two stays open for as
-// long as the old process lives, so the new one neither idles out nor stops
-// before it is gone: systemd kills the rest of the unit (KillMode=mixed) as
-// soon as the main process exits.
+// long as the old process lives: a Link. systemd kills the rest of the unit
+// (KillMode=mixed) as soon as the main process exits, so the main process
+// neither idles out nor stops while any older generation lives. With its
+// confirmation the old process passes on its links to the older generations
+// still alive, so the new main process watches each of them itself, and a
+// generation that is no longer the main process exits once it has drained,
+// whatever older generations still build. Only if the successor said it
+// watches them: one that predates links (a rollback) watches its
+// predecessor alone, which then waits for the older generations as before.
 
 #include <chrono>
 #include <cstdint>
@@ -65,6 +71,13 @@ public:
         return peerPid;
     }
 
+    // After `ready`: whether the successor watches the links accept()
+    // passes it. One that predates links does not.
+    [[nodiscard]] auto peerWatchesOlder() const -> bool
+    {
+        return watchesOlder;
+    }
+
     void send(const std::vector<int> & fds, std::string_view env);
     // After `ready`: asks systemd to make the successor the unit's main
     // process and waits up to `timeout` (negative: no limit) until systemd
@@ -72,9 +85,10 @@ public:
     // systemd checked it. False if it is gone, which systemd refuses, so this
     // one is still the main process: reject() and serve on.
     auto makeMain(std::chrono::milliseconds timeout) -> bool;
-    // Confirms to the successor that it is the main process now. The
-    // connection stays open until this process exits.
-    void accept();
+    // Confirms to the successor that it is the main process now, passing
+    // it `older`, this process's links that still live. The connection
+    // stays open until this process exits.
+    void accept(const std::vector<int> & older);
     void reject();
 
 private:
@@ -90,8 +104,35 @@ private:
     nix::AutoCloseFD listener;
     nix::AutoCloseFD conn;
     pid_t peerPid = 0;
+    bool watchesOlder = false;
     State state = State::idle;
     std::chrono::steady_clock::time_point deadline;
+};
+
+// A connection to an older generation of this unit, open for as long as
+// that generation lives.
+class Link
+{
+public:
+    explicit Link(nix::AutoCloseFD sock);
+
+    // The generation at the other end.
+    [[nodiscard]] auto pid() const -> pid_t
+    {
+        return pid_;
+    }
+
+    [[nodiscard]] auto fd() const -> int
+    {
+        return sock.get();
+    }
+
+    // False once that generation has exited.
+    auto alive() -> bool;
+
+private:
+    nix::AutoCloseFD sock;
+    pid_t pid_ = 0;
 };
 
 // The successor's side.
@@ -117,10 +158,10 @@ public:
         return pid_;
     }
 
-    // We serve. Returns once the predecessor has made us the main process.
-    void ready();
-    // False once the predecessor has exited.
-    auto alive() -> bool;
+    // We serve. Returns once the predecessor has made us the main process,
+    // with the links to the predecessor and to the older generations it
+    // passed on.
+    auto ready() -> std::vector<Link>;
 
 private:
     pid_t pid_;

@@ -150,7 +150,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
 
     nixgrpc::LocalStore local;
     nixgrpc::UploadClaims uploads;
-    nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return local.scoped(); }};
+    nixgrpc::SessionRoots sessions;
 
     // This node's disk, not the caller, failed. Nix's error says so where it
     // survives; where Nix drops the reason (a failed fetch) the disk does.
@@ -393,7 +393,8 @@ public:
         nixgrpc::IdleTracker & idle,
         nixgrpc::LogLevel logLevel,
         nixgrpc::Auth & auth,
-        nixgrpc::Coordinator & coord)
+        nixgrpc::Coordinator & coord,
+        std::chrono::seconds sessionTtl)
         : workerName(std::move(workerName))
         , metrics(metrics)
         , idle(idle)
@@ -402,6 +403,7 @@ public:
         , backends{.socketPath = std::move(socketPath)}
         , coord(coord)
         , local(std::move(storeUri))
+        , sessions([this] -> nix::ref<nix::Store> { return local.scoped(); }, sessionTtl)
     {
     }
 
@@ -1533,22 +1535,49 @@ struct Generation
     std::vector<int> listenFds;
     std::optional<nixgrpc::Acceptor> acceptor;
     std::optional<Succession> succession;
-    // We took over from it, and it may still be draining.
+    // We take over from it.
     std::optional<takeover::Predecessor> predecessor;
+    // The older generations, which may still be draining: our predecessor
+    // and those it passed on.
+    std::vector<takeover::Link> older;
+    // We handed over to a successor that watches them itself.
+    bool successorWatchesOlder = false;
     // Shutdown() since the takeover: GOAWAY, then it waits for the calls.
     std::thread goaway;
     // Their idle ones end with the takeover: our server takes none after it.
     nixgrpc::tunnel::Tunnels * tunnels = nullptr;
 
-    // Until it is gone this process may not end: systemd would take that for
-    // the unit's end and kill the predecessor's builds (KillMode=mixed).
-    auto predecessorAlive() -> bool
+    // While one lives the main process may not end: systemd would take that
+    // for the unit's end and kill that generation's builds (KillMode=mixed).
+    auto olderAlive() -> bool
     {
-        if (predecessor && !predecessor->alive()) {
-            logLine(LogLevel::info, {{"event", "predecessor_exited"}, {"pid", std::to_string(predecessor->pid())}});
-            predecessor.reset();
+        std::erase_if(older, [](takeover::Link & link) -> bool {
+            if (link.alive()) {
+                return false;
+            }
+            logLine(LogLevel::info, {{"event", "predecessor_exited"}, {"pid", std::to_string(link.pid())}});
+            return true;
+        });
+        return !older.empty();
+    }
+
+    // The main process waits for them, and so does one that handed over to
+    // a successor that does not watch them (one that predates links).
+    auto mustOutliveOlder() -> bool
+    {
+        return (!handedOver || !successorWatchesOlder) && olderAlive();
+    }
+
+    // The links a successor gets with the unit: those that still live.
+    auto olderFds() -> std::vector<int>
+    {
+        olderAlive();
+        std::vector<int> fds;
+        fds.reserve(older.size());
+        for (auto const & link : older) {
+            fds.push_back(link.fd());
         }
-        return predecessor.has_value();
+        return fds;
     }
 
     // A successor is starting.
@@ -1591,7 +1620,7 @@ void offerTakeover(Generation & gen, nixgrpc::Coordinator & coord, const nixgrpc
 
 // We serve: once the predecessor has made us the main process, let the reload
 // return.
-void becomeMain(takeover::Detached & detached, takeover::Predecessor & pred)
+void becomeMain(takeover::Detached & detached, takeover::Predecessor & pred, std::vector<takeover::Link> & older)
 {
     try {
         // systemd supervises as its main process only a child of its own.
@@ -1599,7 +1628,7 @@ void becomeMain(takeover::Detached & detached, takeover::Predecessor & pred)
         // From here on we may become the main process, and outlive the
         // reload. Not if systemd gave up on it.
         detached.ensureReloadWaits();
-        pred.ready();
+        older = pred.ready();
     } catch (std::exception & err) {
         // The predecessor serves on. Leave at once, with the connections
         // we took: Server's destructor would wait for their calls.
@@ -1693,10 +1722,11 @@ void takeOverStep(
         // Our scheduler's clients reconnect, to the successor's.
         coord.restarting();
         next.paused.reset();
+        gen.successorWatchesOlder = offer.peerWatchesOlder();
         handedOver = true;
         logLine(LogLevel::info, {{"event", "handed_over"}, {"pid", peer}});
         try {
-            offer.accept();
+            offer.accept(gen.olderFds());
         } catch (std::exception & err) {
             logLine(LogLevel::info, {{"event", "takeover_unconfirmed"}, {"pid", peer}, {"error", err.what()}});
         }
@@ -1763,9 +1793,9 @@ void serve(
     bool draining = false;
     std::sig_atomic_t reloaded = 0;
     for (;;) {
-        bool const predecessor = gen.predecessorAlive();
+        bool const older = gen.mustOutliveOlder();
         if (!stopping()) {
-            if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout && !predecessor && !gen.paused()) {
+            if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout && !older && !gen.paused()) {
                 return;
             }
             if (reloadSignal != reloaded) {
@@ -1781,7 +1811,10 @@ void serve(
                 startDrain(server, coord);
             }
             coord.tick(); // gives back unclaimed leases
-            if (stopSignal >= nixgrpc::kCancelBuilds || (drained(coord, metrics) && !predecessor)) {
+            // Sessions end as when serving: a draining process can live on
+            // for as long as a build or an older generation does.
+            service.tick();
+            if (stopSignal >= nixgrpc::kCancelBuilds || (drained(coord, metrics) && !older)) {
                 return;
             }
         }
@@ -1939,7 +1972,15 @@ try {
          {"niks3", options.niks3.url},
          {"max_jobs", std::to_string(coord.builder ? coord.builder->maxJobs() : 0)}});
     NixRemoteService service(
-        options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord);
+        options.socketPath,
+        options.storeUri,
+        options.workerName,
+        metrics,
+        idle,
+        options.logLevel,
+        auth,
+        coord,
+        options.sessionTtl);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -2011,7 +2052,7 @@ try {
         nixgrpc::sdNotify("READY=1");
     }
     if (detached && gen.predecessor) {
-        becomeMain(*detached, *gen.predecessor);
+        becomeMain(*detached, *gen.predecessor, gen.older);
     }
 
     serve(*server, service, options, idle, coord, metrics, gen);

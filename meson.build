@@ -274,6 +274,8 @@ if build_server
   # A client that vanished without closing its connection must not keep its
   # builds wanted: the daemon ends its Schedule stream, and the build only
   # that client followed ends, revoked or given back, and is not placed again.
+  test('session-ttl', find_program('tests/session-ttl-test.sh'), args : [daemon_exe])
+
   test('keepalive', find_program('python3'),
     args : [files('tests/keepalive-test.py'), daemon_exe],
   )

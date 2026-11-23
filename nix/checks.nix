@@ -190,6 +190,19 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     part = "failures";
   };
 
+  handover-chain = import ../tests/handover.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+    part = "chain";
+    # A daemon that predates the links between generations (takeover.hh), as
+    # a rollback starts one: the integration branch as deployed before them.
+    oldDaemon =
+      (builtins.getFlake "github:ConnorBaker/nix-grpc-store/d279c64cdecf4c601e7fa253e0a115c51f402fd8")
+      .packages.${pkgs.stdenv.hostPlatform.system}.default;
+  };
+
   helm = import ../tests/helm.nix {
     inherit pkgs;
     chart = ../deploy/helm/nix-grpc-farm;

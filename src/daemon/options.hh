@@ -69,6 +69,10 @@ struct Options
     // BuildDerivation, which includes the wait for the slot the revoke freed.
     static constexpr std::chrono::seconds defaultMaxLinger{600};
     std::chrono::seconds maxLinger = defaultMaxLinger;
+    // How long a client session's paths stay held after its last call
+    // (SessionRoots).
+    static constexpr std::chrono::seconds defaultSessionTtl{3600};
+    std::chrono::seconds sessionTtl = defaultSessionTtl;
     std::string storeDir;
     // --take-over: start as the successor of this main process, see takeover.hh.
     std::optional<pid_t> takeOverFrom;

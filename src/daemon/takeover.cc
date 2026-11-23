@@ -80,6 +80,8 @@ constexpr std::chrono::seconds readyTimeout{120};
 // The steps of the other side that do not wait for a whole daemon start.
 constexpr std::chrono::seconds stepTimeout{30};
 constexpr size_t maxFds = 16;
+// Links to older generations: as many as one message carries (SCM_MAX_FD).
+constexpr size_t maxLinks = 253;
 // "ready" and "ok" fit, and so does the sd_notify environment.
 constexpr size_t maxMsg = 64;
 constexpr size_t maxEnv = 4096;
@@ -143,23 +145,64 @@ auto readable(int sock, std::chrono::milliseconds timeout, int reload = -1) -> b
     }
 }
 
-void sendAll(int sock, std::string_view msg)
+// `msg` with `fds` attached.
+void sendFds(int sock, std::string_view msg, const std::vector<int> & fds)
 {
-    if (::send(sock, msg.data(), msg.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(msg.size())) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast,misc-include-cleaner): sendmsg only reads it; iovec comes from <sys/socket.h>.
+    iovec iov{.iov_base = const_cast<char *>(msg.data()), .iov_len = msg.size()};
+    std::vector<char> control(CMSG_SPACE(sizeof(int) * fds.size()));
+    msghdr hdr{};
+    hdr.msg_iov = &iov;
+    hdr.msg_iovlen = 1;
+    if (!fds.empty()) {
+        hdr.msg_control = control.data();
+        hdr.msg_controllen = control.size();
+        cmsghdr * cmsg = CMSG_FIRSTHDR(&hdr);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int) * fds.size());
+        std::memcpy(CMSG_DATA(cmsg), fds.data(), sizeof(int) * fds.size());
+    }
+    if (::sendmsg(sock, &hdr, MSG_NOSIGNAL) != static_cast<ssize_t>(msg.size())) {
         throw nix::SysError("takeover: send");
     }
 }
 
-// One message, or nullopt if the peer has gone.
-auto receive(int sock) -> std::optional<std::string>
+// One message, and the fds attached to it (closed on exec); nullopt if the
+// peer has gone. Throws if either did not fit.
+auto receiveWithFds(int sock) -> std::optional<std::pair<std::string, std::vector<nix::AutoCloseFD>>>
 {
-    std::array<char, maxMsg> buf{};
-    auto const len = ::recv(sock, buf.data(), buf.size(), MSG_DONTWAIT);
+    std::string buf(maxMsg, '\0');
+    iovec iov{.iov_base = buf.data(), .iov_len = buf.size()};
+    std::vector<char> control(CMSG_SPACE(sizeof(int) * maxLinks));
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.data();
+    msg.msg_controllen = control.size();
+    auto const len = ::recvmsg(sock, &msg, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+    std::vector<nix::AutoCloseFD> fds;
+    if (len > 0) {
+        for (cmsghdr * cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+                std::vector<int> raw((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+                std::memcpy(raw.data(), CMSG_DATA(cmsg), raw.size() * sizeof(int));
+                for (int const passed : raw) {
+                    fds.emplace_back(passed);
+                }
+            }
+        }
+    }
     if (len <= 0) {
         return std::nullopt;
     }
-    return std::string(buf.data(), static_cast<size_t>(len));
+    if ((msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
+        throw nix::Error("takeover: a message did not fit");
+    }
+    buf.resize(static_cast<size_t>(len));
+    return std::pair{std::move(buf), std::move(fds)};
 }
+
 } // namespace
 
 Offer::Offer()
@@ -207,8 +250,12 @@ auto Offer::wait(std::chrono::milliseconds timeout) -> Event
         if (!readable(conn.get(), std::min(timeout, left))) {
             return Event::none;
         }
-        auto const msg = receive(conn.get());
-        return msg == readyMsg ? Event::ready : Event::gone;
+        auto const msg = receiveWithFds(conn.get());
+        if (!msg || msg->first != readyMsg) {
+            return Event::gone;
+        }
+        watchesOlder = !msg->second.empty();
+        return Event::ready;
     }
     case State::asked:
     case State::done:
@@ -261,9 +308,11 @@ auto Offer::makeMain(std::chrono::milliseconds timeout) -> bool
     return sdNotifyBarrier(timeout) && !peerGone();
 }
 
-void Offer::accept()
+void Offer::accept(const std::vector<int> & older)
 {
-    sendAll(conn.get(), okMsg);
+    // A successor that predates links reads the message with recv(), which
+    // drops (closes) what is attached: it watches this process alone, as before.
+    sendFds(conn.get(), okMsg, older);
     state = State::done;
     listener.close();
 }
@@ -272,6 +321,7 @@ void Offer::reject()
 {
     conn.close();
     peerPid = 0;
+    watchesOlder = false;
     state = State::idle;
 }
 
@@ -322,15 +372,34 @@ Predecessor::Predecessor(pid_t pid, const Detached * reload)
     env_ = std::string_view(buf.data(), static_cast<size_t>(len2)).substr(1);
 }
 
-void Predecessor::ready()
+auto Predecessor::ready() -> std::vector<Link>
 {
-    sendAll(sock.get(), readyMsg);
-    if (!readable(sock.get(), stepTimeout) || receive(sock.get()) != okMsg) {
+    // In the same record, so that it comes with "ready" or not at all: an fd,
+    // which says that we watch the links passed to us. A predecessor that
+    // predates links reads the record with recv(), which drops (closes) it.
+    nix::Pipe token;
+    token.create();
+    sendFds(sock.get(), readyMsg, {token.readSide.get()});
+    auto answer = readable(sock.get(), stepTimeout) ? receiveWithFds(sock.get()) : std::nullopt;
+    if (!answer || answer->first != okMsg) {
         throw nix::Error("takeover: process %d did not let go", pid_);
     }
+    std::vector<Link> links;
+    links.emplace_back(std::move(sock));
+    for (auto & passed : answer->second) {
+        links.emplace_back(std::move(passed));
+    }
+    return links;
 }
 
-auto Predecessor::alive() -> bool
+Link::Link(nix::AutoCloseFD sock_)
+    : sock(std::move(sock_))
+    // Whoever listened: the generation the link was made to.
+    , pid_(peerCred(sock.get()).pid)
+{
+}
+
+auto Link::alive() -> bool
 {
     if (!sock) {
         return false;
@@ -439,7 +508,7 @@ auto Offer::peerGone() -> bool
     return true;
 }
 
-void Offer::accept() {}
+void Offer::accept(const std::vector<int> & /*older*/) {}
 
 void Offer::reject() {}
 
@@ -449,9 +518,17 @@ Predecessor::Predecessor(pid_t pid, const Detached * /*reload*/)
     throw nix::Error("--take-over needs Linux");
 }
 
-void Predecessor::ready() {}
+auto Predecessor::ready() -> std::vector<Link>
+{
+    return {};
+}
 
-auto Predecessor::alive() -> bool
+Link::Link(nix::AutoCloseFD sock_)
+    : sock(std::move(sock_))
+{
+}
+
+auto Link::alive() -> bool
 {
     return false;
 }

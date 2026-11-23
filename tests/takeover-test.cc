@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -108,12 +109,12 @@ void theSuccessorGetsTheSocketsAndSeesThePredecessorGo()
         nixgrpc::takeover::applyNotifyEnv(pred.env());
         held = held && nix::getEnv("NOTIFY_SOCKET") == "/run/systemd/notify" && nix::getEnv("WATCHDOG_USEC") == "15000000"
                && !nix::getEnv("LD_PRELOAD");
-        pred.ready();
-        held = held && pred.alive();
+        auto links = pred.ready();
+        held = held && links.size() == 1 && links.front().pid() == self && links.front().alive();
         bool const told = ::write(sawUs.writeSide.get(), "s", 1) == 1;
         held = held && told;
-        // Nothing to wait on from outside Predecessor: look until it is gone.
-        while (pred.alive()) {
+        // Nothing to wait on from outside the link: look until it is gone.
+        while (links.front().alive()) {
             std::this_thread::sleep_for(kStep);
         }
         return held;
@@ -124,11 +125,142 @@ void theSuccessorGetsTheSocketsAndSeesThePredecessorGo()
     assert(::write(listening.writeSide.get(), "x", 1) == 1);
     offer->send({listening.readSide.get()}, "NOTIFY_SOCKET=/run/systemd/notify\nWATCHDOG_USEC=15000000\nLD_PRELOAD=/evil.so\n");
     assert(next(*offer, child) == Event::ready);
-    offer->accept();
+    assert(offer->peerWatchesOlder());
+    offer->accept({});
     // The successor still sees us.
     char byte = 0;
     assert(::read(sawUs.readSide.get(), &byte, 1) == 1);
     offer.reset(); // as when this process exits
+    assert(exitStatus(child) == 0);
+}
+
+// Three generations: this process, `second` that took over from it, and
+// `third` that took over from `second`. With its confirmation `second` passes
+// on its link to this one, so `third` sees each of the two go by itself:
+// `second` first, while this one lives on.
+void theSuccessorWatchesTheOlderGenerationsItIsPassed()
+{
+    auto first = std::make_unique<Offer>();
+    auto const self = ::getpid();
+    nix::Pipe listening;
+    listening.create();
+    nix::Pipe secondOffers; // `second` listens for its successor
+    secondOffers.create();
+    nix::Pipe secondGoes; // closed: `second` exits
+    secondGoes.create();
+    auto const second = spawn([&] -> bool {
+        secondOffers.readSide.close();
+        secondGoes.writeSide.close();
+        Predecessor pred(self);
+        auto links = pred.ready();
+        Offer offer;
+        nix::Pipe ours;
+        ours.create();
+        if (::write(secondOffers.writeSide.get(), "o", 1) != 1) {
+            return false;
+        }
+        Event event = Event::none;
+        while ((event = offer.wait(kStep)) == Event::none) {
+        }
+        if (event != Event::requested) {
+            return false;
+        }
+        offer.send({ours.readSide.get()}, "");
+        while ((event = offer.wait(kStep)) == Event::none) {
+        }
+        if (event != Event::ready) {
+            return false;
+        }
+        std::vector<int> older;
+        older.reserve(links.size());
+        for (auto const & link : links) {
+            older.push_back(link.fd());
+        }
+        offer.accept(older);
+        char byte = 0;
+        (void) ::read(secondGoes.readSide.get(), &byte, 1);
+        return true;
+    });
+    secondOffers.writeSide.close();
+    secondGoes.readSide.close();
+    assert(next(*first, second) == Event::requested);
+    first->send({listening.readSide.get()}, "");
+    assert(next(*first, second) == Event::ready);
+    first->accept({});
+    char byte = 0;
+    assert(::read(secondOffers.readSide.get(), &byte, 1) == 1);
+
+    nix::Pipe report; // `third`: 'l' it has both links, 's' `second` went first
+    report.create();
+    auto const third = spawn([&] -> bool {
+        // Only what a successor of its own has: not this process's side of
+        // its link to `second`, which would keep that link up for it.
+        auto const keep = static_cast<unsigned>(report.writeSide.get());
+        ::close_range(3, keep - 1, 0);
+        ::close_range(keep + 1, ~0U, 0);
+        Predecessor pred(second);
+        auto links = pred.ready();
+        if (links.size() != 2 || links.front().pid() != second || links.back().pid() != self) {
+            return false;
+        }
+        if (::write(report.writeSide.get(), "l", 1) != 1) {
+            return false;
+        }
+        while (links.front().alive()) {
+            std::this_thread::sleep_for(kStep);
+        }
+        if (!links.back().alive() || ::write(report.writeSide.get(), "s", 1) != 1) {
+            return false;
+        }
+        while (links.back().alive()) {
+            std::this_thread::sleep_for(kStep);
+        }
+        return true;
+    });
+    report.writeSide.close();
+    assert(::read(report.readSide.get(), &byte, 1) == 1 && byte == 'l');
+    secondGoes.writeSide.close();
+    assert(exitStatus(second) == 0);
+    assert(::read(report.readSide.get(), &byte, 1) == 1 && byte == 's');
+    first.reset(); // as when this process exits
+    assert(exitStatus(third) == 0);
+}
+
+// A successor that predates links, as a rollback starts one: it says
+// "ready" with nothing attached, as d279c64c's Predecessor::ready() did, and
+// reads the answer with recv(). It does not watch the older generations.
+void aSuccessorThatPredatesLinksDoesNotWatchTheOlderGenerations()
+{
+    Offer offer;
+    auto const self = ::getpid();
+    nix::Pipe listening;
+    listening.create();
+    auto const child = spawn([&] -> bool {
+        nix::AutoCloseFD const sock(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        auto const name = "nix-grpc-daemon/takeover/" + std::to_string(self);
+        name.copy(&addr.sun_path[1], name.size());
+        auto const len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name.size());
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): sockaddr API.
+        if (::connect(sock.get(), reinterpret_cast<const sockaddr *>(&addr), len) != 0) {
+            return false;
+        }
+        std::array<char, kMessage> buf{};
+        // The sockets: recv() closes them.
+        constexpr std::string_view ready = "ready";
+        if (::recv(sock.get(), buf.data(), buf.size(), 0) <= 0
+            || ::send(sock.get(), ready.data(), ready.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(ready.size())) {
+            return false;
+        }
+        auto const got = ::recv(sock.get(), buf.data(), buf.size(), 0);
+        return got == 2 && std::string(buf.data(), 2) == "ok";
+    });
+    assert(next(offer, child) == Event::requested);
+    offer.send({listening.readSide.get()}, "");
+    assert(next(offer, child) == Event::ready);
+    assert(!offer.peerWatchesOlder());
+    offer.accept({listening.readSide.get()});
     assert(exitStatus(child) == 0);
 }
 
@@ -156,7 +288,7 @@ void aSuccessorThatDiesBeforeItServesGivesTheNodeBack()
     assert(next(offer, again) == Event::requested);
     offer.send({listening.readSide.get()}, "");
     assert(next(offer, again) == Event::ready);
-    offer.accept();
+    offer.accept({});
     assert(exitStatus(again) == 0);
 }
 
@@ -448,7 +580,7 @@ void theOldProcessKeepsTheUnitIfTheSuccessorDiesBeforeSystemdTakesIt()
         assert(next(offer, child) == Event::ready);
         assert(offer.makeMain(noLimit));
         assert(manager.got("MAINPID=" + std::to_string(child)));
-        offer.accept();
+        offer.accept({});
         assert(exitStatus(child) == 0);
     }
     {
@@ -483,6 +615,8 @@ void theOldProcessKeepsTheUnitIfTheSuccessorDiesBeforeSystemdTakesIt()
 auto main() -> int
 {
     theSuccessorGetsTheSocketsAndSeesThePredecessorGo();
+    theSuccessorWatchesTheOlderGenerationsItIsPassed();
+    aSuccessorThatPredatesLinksDoesNotWatchTheOlderGenerations();
     aSuccessorThatDiesBeforeItServesGivesTheNodeBack();
     aRejectedSuccessorDoesNotTakeOver();
     noTakeoverFromAProcessThatOffersNone();
