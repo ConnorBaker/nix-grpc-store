@@ -177,12 +177,70 @@ fn finished_once(tag: &str) {
 }
 
 // A short build, which has to succeed: one the daemon refuses fails once
-// the store's restart-grace has run out.
-fn quick_build(tag: &str) {
+// the store's restart-grace has run out. Returns its output.
+fn quick_build(tag: &str) -> String {
     let slow = env("NGS_SLOW_EXPR");
     let store = store();
     let out = run(&build_argv(&store, &slow, tag, false));
     assert_eq!(out.code, 0, "build {tag} failed:\n{}", out.combined());
+    out.stdout.trim().to_string()
+}
+
+// The lines of process `pid` in the unit's journal that end with `event`.
+// Read whole: journal_count's `--grep` sees the message alone, not who
+// wrote it.
+fn logged_by(pid: &str, event: &str) -> usize {
+    journal(MACHINE, UNIT)
+        .lines()
+        .filter(|l| l.contains(&format!("nix-grpc-daemon[{pid}]:")) && l.trim_end().ends_with(event))
+        .count()
+}
+
+// The live processes whose temp roots name `path`: the nix-daemon
+// connections that keep it from the garbage collector.
+fn holders(path: &str) -> Vec<String> {
+    query(
+        MACHINE,
+        &[
+            "sh",
+            "-c",
+            r#"for f in $(grep -lF -e "$1" /nix/var/nix/temproots/* 2>/dev/null); do
+  p=${f##*/}; [ -d "/proc/$p" ] && echo "$p"; done; true"#,
+            "sh",
+            path,
+        ],
+    )
+    .split_whitespace()
+    .map(String::from)
+    .collect()
+}
+
+// Whether the temp-roots file of nix-daemon process `pid` is there.
+fn temp_roots_file(pid: &str) -> bool {
+    run(&["test", "-e", &format!("/nix/var/nix/temproots/{pid}")]).code == 0
+}
+
+// The connections of process `pid` to the nix-daemon: its unix sockets whose
+// peer is the nix-daemon socket's side of a connection. `ss -xpn` fields:
+// netid, state, queues, local path and inode, peer path and inode, process.
+fn daemon_connections(pid: &str) -> usize {
+    query(
+        MACHINE,
+        &[
+            "bash",
+            "-c",
+            r#"set -o pipefail
+ss -xpn | awk -v me="pid=$1," '
+  { line[NR] = $0; peer[NR] = $8 }
+  $5 ~ /daemon-socket\/socket$/ { daemon[$6] = 1 }
+  END { for (i = 1; i <= NR; i++) if (index(line[i], me) && (peer[i] in daemon)) n++; print n + 0 }'"#,
+            "sh",
+            pid,
+        ],
+    )
+    .trim()
+    .parse()
+    .expect("a count")
 }
 
 fn system(name: &str) -> String {
@@ -320,35 +378,6 @@ pub mod upgrade {
         warm("after-stop");
     }
 
-    // A reload while the previous generation still drains: each new one
-    // waits for its predecessor, and every build completes once.
-    #[test]
-    fn two_reloads_in_a_row_chain_and_every_build_completes_once() {
-        warm("warm-chain");
-        start_build("chain");
-        let first = main_pid();
-        let second = take_over_into(other("next", "base"));
-        quick_build("chain-second");
-        let third = take_over_into(other("next", "base"));
-        quick_build("chain-third");
-        assert_eq!(
-            unit_state("chain"),
-            "active",
-            "the long build was over too soon"
-        );
-        assert!(alive(&first) && alive(&second), "a predecessor left early");
-        release("chain");
-        finished_once("chain");
-        // Within 1.4 s in earlier runs.
-        within(120, "both predecessors exited", || {
-            !alive(&first) && !alive(&second)
-        });
-        assert_eq!(main_pid(), third);
-        wait_journal_above(UNIT, &format!("event=predecessor_exited pid={second}$"), 0, &[UNIT]);
-        assert_eq!(unit_state(UNIT), "active");
-        quick_build("chain-later");
-    }
-
     // The client of a build that runs across a takeover is sent to the new
     // generation and follows its build on: its call stays on the old one.
     // The old one's linger for that client runs out (longer than the hold,
@@ -450,6 +479,202 @@ pub mod upgrade {
         assert!(unit_pids().is_empty(), "{:?}", unit_pids());
         warm("after-idle");
     }
+}
+
+// Reloads while older generations still build. The unit's main process
+// (the newest generation) may not end while one of them lives; any other
+// generation exits once it has drained.
+pub mod chain {
+    use super::*;
+
+    // Steps of 500 ms the main process is watched draining while the oldest
+    // generation still builds: 10 s, ten of its exit checks (one a second).
+    const STOP_HOLD_STEPS: u32 = 20;
+
+    // A reload while the previous generation still drains, and another: the
+    // second generation, with nothing of its own to drain, exits while the
+    // first still builds, and the main process sees the first one go itself.
+    // Every build completes once.
+    #[test]
+    fn a_middle_generation_exits_once_drained_while_the_first_still_builds() {
+        warm("warm-chain");
+        start_build("chain");
+        let first = main_pid();
+        let second = take_over_into(other("next", "base"));
+        quick_build("chain-second");
+        let third = take_over_into(other("next", "base"));
+        quick_build("chain-third");
+        // Its one build is over: nothing left to drain.
+        within(120, "the second generation exited", || !alive(&second));
+        assert_eq!(
+            unit_state("chain"),
+            "active",
+            "the long build was over too soon"
+        );
+        assert!(alive(&first), "the first generation left early");
+        release("chain");
+        finished_once("chain");
+        within(120, "the first generation exited", || !alive(&first));
+        assert_eq!(main_pid(), third);
+        // Written at the main process's next check after the exit.
+        within(10, "the main process saw the first generation exit", || {
+            logged_by(&third, &format!("event=predecessor_exited pid={first}")) > 0
+        });
+        assert_eq!(unit_state(UNIT), "active");
+        quick_build("chain-later");
+    }
+
+    // After two reloads the second generation is gone, by itself or killed,
+    // while the first still builds. A stop then drains the main process,
+    // which stays until the first generation's build is over: had it exited,
+    // systemd would have killed that build (KillMode=mixed).
+    #[test]
+    fn the_main_process_outlives_the_first_generation_once_the_second_is_gone() {
+        warm("warm-oldest");
+        start_build("oldest");
+        let first = main_pid();
+        let second = take_over_into(other("next", "base"));
+        let third = take_over_into(other("next", "base"));
+        // A generation that waits for its predecessor would not go by itself.
+        let _ = run(&["kill", "-KILL", &second]);
+        within(120, "the second generation gone", || !alive(&second));
+        within(10, "the main process saw the second generation go", || {
+            logged_by(&third, &format!("event=predecessor_exited pid={second}")) > 0
+        });
+        let kills = journal_count(MACHINE, UNIT, "SIGKILL");
+        succeed(&["systemctl", "stop", "--no-block", UNIT]);
+        // Within a second of the stop (its next check).
+        within(10, "the main process drains", || logged_by(&third, "event=draining") > 0);
+        for _ in 0..STOP_HOLD_STEPS {
+            assert!(
+                alive(&third),
+                "the main process exited while the first generation still built\n{}",
+                journal(MACHINE, UNIT)
+            );
+            assert!(alive(&first), "the first generation was gone before its build was over");
+            assert_eq!(unit_state("oldest"), "active", "the first generation's build ended early");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        release("oldest");
+        finished_once("oldest");
+        within(120, "the stopped daemon ended", || ended(UNIT));
+        assert_eq!(
+            journal_count(MACHINE, UNIT, "SIGKILL"),
+            kills,
+            "the stop killed processes"
+        );
+        assert_eq!(unit_result(MACHINE, UNIT), "success");
+        warm("after-oldest");
+    }
+
+    // A generation that handed over and drained keeps no nix-daemon
+    // connection, though an older one still builds: the paths its sessions
+    // held go back to the garbage collector.
+    #[test]
+    fn a_drained_generation_keeps_no_nix_daemon_connection_while_an_older_one_builds() {
+        warm("warm-roots");
+        start_build("roots");
+        let second = take_over_into(other("next", "base"));
+        let held = quick_build("roots-second");
+        let workers = holders(&held);
+        assert!(
+            !workers.is_empty() && daemon_connections(&second) > 0,
+            "the second generation holds nothing, so its letting go proves nothing: {workers:?}"
+        );
+        take_over_into(other("next", "base"));
+        within(120, "the second generation's nix-daemon connections ended", || {
+            daemon_connections(&second) == 0
+        });
+        within(10, "its nix-daemon processes' temp roots are gone", || {
+            workers.iter().all(|w| !temp_roots_file(w))
+        });
+        assert_eq!(holders(&held), Vec::<String>::new());
+        assert_eq!(
+            unit_state("roots"),
+            "active",
+            "the first generation's build was over, so this proves nothing"
+        );
+        release("roots");
+        finished_once("roots");
+    }
+
+    // Steps of 500 ms a rollback's main process is watched draining while
+    // the first generation still builds: 20 s, past the 6 s in which a
+    // second generation that left at the takeover would have exited (its
+    // 5 s shutdown grace and a second).
+    const ROLLBACK_HOLD_STEPS: u32 = 40;
+
+    // A rollback: the newest generation runs a daemon that predates the
+    // links between generations (tests/handover.nix `old`) and watches its
+    // predecessor alone. That one, having handed over to a successor that
+    // does not watch the older generations, waits for them itself, so a
+    // stop drains them all and the first generation's build completes.
+    #[test]
+    fn a_rollback_to_a_daemon_without_links_keeps_the_first_generations_build() {
+        warm("warm-rollback");
+        start_build("rollback");
+        let first = main_pid();
+        take_over_into(other("next", "base"));
+        let third = take_over_into("old");
+        let old = env("NGS_OLD_DAEMON");
+        assert!(exe(&third).starts_with(&old), "{} is not {old}", exe(&third));
+        let kills = journal_count(MACHINE, UNIT, "SIGKILL");
+        succeed(&["systemctl", "stop", "--no-block", UNIT]);
+        within(10, "the main process drains", || logged_by(&third, "event=draining") > 0);
+        for _ in 0..ROLLBACK_HOLD_STEPS {
+            assert!(
+                alive(&third),
+                "the main process exited while the first generation still built\n{}",
+                journal(MACHINE, UNIT)
+            );
+            assert!(alive(&first), "the first generation was gone before its build was over");
+            assert_eq!(unit_state("rollback"), "active", "the first generation's build ended early");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        release("rollback");
+        finished_once("rollback");
+        within(120, "the stopped daemon ended", || ended(UNIT));
+        assert_eq!(
+            journal_count(MACHINE, UNIT, "SIGKILL"),
+            kills,
+            "the stop killed processes"
+        );
+        assert_eq!(unit_result(MACHINE, UNIT), "success");
+        // Back to this daemon for the tests after: the socket starts it.
+        let out = switch_to("base");
+        assert_eq!(out.code, 0, "switch to base:\n{}", out.combined());
+        warm("after-rollback");
+    }
+
+    // A generation that handed over and still builds lets its sessions go as
+    // one that serves does, `SESSION_TTL` after their last call, though it
+    // lives on for its build.
+    #[test]
+    fn a_generation_still_building_after_a_takeover_ends_its_sessions() {
+        warm("warm-sessions");
+        take_over_into("short-sessions");
+        let held = quick_build("sessions-held");
+        assert!(
+            !holders(&held).is_empty(),
+            "the session holds nothing, so its end proves nothing"
+        );
+        start_build("sessions-long");
+        let old = main_pid();
+        take_over_into(other("next", "base"));
+        // The session's last call was quick_build's; the bound is twice the
+        // TTL, in steps.
+        within(2 * SESSION_TTL, "the old generation's session ended", || {
+            holders(&held).is_empty()
+        });
+        assert!(alive(&old), "the old generation exited, so this proves nothing");
+        assert_eq!(unit_state("sessions-long"), "active");
+        release("sessions-long");
+        finished_once("sessions-long");
+        within(120, "the old generation exited", || !alive(&old));
+    }
+
+    // tests/handover.nix's short-sessions: --session-ttl.
+    const SESSION_TTL: u64 = 60;
 }
 
 pub mod failures {

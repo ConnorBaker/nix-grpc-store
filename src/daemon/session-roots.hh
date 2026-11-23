@@ -27,10 +27,9 @@ public:
     using Clock = std::chrono::steady_clock;
     using Open = std::function<nix::ref<nix::Store>()>;
 
-    static constexpr std::chrono::seconds defaultTtl{3600};
     static constexpr size_t defaultCap = 256;
 
-    explicit SessionRoots(Open open, std::chrono::seconds ttl = defaultTtl, size_t cap = defaultCap)
+    SessionRoots(Open open, std::chrono::seconds ttl, size_t cap = defaultCap)
         : open_(std::move(open))
         , ttl_(ttl)
         , cap_(cap)

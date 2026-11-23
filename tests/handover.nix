@@ -3,14 +3,17 @@
 # proxying to the local nix-daemon. Switches between this configuration and
 # its specialisations reload the unit mid-build, see src/daemon/takeover.hh
 # and tests/e2e/handover.rs. `part` picks the tests: "upgrade" (what a
-# reload hands over, and what a stop or idle timeout does after it) or
-# "failures" (takeovers that fail, crash or are refused).
+# reload hands over, and what a stop or idle timeout does after it),
+# "chain" (reloads while older generations still build) or "failures"
+# (takeovers that fail, crash or are refused).
 {
   pkgs,
   nixPkgs,
   module,
   e2eTests,
   part,
+  # For "chain": the daemon of a rollback, see the specialisation `old`.
+  oldDaemon ? null,
 }:
 
 let
@@ -81,6 +84,16 @@ pkgs.testers.runNixOSTest {
         quick-timeout.configuration.systemd.services.nix-grpc-daemon.serviceConfig.TimeoutStartSec = "5s";
         # Idles out after 20 s.
         idle.configuration.services.nix-grpc-daemon.idleTimeout = lib.mkForce 20;
+        # Lets a session's paths go 60 s after its last call
+        # (tests/e2e/handover.rs SESSION_TTL).
+        short-sessions.configuration.services.nix-grpc-daemon.extraFlags = [
+          "--session-ttl"
+          "60"
+        ];
+      }
+      // lib.optionalAttrs (oldDaemon != null) {
+        # A rollback to a daemon that predates the links between generations.
+        old.configuration.services.nix-grpc-daemon.package = lib.mkForce oldDaemon;
       };
     };
 
@@ -95,7 +108,7 @@ pkgs.testers.runNixOSTest {
       with subtest("${part}"):
           run_e2e(
               {"machine": machine},
-              {"NGS_SLOW_EXPR": "${slowExpr}", "NGS_BASE_SYSTEM": "${nodes.machine.system.build.toplevel}"},
+              {"NGS_SLOW_EXPR": "${slowExpr}", "NGS_BASE_SYSTEM": "${nodes.machine.system.build.toplevel}", "NGS_OLD_DAEMON": "${toString oldDaemon}"},
               "handover::${part}::",
               "--test-threads=1",
           )
