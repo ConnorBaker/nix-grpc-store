@@ -472,12 +472,16 @@ if build_server
 
   # It reads its threads' states from /proc.
   if host_machine.system() == 'linux'
-    test('push', executable('push-test',
+    push_test = executable('push-test',
       sources : ['tests/push-test.cc'],
       include_directories : [src_inc, include_directories('src/daemon')],
       dependencies : [nix_store_dep, nix_util_dep, json_dep, curl_dep, threads_dep],
       cpp_args : ['-UNDEBUG'],
-    ))
+    )
+    test('push', push_test)
+    # A push at a limit of threads, in a user namespace of its own: SKIP
+    # (exit 77) where one cannot be had, so that the gate shows whether it ran.
+    test('push-limit', push_test, args : ['at-the-limit'])
   endif
 
   local_store_test = executable('local-store-test',

@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <ios>
 #include <optional>
+#include <print>
 #include <sstream>
 #include <stdexcept>
 #include <stop_token>
@@ -26,10 +27,13 @@
 #include <fcntl.h>
 #include <signal.h> // NOLINT(modernize-deprecated-headers): SIGPIPE is POSIX, not in <csignal>.
 #include <stdlib.h> // NOLINT(modernize-deprecated-headers): mkdtemp is POSIX, not in <cstdlib>.
+#include <sched.h>
 #include <sys/poll.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <nix/util/file-descriptor.hh>
@@ -417,6 +421,7 @@ auto contents(const std::filesystem::path & file) -> std::string
     nix::AutoCloseFD const input{::open(file.c_str(), O_RDONLY | O_CLOEXEC)}; // NOLINT(cppcoreguidelines-pro-type-vararg)
     std::string text;
     std::array<char, chunkBytes> bytes{};
+    // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): flushLog let go of the queue's lock; the analyzer does not follow it through the wait.
     for (ssize_t got = 0; input && (got = ::read(input.get(), bytes.data(), bytes.size())) > 0;) {
         text.append(bytes.data(), static_cast<size_t>(got));
     }
@@ -448,13 +453,28 @@ enum class Wait : std::uint8_t
 
 // What a step of the stalled-stderr tests guards against, read directly: a
 // thread of ours other than the log writer asleep writing to our stderr,
-// which nothing reads until the test is done, so it sleeps there for good.
-// A correct run never shows it, however slow it is.
-auto heldOnOurStderr(const std::filesystem::path & /*childPid*/) -> bool
+// which nothing reads until the test is done, so it sleeps there for good;
+// or a child of the push whose stderr is ours, where its lines would wait
+// for that stderr too. That fd 2 of the child is ours says so before the
+// child writes a line there, and a child that never writes one holds
+// nothing up; its own pipe is the child's stderr. A correct run never shows
+// either, however slow it is.
+auto heldOnOurStderr(const std::filesystem::path & childPid) -> bool
 {
-    return std::ranges::any_of(threads(), [](const std::string & tid) -> bool {
-        return firstLine("/proc/self/task/" + tid + "/comm") != "log-writer" && sleepsWritingTo(task(tid)) == STDERR_FILENO;
-    });
+    if (std::ranges::any_of(threads(), [](const std::string & tid) -> bool {
+            return firstLine("/proc/self/task/" + tid + "/comm") != "log-writer" && sleepsWritingTo(task(tid)) == STDERR_FILENO;
+        })) {
+        return true;
+    }
+    auto const child = pidIn(childPid);
+    if (!child) {
+        return false;
+    }
+    std::error_code childError;
+    std::error_code ourError;
+    auto const childs = std::filesystem::read_symlink("/proc/" + *child + "/fd/2", childError);
+    auto const ours = std::filesystem::read_symlink("/proc/self/fd/2", ourError);
+    return !childError && !ourError && childs == ours;
 }
 
 // Reads until `done` holds, or the step is read held up on our stderr
@@ -748,12 +768,14 @@ struct Call
 // pushWait must return, starting the child; so must one acked after a build
 // log's ack; with a build log the child does not ack, a request the child
 // exits on must fail its pushWait, and the next pushWait must start another
-// child and return. A step is held up once a thread of ours other than the
-// log writer is found asleep writing to our stderr (heldOnOurStderr): the defects the steps exist for,
+// child and return, while a process the exited child left behind still
+// holds that child's stderr. A step is held up once a thread of ours other
+// than the log writer is found asleep writing to our stderr, or the child has
+// our stderr for its own (heldOnOurStderr): the defects the steps exist for,
 // which a correct run never shows, however slow. The first step not done ends the steps:
 // those after it would wait behind it. Then our stderr is read, which lets
 // everything go, and every line logged must reach it: each child's start and
-// exit, and each build log's outcome.
+// exit, each build log's outcome, and each line the children logged.
 //
 // Known limits: as aStalledStderrHoldsUpOnlyItsWriter's, and a step without
 // an answer leaves its caller to end with the child, which the test does not
@@ -767,6 +789,9 @@ void aStalledStderrHoldsUpNoPushWait()
     auto const dir = std::filesystem::path(unique);
     auto const childPid = dir / "child-pid";
     auto const childIn = dir / "child-stdin";
+    // The pids of processes the children leave holding their stderr, as
+    // niks3's token command may outlive niks3.
+    auto const holders = dir / "holders";
     nix::AutoCloseFD const ourStderr{fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)}; // NOLINT(cppcoreguidelines-pro-type-vararg)
     assert(ourStderr);
     auto const path = [](const std::string & name) -> std::string {
@@ -794,14 +819,18 @@ void aStalledStderrHoldsUpNoPushWait()
         {
             // Each child writes its pid, records what it is sent, and acks
             // each request but one for a path ending in "-hold", which it
-            // leaves, and one ending in "-exit", on which it exits.
+            // leaves, and one ending in "-exit", on which it exits, its last
+            // line to its stderr without a newline. Each starts a process
+            // that holds its stderr and outlives it, until the test kills it. Before each ack it logs
+            // to its stderr, as niks3 push does a path it uploads.
             std::optional<nixgrpc::PushProcess> push;
             push.emplace(nixgrpc::PushProcess::Argv{
                 "sh",
                 "-c",
-                R"(echo $$ > "$0"; while IFS= read -r line; do printf '%s\n' "$line" >> "$1"; case $line in *-exit*) exit ;; *-hold*) continue ;; esac; id=${line#*\"id\":}; printf '{"id":%s,"status":"ok"}\n' "${id%%,*}"; done)",
+                R"(sleep 2147483647 > /dev/null & echo $! >> "$2"; echo $$ > "$0"; while IFS= read -r line; do printf '%s\n' "$line" >> "$1"; case $line in *-exit*) printf Leaving >&2; exit ;; *-hold*) continue ;; esac; echo Uploading >&2; id=${line#*\"id\":}; printf '{"id":%s,"status":"ok"}\n' "${id%%,*}"; done)",
                 childPid.string(),
-                childIn.string()});
+                childIn.string(),
+                holders.string()});
             std::deque<Call> calls;
             std::vector<std::thread> callers;
             auto const call = [&](const std::string & name) -> Call & {
@@ -854,9 +883,19 @@ void aStalledStderrHoldsUpNoPushWait()
             }
 
             reader = std::thread([&, readSide = err.readSide.get()] -> void { stalled = nix::drainFD(readSide); });
+            // The processes left holding the children's stderr go: those
+            // started so far, which a caller may wait for, then the rest.
+            auto const killHolders = [&] -> void {
+                std::istringstream pids(contents(holders));
+                for (pid_t holder = 0; pids >> holder;) {
+                    kill(holder, SIGKILL);
+                }
+            };
+            killHolders();
             for (auto & caller : callers) {
                 caller.join();
             }
+            killHolders();
             push.reset();
         }
         // Every line logged goes to the pipe before our stderr is back.
@@ -879,11 +918,6 @@ void aStalledStderrHoldsUpNoPushWait()
     if (!unanswered.empty()) {
         static_cast<void>(std::fputs(("push-test: " + unanswered + "\n").c_str(), stderr));
     }
-    assert(unanswered.empty() && "a step that waits had no answer: the push-test: line before says which");
-    assert(started && "a pushWait that started the child waited behind a stalled stderr write");
-    assert(afterLog && "a pushWait acked after a build log waited behind a stalled stderr write");
-    assert(failedOnExit && "a pushWait whose child exited waited behind a stalled stderr write");
-    assert(restarted && "a pushWait after the child exited waited behind a stalled stderr write");
     auto const times = [&](const std::string & line) -> size_t {
         size_t count = 0;
         for (size_t at = 0; (at = stalled.find(line, at)) != std::string::npos; at += line.size()) {
@@ -891,11 +925,578 @@ void aStalledStderrHoldsUpNoPushWait()
         }
         return count;
     };
+    // First: a step held up while the reader logged a failed read shows that line.
+    assert(times("event=niks3_push_stderr_lost") == 0 && "a read of the child's stderr that found it empty was taken for a failure");
+    assert(unanswered.empty() && "a step that waits had no answer: the push-test: line before says which");
+    assert(started && "a pushWait that started the child waited behind a stalled stderr write");
+    assert(afterLog && "a pushWait acked after a build log waited behind a stalled stderr write");
+    assert(failedOnExit && "a pushWait whose child exited waited behind a stalled stderr write");
+    assert(restarted && "a pushWait after the child exited waited behind a stalled stderr write");
     assert(times("event=niks3_push_started") == 2 && "a child's start is missing from our stderr");
     assert(times("event=build_log_pushed drv=" + path("log.drv")) == 1 && "a build log's upload is missing from our stderr");
     assert(times("event=build_log_push_failed drv=" + path("hold.drv")) == 1 && "a failed build log upload is missing from our stderr");
     assert(times("event=niks3_push_exited") == 2 && "a child's exit is missing from our stderr");
+    assert(times("Uploading\n") == 4 && "a line the child logged is missing from our stderr");
+    assert(times("Leaving\n") == 1 && "the child's last line, without its newline, is missing from our stderr");
     std::filesystem::remove_all(dir);
+}
+
+// What the child writes to its stderr just before it exits reaches ours:
+// its stdout ends with its exit, and the copy goes on to the end of what is
+// in its stderr's pipe. pushWait's wait asks `cancelled` under its
+// request's lock, which the reader needs to take the child's ack. The child
+// acks only once `cancelled` tells it to, through `goFifo`; so the reader is
+// held in that ack while the child writes its last lines, more than one
+// read takes but fewer than its pipe holds, and exits. `cancelled` returns
+// once the child is a zombie: exited, and not reaped, so the reader has not
+// gone past the ack. A copy that ended with the child's stdout would then
+// lose all but a read of them.
+void aChildsLastLinesArriveWhileTheReaderIsHeld()
+{
+    constexpr int lastLines = 4'000; // about 39 KB: more than a read of 4096, less than a pipe of 64 KiB
+    constexpr int zombieReadings = 3;
+    constexpr int writingReadings = 1'000;
+    constexpr long steps = 50'000'000;
+    std::string unique = (std::filesystem::temp_directory_path() / "push-test-XXXXXX").string();
+    if (mkdtemp(unique.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    auto const dir = std::filesystem::path(unique);
+    auto const file = dir / "stderr";
+    auto const goFifo = dir / "go";
+    auto const childPid = dir / "child-pid";
+    assert(mkfifo(goFifo.c_str(), 0600) == 0);
+    nix::AutoCloseFD const ourStderr{fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)}; // NOLINT(cppcoreguidelines-pro-type-vararg)
+    nix::AutoCloseFD const out{::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)}; // NOLINT(cppcoreguidelines-pro-type-vararg)
+    assert(ourStderr && out);
+    nixgrpc::flushLog(); // what was logged before goes where stderr was
+    assert(dup2(out.get(), STDERR_FILENO) != -1);
+    std::string status;
+    bool asked = false;
+    bool opened = false;
+    bool held = false;
+    bool writing = false;
+    {
+        nixgrpc::PushProcess push(nixgrpc::PushProcess::Argv{
+            "sh",
+            "-c",
+            R"(echo $$ > "$1"; read -r line; read -r _ < "$2"; id=${line#*\"id\":}; printf '{"id":%s,"status":"ok"}\n' "${id%%,*}"; last=$(seq -f 'last %.0f' 0 "$0"); printf '%s\n' "$last" >&2; exit)",
+            std::to_string(lastLines - 1),
+            childPid.string(),
+            goFifo.string()});
+        auto const cancelled = [&] -> bool {
+            if (asked) {
+                return false;
+            }
+            asked = true;
+            int gateFd = -1;
+            for (long step = 0; step < steps && gateFd < 0; step++) {
+                gateFd = ::open(goFifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
+                if (gateFd < 0) {
+                    std::this_thread::yield();
+                }
+            }
+            if (gateFd < 0) {
+                // The child never came to read the gate: it is ended, so
+                // that the push fails rather than waits for it for good.
+                if (auto const pid = pidIn(childPid)) {
+                    static_cast<void>(::kill(std::stoi(*pid), SIGKILL));
+                }
+                return false;
+            }
+            opened = true;
+            {
+                nix::AutoCloseFD const gate{gateFd};
+                nix::writeFull(gate.get(), "\n", false);
+            }
+            int zombie = 0;
+            int sleepsWriting = 0;
+            for (long step = 0; step < steps && zombie < zombieReadings && sleepsWriting < writingReadings; step++) {
+                auto const pid = pidIn(childPid);
+                char const state = pid ? processState(*pid) : '?';
+                std::istringstream fields(pid ? firstLine("/proc/" + *pid + "/syscall") : std::string{});
+                long number = -1;
+                bool const inWrite = state == 'S' && (fields >> number) && number == SYS_write;
+                zombie = state == 'Z' ? zombie + 1 : 0;
+                sleepsWriting = inWrite ? sleepsWriting + 1 : 0;
+                std::this_thread::yield();
+            }
+            held = zombie == zombieReadings;
+            writing = sleepsWriting == writingReadings;
+            return false;
+        };
+        try {
+            push.pushWait({"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-held-lines"}, cancelled);
+            status = "ok";
+        } catch (std::exception & err) {
+            status = err.what();
+        }
+    }
+    nixgrpc::flushLog();
+    assert(dup2(ourStderr.get(), STDERR_FILENO) != -1);
+    auto const text = contents(file);
+    std::filesystem::remove_all(dir);
+    int next = 0;
+    std::string_view const key = "last ";
+    for (size_t at = 0; (at = text.find(key, at)) != std::string::npos; at += 1) {
+        next += std::stoi(text.substr(at + key.size())) == next ? 1 : 0;
+    }
+    std::println("push-test: held lines: asked={} opened={} held={} writing={} status={} lines={}", asked, opened, held, writing, status, next);
+    static_cast<void>(std::fflush(stdout)); // before an assertion ends us
+    assert(opened && "the child never opened its gate within the steps");
+    assert(asked && !writing && "the child's last lines did not fit its pipe while the reader was held");
+    assert(held && "the child was not a zombie while the reader was held in its ack");
+    assert(status == "ok");
+    assert(next == lastLines && "a line the child wrote before it exited, while the reader was held, is missing from our stderr");
+}
+
+// A child that closes its stderr and goes on leaves the reader asleep: the
+// pipe's end is read once, and the pipe polled no more. The child closes its
+// stderr, says its pid, and waits for a request, then for `goFifo`. While
+// pushWait asks `cancelled`, once the child has said its pid, a thread the
+// push started must be found asleep, awakeReadings readings running; one
+// that polled the ended pipe again would find it ended at once, and never
+// sleep. Each wait, for the pid and for the sleep, is bounded by dropWithin
+// readings.
+void aStderrThatEndsFirstLeavesTheReaderAsleep()
+{
+    constexpr int awakeReadings = 1'000;
+    std::string unique = (std::filesystem::temp_directory_path() / "push-test-XXXXXX").string();
+    if (mkdtemp(unique.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    auto const dir = std::filesystem::path(unique);
+    auto const goFifo = dir / "go";
+    auto const childPid = dir / "child-pid";
+    assert(mkfifo(goFifo.c_str(), 0600) == 0);
+    auto const before = threads();
+    std::string status;
+    bool asleep = false;
+    bool opened = false;
+    {
+        nixgrpc::PushProcess push(nixgrpc::PushProcess::Argv{
+            "sh",
+            "-c",
+            R"(exec 2>&-; echo $$ > "$0"; read -r line; read -r _ < "$1"; id=${line#*\"id\":}; printf '{"id":%s,"status":"ok"}\n' "${id%%,*}"; read -r _)",
+            childPid.string(),
+            goFifo.string()});
+        bool asked = false;
+        auto const cancelled = [&] -> bool {
+            if (asked) {
+                return false;
+            }
+            asked = true;
+            for (int step = 0; step < dropWithin && !pidIn(childPid); step++) {
+                std::this_thread::yield();
+            }
+            int found = 0;
+            for (int step = 0; pidIn(childPid) && step < dropWithin && found < awakeReadings; step++) {
+                bool any = false;
+                for (auto const & tid : threads()) {
+                    any = any || (std::ranges::find(before, tid) == before.end() && task(tid).state == 'S');
+                }
+                found = any ? found + 1 : 0;
+                std::this_thread::yield();
+            }
+            asleep = found == awakeReadings;
+            int gateFd = -1;
+            for (int step = 0; step < dropWithin && gateFd < 0; step++) {
+                gateFd = ::open(goFifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
+                if (gateFd < 0) {
+                    std::this_thread::yield();
+                }
+            }
+            if (gateFd < 0) {
+                // The child never came to read the gate: it is ended, so
+                // that the push fails rather than waits for it for good.
+                if (auto const pid = pidIn(childPid)) {
+                    static_cast<void>(::kill(std::stoi(*pid), SIGKILL));
+                }
+                return false;
+            }
+            opened = true;
+            nix::AutoCloseFD const gate{gateFd};
+            nix::writeFull(gate.get(), "\n", false);
+            return false;
+        };
+        try {
+            push.pushWait({"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-stderr-ended"}, cancelled);
+            status = "ok";
+        } catch (std::exception & err) {
+            status = err.what();
+        }
+    }
+    std::filesystem::remove_all(dir);
+    std::println("push-test: stderr ended first: opened={} asleep={} status={}", opened, asleep, status);
+    static_cast<void>(std::fflush(stdout)); // before an assertion ends us
+    assert(opened && "the child never opened its gate within the steps");
+    assert(status == "ok");
+    assert(asleep && "the reader polled the child's ended stderr without sleeping");
+}
+
+// The test's own hold on the child's stderr pipe, for
+// aWriterLeftHoldingStderrIsCopiedNoFurther's hook.
+int heldStderr = -1; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): written by the test, read by the reader's hook
+// The bytes that hook wrote into the pipe; less than its lines, or none, and
+// the test tells nothing.
+std::atomic<long> lateWritten = -1; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): written by the reader's hook
+
+// A process the child leaves holding its stderr (niks3's token command
+// inherits niks3's stderr and may outlive it) has what it wrote by the
+// child's reaping copied, and no more: the copy after the reaping, under the
+// State lock, ends at what the pipe held then. The test holds the pipe
+// itself, opened from the child's fd 2 while the child waits on `goFifo`,
+// and plays that process: once the child is reaped and what the pipe holds
+// is measured (PushProcess::afterStderrMeasured), it writes lateLines
+// lines there, and must have written them all. The child acks once `cancelled` opens the gate, which holds
+// the reader in that ack, as in aChildsLastLinesArriveWhileTheReaderIsHeld;
+// then it writes its own lines, earlyLines of them, more than a read takes,
+// and exits, and `cancelled` returns once it is a zombie. So the pipe holds
+// some of them when it is measured. Every early line must reach our stderr,
+// and no late one.
+void aWriterLeftHoldingStderrIsCopiedNoFurther()
+{
+    constexpr int earlyLines = 1000; // about 9 KB: more than a read of 4096
+    constexpr int lateLines = 10;
+    std::string unique = (std::filesystem::temp_directory_path() / "push-test-XXXXXX").string();
+    if (mkdtemp(unique.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    auto const dir = std::filesystem::path(unique);
+    auto const file = dir / "stderr";
+    auto const goFifo = dir / "go";
+    auto const childPid = dir / "child-pid";
+    assert(mkfifo(goFifo.c_str(), 0600) == 0);
+    nix::AutoCloseFD const ourStderr{fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)}; // NOLINT(cppcoreguidelines-pro-type-vararg)
+    nix::AutoCloseFD const out{::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)}; // NOLINT(cppcoreguidelines-pro-type-vararg)
+    assert(ourStderr && out);
+    nixgrpc::flushLog(); // what was logged before goes where stderr was
+    assert(dup2(out.get(), STDERR_FILENO) != -1);
+    std::string status;
+    bool opened = false;
+    bool held = false;
+    {
+        nixgrpc::PushProcess push(nixgrpc::PushProcess::Argv{
+            "sh",
+            "-c",
+            R"(echo $$ > "$0"; read -r line; read -r _ < "$1"; id=${line#*\"id\":}; printf '{"id":%s,"status":"ok"}\n' "${id%%,*}"; seq -f 'early %.0f' 0 "$2" >&2; exit)",
+            childPid.string(),
+            goFifo.string(),
+            std::to_string(earlyLines - 1)});
+        bool asked = false;
+        auto const cancelled = [&] -> bool {
+            if (asked) {
+                return false;
+            }
+            asked = true;
+            for (int step = 0; step < dropWithin && !pidIn(childPid); step++) {
+                std::this_thread::yield();
+            }
+            if (auto const pid = pidIn(childPid)) {
+                heldStderr = ::open(("/proc/" + *pid + "/fd/2").c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
+            }
+            held = heldStderr >= 0;
+            int gateFd = -1;
+            for (int step = 0; step < dropWithin && gateFd < 0; step++) {
+                gateFd = ::open(goFifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
+                if (gateFd < 0) {
+                    std::this_thread::yield();
+                }
+            }
+            if (gateFd < 0) {
+                // The child never came to read the gate: it is ended, so
+                // that the push fails rather than waits for it for good.
+                if (auto const pid = pidIn(childPid)) {
+                    static_cast<void>(::kill(std::stoi(*pid), SIGKILL));
+                }
+                return false;
+            }
+            opened = true;
+            {
+                nix::AutoCloseFD const gate{gateFd};
+                nix::writeFull(gate.get(), "\n", false);
+            }
+            // A zombie: exited, its lines written, and not reaped, so the
+            // reader is still held. It exits once it has written them.
+            for (auto const pid = pidIn(childPid); pid && processState(*pid) != 'Z';) {
+                std::this_thread::yield();
+            }
+            return false;
+        };
+        nixgrpc::PushProcess::afterStderrMeasured = [] -> void {
+            std::string late;
+            for (int seq = 0; seq < lateLines; seq++) {
+                late += "late " + std::to_string(seq) + "\n";
+            }
+            lateWritten = ::write(heldStderr, late.data(), late.size());
+        };
+        try {
+            push.pushWait({"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-writer-left"}, cancelled);
+            status = "ok";
+        } catch (std::exception & err) {
+            status = err.what();
+        }
+    }
+    nixgrpc::PushProcess::afterStderrMeasured = nullptr;
+    long const wroteLate = lateWritten.exchange(-1);
+    if (heldStderr >= 0) {
+        ::close(heldStderr);
+        heldStderr = -1;
+    }
+    nixgrpc::flushLog();
+    assert(dup2(ourStderr.get(), STDERR_FILENO) != -1);
+    auto const text = contents(file);
+    std::filesystem::remove_all(dir);
+    auto const count = [&](std::string_view key) -> int {
+        int found = 0;
+        for (size_t at = 0; (at = text.find(key, at)) != std::string::npos; at += key.size()) {
+            found++;
+        }
+        return found;
+    };
+    int const early = count("early ");
+    int const late = count("late ");
+    std::string lateText;
+    for (int seq = 0; seq < lateLines; seq++) {
+        lateText += "late " + std::to_string(seq) + "\n";
+    }
+    std::println(
+        "push-test: a writer left holding stderr: opened={} held={} status={} wroteLate={} early={} late={}",
+        opened, held, status, wroteLate, early, late);
+    static_cast<void>(std::fflush(stdout)); // before an assertion ends us
+    assert(opened && held && "the child's stderr was not held, or its gate not opened, within the steps");
+    assert(std::cmp_equal(wroteLate, lateText.size()) && "the late lines were not written into the pipe after it was measured");
+    assert(status == "ok");
+    assert(early == earlyLines && "a line the child wrote before it was reaped is missing from our stderr");
+    assert(late == 0 && "the reader copied on past what the pipe held when the child was reaped");
+}
+
+// Two threads start, and a third does not: the limit on tasks counts this
+// process's own, from one.
+auto twoMoreTasksAndNoThird() -> bool
+{
+    nix::Pipe hold;
+    hold.create();
+    auto const sit = [held = hold.readSide.get()] -> void {
+        char byte = 0;
+        static_cast<void>(::read(held, &byte, 1));
+    };
+    std::vector<std::thread> sitting;
+    bool third = true;
+    try {
+        sitting.emplace_back(sit);
+        sitting.emplace_back(sit);
+        try {
+            std::thread([] -> void {}).join();
+        } catch (std::system_error &) {
+            third = false;
+        }
+    } catch (std::system_error &) {
+        third = true; // fewer than two: not the limit this test takes
+    }
+    hold.writeSide.close();
+    for (auto & one : sitting) {
+        one.join();
+    }
+    // A joined thread counts until the kernel lets it go, gone from
+    // /proc/self/task.
+    constexpr int steps = 1'000'000;
+    for (int step = 0; step < steps && threads().size() > 1; step++) {
+        std::this_thread::yield();
+    }
+    return sitting.size() == 2 && !third;
+}
+
+// Every thread of the process `pid` asleep on a futex: one that waits on a
+// lock or a condition no thread of it will release. A process with a thread
+// asleep in anything else, a reader in poll, say, is never read so, though
+// it may wait for good too.
+auto allOnAFutex(pid_t pid) -> bool
+{
+    auto const dir = "/proc/" + std::to_string(pid) + "/task";
+    std::error_code error;
+    bool any = false;
+    for (std::filesystem::directory_iterator it(dir, error), end; !error && it != end; it.increment(error)) {
+        auto const tid = dir + "/" + it->path().filename().string();
+        std::string const line = firstLine(tid + "/stat");
+        auto const close = line.rfind(')');
+        std::istringstream fields(firstLine(tid + "/syscall"));
+        long number = -1;
+        if (close == std::string::npos || close + 2 >= line.size() || line.at(close + 2) != 'S' || !(fields >> number) || number != SYS_futex) {
+            return false;
+        }
+        any = true;
+    }
+    return any && !error;
+}
+
+// Waits for the child `pid` of the test by readings: one found with every
+// thread asleep on a futex stuckReadings readings running waits for good,
+// and is killed. Whether it exited of itself.
+auto exitedUnstuck(pid_t pid, int & status) -> bool
+{
+    constexpr int stuckReadings = 100;
+    bool exited = false;
+    for (int asleep = 0; !exited && asleep < stuckReadings;) {
+        exited = waitpid(pid, &status, WNOHANG) == pid;
+        asleep = !exited && allOnAFutex(pid) ? asleep + 1 : 0;
+        std::this_thread::yield();
+    }
+    if (!exited) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+    }
+    return exited;
+}
+
+// At a limit of threads (EAGAIN) a push works on: one thread reads the
+// child's acks and its stderr, and the push needs no other; and where that
+// reader cannot start, the push fails to its caller and leaves no child
+// behind, so the next push starts another. A child of the test, in a user
+// namespace of its own, where the limit on its user's tasks counts its own,
+// is first checked to have room for two more tasks and no third, or the
+// test is skipped (exit 77). One task short of the reader, its pushWait must
+// fail, and no child of it may be left; at three tasks (itself, the push
+// child and the reader) the next pushWait must return, and the push child's
+// line must reach its stderr. The test waits for its child as exitedUnstuck
+// does: one whose push has no reader, waiting for an ack, is found so; one
+// that waits for good with its reader asleep in poll is not, and hangs the
+// test.
+auto aPushAtTheLimitOfThreadsWorks() -> bool
+{
+    constexpr int returned = 0;
+    constexpr int setupFailed = 2;
+    constexpr int secondFailed = 3;
+    constexpr int childLeft = 4;
+    constexpr int firstReturned = 5;
+    constexpr int skipped = 77;
+    constexpr rlim_t tasks = 3;
+    std::string unique = (std::filesystem::temp_directory_path() / "push-test-XXXXXX").string();
+    if (mkdtemp(unique.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    auto const file = std::filesystem::path(unique) / "stderr";
+    nixgrpc::flushLog();
+    static_cast<void>(std::fflush(stdout)); // a child that exits would write it again
+    pid_t const child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        int const out = ::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); // NOLINT(cppcoreguidelines-pro-type-vararg)
+        if (out < 0 || dup2(out, STDERR_FILENO) < 0) {
+            std::_Exit(setupFailed);
+        }
+        rlimit const limit{.rlim_cur = tasks, .rlim_max = tasks};
+        if (unshare(CLONE_NEWUSER) != 0 || setrlimit(RLIMIT_NPROC, &limit) != 0 || !twoMoreTasksAndNoThird()) {
+            std::_Exit(skipped);
+        }
+        rlimit const noReader{.rlim_cur = tasks - 1, .rlim_max = tasks};
+        if (setrlimit(RLIMIT_NPROC, &noReader) != 0) {
+            std::_Exit(setupFailed);
+        }
+        nixgrpc::PushProcess push(nixgrpc::PushProcess::Argv{
+            "sh",
+            "-c",
+            R"(while read -r line; do echo Uploading >&2; id=${line#*\"id\":}; printf '{"id":%s,"status":"ok"}\n' "${id%%,*}"; done)"});
+        bool firstFailed = false;
+        try {
+            push.pushWait({"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-no-reader"}, [] -> bool { return false; });
+        } catch (std::system_error &) {
+            firstFailed = true;
+        }
+        if (!firstFailed) {
+            std::_Exit(firstReturned);
+        }
+        if (waitpid(-1, nullptr, WNOHANG) != -1 || errno != ECHILD) {
+            std::_Exit(childLeft);
+        }
+        if (setrlimit(RLIMIT_NPROC, &limit) != 0) {
+            std::_Exit(setupFailed);
+        }
+        try {
+            push.pushWait({"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-at-the-limit"}, [] -> bool { return false; });
+        } catch (std::exception &) {
+            std::_Exit(secondFailed);
+        }
+        nixgrpc::exitLogged(returned);
+    }
+    int status = 0;
+    bool const exited = exitedUnstuck(child, status);
+    auto const text = contents(file);
+    std::filesystem::remove_all(unique);
+    int const code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == skipped) {
+        std::println("push-test: at the limit of threads: skipped, no user namespace or limit as taken");
+        return false;
+    }
+    std::println("push-test: at the limit of threads: stuck={} status={:#x} uploading={}", !exited, status, text.contains("Uploading"));
+    static_cast<void>(std::fflush(stdout)); // before an assertion ends us
+    assert(exited && "a child of the test waited for good");
+    assert(code != firstReturned && "a push one task short of its reader returned");
+    assert(code != childLeft && "a push whose reader could not start left its child");
+    assert(code == returned && "a push at the limit of threads did not return");
+    assert(text.contains("Uploading") && "the push child's line at the limit of threads is missing");
+    return true;
+}
+
+// A build log at a limit of threads fails as any upload of one does, said on
+// our stderr: the thread that sends build logs goes on, and the process with
+// it. A child of the test, as in aPushAtTheLimitOfThreadsWorks, has room for
+// three tasks: itself, the thread that sends build logs, and the push child,
+// and none for the reader. It sends a build log, waits by readings for its
+// failure on its stderr, and exits; it must exit 0, with the failure there,
+// not die of the exception that left the sending thread.
+auto aBuildLogAtTheLimitOfThreadsFails() -> bool
+{
+    constexpr int sent = 0;
+    constexpr int setupFailed = 2;
+    constexpr int noFailure = 3;
+    constexpr int skipped = 77;
+    constexpr rlim_t tasks = 3;
+    std::string unique = (std::filesystem::temp_directory_path() / "push-test-XXXXXX").string();
+    if (mkdtemp(unique.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    auto const file = std::filesystem::path(unique) / "stderr";
+    auto const drvPath = std::string("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-log-at-the-limit.drv");
+    nixgrpc::flushLog();
+    static_cast<void>(std::fflush(stdout)); // a child that exits would write it again
+    pid_t const child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        int const out = ::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); // NOLINT(cppcoreguidelines-pro-type-vararg)
+        if (out < 0 || dup2(out, STDERR_FILENO) < 0) {
+            std::_Exit(setupFailed);
+        }
+        rlimit const limit{.rlim_cur = tasks, .rlim_max = tasks};
+        if (unshare(CLONE_NEWUSER) != 0 || setrlimit(RLIMIT_NPROC, &limit) != 0 || !twoMoreTasksAndNoThird()) {
+            std::_Exit(skipped);
+        }
+        bool failed = false;
+        {
+            nixgrpc::PushProcess push(nixgrpc::PushProcess::Argv{"sh", "-c", "while read -r line; do :; done"});
+            push.pushLog(drvPath);
+            for (int step = 0; step < dropWithin && !failed; step++) {
+                failed = contents(file).contains("event=build_log_push_failed drv=" + drvPath);
+                std::this_thread::yield();
+            }
+        }
+        nixgrpc::exitLogged(failed ? sent : noFailure);
+    }
+    int status = 0;
+    bool const exited = exitedUnstuck(child, status);
+    auto const text = contents(file);
+    std::filesystem::remove_all(unique);
+    int const code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == skipped) {
+        std::println("push-test: a build log at the limit of threads: skipped, no user namespace or limit as taken");
+        return false;
+    }
+    std::println("push-test: a build log at the limit of threads: stuck={} status={:#x}", !exited, status);
+    static_cast<void>(std::fflush(stdout)); // before an assertion ends us
+    assert(exited && "a child of the test waited for good");
+    assert(!WIFSIGNALED(status) && "a build log at the limit of threads ended the process");
+    assert(code == sent && text.contains("event=build_log_push_failed drv=" + drvPath) && "a build log at the limit of threads did not fail on our stderr");
+    return true;
 }
 
 } // namespace
@@ -906,7 +1507,9 @@ extern "C" auto __lsan_default_suppressions() -> const char * // NOLINT(bugprone
     return "leak:libnixutil";
 }
 
-auto main() -> int
+// With "at-the-limit", only the tests at a limit of threads, its own test
+// (exit 77 where both are skipped); otherwise every other test.
+auto main(int argc, char ** argv) -> int // NOLINT(misc-const-correctness): main's own signature
 try {
     // As in the daemon: a child that is gone fails the write.
     (void) ::signal(SIGPIPE, SIG_IGN); // NOLINT(misc-include-cleaner): its header differs per platform
@@ -923,9 +1526,18 @@ try {
     if (__sanitizer_set_death_callback != nullptr) {
         __sanitizer_set_death_callback(replayCaptured);
     }
+    if (argc == 2 && std::string_view(argv[1]) == "at-the-limit") { // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        constexpr int skippedTest = 77;
+        bool const pushRan = aPushAtTheLimitOfThreadsWorks();
+        bool const logRan = aBuildLogAtTheLimitOfThreadsFails();
+        return pushRan || logRan ? 0 : skippedTest;
+    }
     aLogDoesNotWaitForTheChild();
     aStalledStderrHoldsUpOnlyItsWriter();
     aStalledStderrHoldsUpNoPushWait();
+    aChildsLastLinesArriveWhileTheReaderIsHeld();
+    aStderrThatEndsFirstLeavesTheReaderAsleep();
+    aWriterLeftHoldingStderrIsCopiedNoFurther();
     return 0;
 } catch (std::exception & err) {
     replayCaptured();
