@@ -178,3 +178,27 @@ fn default_client_cert_lookup() {
     succeed(&["rm", "-r", "/var/lib/nix-grpc-store"]);
     assert_eq!(out.code, 0, "{}", out.combined());
 }
+
+/// The relay nix-grpc-daemon-recorded reaches nix-daemon through outlives a
+/// connection it could not pass on while nix-daemon was down, as the daemon's
+/// own probe of nix-daemon makes during a restart.
+#[test]
+fn the_recorder_relays_again_once_nix_daemon_is_back() {
+    let relay = "/run/nix-grpc-recorded/socket";
+    wait_for_unit("nix-daemon-recorder.service");
+    succeed(&["sh", "-c", "until test -S \"$1\"; do sleep 0.1; done", "sh", relay]);
+    succeed(&["systemctl", "stop", "nix-daemon.socket", "nix-daemon.service"]);
+    let store = format!("unix://{relay}");
+    fail(&["nix", "store", "info", "--store", &store]);
+    succeed(&["systemctl", "start", "nix-daemon.socket"]);
+    succeed(&["nix", "store", "info", "--store", &store]);
+    wait_for_unit("nix-grpc-daemon-recorded.service");
+    write_file(
+        "/tmp/recorder-after-refusal.nix",
+        &drv_expr("recorder-after-refusal", "echo relayed > $out"),
+    );
+    succeed(&build_argv(
+        "grpc://127.0.0.1:50055?insecure=1",
+        "/tmp/recorder-after-refusal.nix",
+    ));
+}
