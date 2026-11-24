@@ -410,10 +410,7 @@ public:
     };
     struct Run;
 
-        struct Bounced {
-      bool refused = false; // the worker answered that it cannot serve builds now, or was not reachable
-      bool left = false;    // it went away or did not take the build: see exec::Bounce
-    };
+    using Bounced = nixgrpc::exec::Bounce; // see bounce.hh
         struct MissingInput {
       StorePath path;
     };

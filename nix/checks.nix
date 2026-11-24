@@ -227,6 +227,13 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
       .packages.${pkgs.stdenv.hostPlatform.system}.default;
   };
 
+  bounce = import ../tests/bounce.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    inherit pkgs niks3;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+  };
+
   helm = import ../tests/helm.nix {
     inherit pkgs;
     chart = ../deploy/helm/nix-grpc-farm;

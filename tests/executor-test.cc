@@ -316,6 +316,97 @@ void refundsABrokenStream()
     assert(outcome(exe, job) == Outcome::gaveUp);
 }
 
+// A refused job that the next Want does not ask for again is cancelled:
+// the scheduler places a drv given back again at once, and a placement we
+// do not take holds a slot until it expires, again and again, while the
+// jobs we did ask for wait for one.
+void bounceNotWantedAgainCancels()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const bounced = exe.add(1, {});
+    exe.connected();
+    assert((exe.takeBatch().wants == std::vector<JobId>{bounced}));
+    auto const urgent = exe.add(9, {});
+    exe.onAssigned(bounced, place("a"));
+    exe.next();
+    exe.bounced(bounced, Clock::now(), {.refused = true, .left = true});
+    assert(std::holds_alternative<st::Wantable>(exe.at(bounced)));
+    auto const batch = exe.takeBatch();
+    assert((batch.wants == std::vector<JobId>{urgent}));
+    assert((batch.cancels == std::vector<JobId>{bounced}));
+}
+
+// A refused job that rests before it asks again is cancelled meanwhile.
+void restingBounceCancels()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    exe.connected();
+    for (int round = 0; round < 2; round++) {
+        exe.takeBatch();
+        exe.onAssigned(job, place("a"));
+        exe.next();
+        exe.bounced(job, Clock::now(), {.refused = true, .left = false});
+    }
+    assert(std::holds_alternative<st::Resting>(exe.at(job)));
+    auto const batch = exe.takeBatch();
+    assert(batch.wants.empty());
+    assert((batch.cancels == std::vector<JobId>{job}));
+}
+
+// A job whose build goes on (its stream to the worker broke) is followed
+// on, wanted again or not: a Cancel would have the scheduler revoke that
+// build (farm::cutoffs, a build whose stream breaks).
+void brokenStreamKeepsTheBuild()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const job = exe.add(1, {});
+    exe.connected();
+    exe.takeBatch();
+    auto const urgent = exe.add(9, {});
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    exe.bounced(job, Clock::now(), {.refused = false, .left = true, .held = true});
+    auto const batch = exe.takeBatch();
+    assert((batch.wants == std::vector<JobId>{urgent}));
+    assert(batch.cancels.empty());
+}
+
+// A job not wanted again after a give-back the worker did not refuse is
+// cancelled too: `bounce` as the worker answers (UNAVAILABLE, draining or
+// out of space: left, not refused), or as Run::recover reports the upload
+// of an input the worker lacked (neither).
+void givenBackNotWantedAgainCancels(nixgrpc::exec::Bounce bounce)
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const job = exe.add(1, {});
+    exe.connected();
+    exe.takeBatch();
+    auto const urgent = exe.add(9, {});
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    exe.bounced(job, Clock::now(), bounce);
+    auto const batch = exe.takeBatch();
+    assert((batch.wants == std::vector<JobId>{urgent}));
+    assert((batch.cancels == std::vector<JobId>{job}));
+}
+
+// A bounced job wanted again in the same batch is not cancelled: the
+// scheduler keeps its entry, with the placement it may have made already.
+void bounceWantedAgainKeepsTheEntry()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    exe.connected();
+    exe.takeBatch();
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    exe.bounced(job, Clock::now(), {.refused = true, .left = true});
+    auto const batch = exe.takeBatch();
+    assert((batch.wants == std::vector<JobId>{job}));
+    assert(batch.cancels.empty());
+}
+
 } // namespace
 
 auto main() -> int
@@ -335,6 +426,12 @@ auto main() -> int
         disconnectForgetsFollows();
         freeBounces();
         refundsABrokenStream();
+        bounceNotWantedAgainCancels();
+        restingBounceCancels();
+        brokenStreamKeepsTheBuild();
+        givenBackNotWantedAgainCancels({.refused = false, .left = true, .held = false}); // draining
+        givenBackNotWantedAgainCancels({});                                              // re-upload
+        bounceWantedAgainKeepsTheEntry();
     } catch (const std::exception & err) {
         std::cerr << err.what() << "\n";
         return 1;
