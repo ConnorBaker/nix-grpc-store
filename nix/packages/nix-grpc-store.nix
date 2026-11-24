@@ -87,6 +87,7 @@ stdenv.mkDerivation {
         ../../tests/tunnel-test.cc
         ../../tests/builder-test.cc
         ../../tests/local-store-test.cc
+        ../../tests/session-roots-test.cc
         ../../tests/plugin-loader-test.cc
         ../../tests/upload-claims-test.cc
         ../../tests/top-down-test.cc

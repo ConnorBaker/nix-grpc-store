@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -19,6 +20,8 @@
 #include <nix/util/error.hh>
 #include <nix/util/ref.hh>
 
+#include "logfmt.hh"
+
 namespace nixgrpc {
 
 class SessionRoots
@@ -29,6 +32,16 @@ public:
 
     static constexpr size_t defaultCap = 256;
 
+    // What a hold is for. A session that held only what queries answered
+    // present is evicted before one that holds uploads or outputs, so
+    // clients that only ask cannot push out the paths of one that builds
+    // while there is a query-only session to evict. When every session
+    // holds uploads or outputs, a new one evicts the least recently used,
+    // and that is logged. A session that held an upload or an output once
+    // stays one that does: its later queries do not make it evictable
+    // first, as its uploads and outputs are still held.
+    enum class Hold : uint8_t { queried, kept };
+
     SessionRoots(Open open, std::chrono::seconds ttl, size_t cap = defaultCap)
         : open_(std::move(open))
         , ttl_(ttl)
@@ -36,10 +49,19 @@ public:
     {
     }
 
-    // Also refreshes the session. No-op without a session.
-    void hold(std::string_view session, const std::vector<nix::StorePath> & paths, Clock::time_point now = Clock::now())
+    // Also refreshes the session. No-op without a session or paths. Throws
+    // if the session's nix-daemon connection cannot be opened: answering
+    // without holding would let the garbage collector take what was
+    // answered present.
+    void hold(
+        std::string_view session,
+        const std::vector<nix::StorePath> & paths,
+        Hold why = Hold::kept,
+        Clock::time_point now = Clock::now())
     {
-        if (session.empty()) {
+        // Nothing to hold: no nix-daemon connection for a query that
+        // found nothing present.
+        if (session.empty() || paths.empty()) {
             return;
         }
         auto const add = [&](nix::Store & store) -> void {
@@ -48,37 +70,66 @@ public:
             }
         };
         try {
-            add(*roots(session, now));
+            add(*roots(session, why, now));
         } catch (nix::Error &) {
             // Its nix-daemon connection is gone, and the roots with it.
             drop(session);
-            add(*roots(session, now));
+            add(*roots(session, why, now));
         }
     }
 
-private:
-    auto roots(std::string_view session, Clock::time_point now) -> std::shared_ptr<nix::Store>
+    [[nodiscard]] auto holds(std::string_view session) -> bool
     {
+        absl::MutexLock const lock(mutex_);
+        return held_.contains(session);
+    }
+
+private:
+    auto roots(std::string_view session, Hold why, Clock::time_point now) -> std::shared_ptr<nix::Store>
+    {
+        {
+            absl::MutexLock const lock(mutex_);
+            if (auto const found = held_.find(session); found != held_.end()) {
+                touch(found->second, why, now);
+                return found->second.store;
+            }
+        }
+        // A new session: its connection first, outside the lock. One that
+        // cannot be opened evicts no other session.
+        std::shared_ptr<nix::Store> opened = open_().get_ptr();
         std::shared_ptr<nix::Store> store;
         std::shared_ptr<nix::Store> evicted; // closed outside the lock
+        std::string holder;                  // an evicted session that held uploads or outputs
         {
             absl::MutexLock const lock(mutex_);
             auto found = held_.find(session);
-            if (found == held_.end()) {
+            if (found == held_.end()) { // nobody opened it meanwhile
                 if (held_.size() >= cap_) {
+                    // The least recently used, of those that only queried
+                    // if there are any.
                     auto oldest = held_.begin();
                     for (auto it = held_.begin(); it != held_.end(); ++it) {
-                        if (it->second.last < oldest->second.last) {
+                        if (std::pair(it->second.keeps, it->second.last)
+                            < std::pair(oldest->second.keeps, oldest->second.last)) {
                             oldest = it;
                         }
                     }
                     evicted = std::move(oldest->second.store);
+                    if (oldest->second.keeps) {
+                        holder = oldest->first;
+                        ++holdersEvicted_;
+                    }
                     held_.erase(oldest);
                 }
-                found = held_.emplace(std::string(session), Held{.store = open_().get_ptr(), .last = now}).first;
+                found = held_.emplace(std::string(session), Held{.store = std::move(opened), .last = now}).first;
             }
-            found->second.last = now;
+            touch(found->second, why, now);
             store = found->second.store;
+        }
+        if (!holder.empty()) {
+            // Its uploads and outputs are no longer held: as many sessions
+            // as the cap all held some within the expiry.
+            logLine(LogLevel::info, {{"event", "session_evicted"}, {"session", holder}, {"held", "uploads_or_outputs"}});
         }
         return store;
     }
@@ -112,6 +163,13 @@ public:
         return ended.size();
     }
 
+    // Sessions evicted although they held uploads or outputs.
+    [[nodiscard]] auto holdersEvicted() -> size_t
+    {
+        absl::MutexLock const lock(mutex_);
+        return holdersEvicted_;
+    }
+
     [[nodiscard]] auto size() -> size_t
     {
         absl::MutexLock const lock(mutex_);
@@ -123,13 +181,21 @@ private:
     {
         std::shared_ptr<nix::Store> store;
         Clock::time_point last;
+        bool keeps = false; // held an upload or an output, not only queried paths
     };
+
+    static void touch(Held & held, Hold why, Clock::time_point now)
+    {
+        held.last = now;
+        held.keeps = held.keeps || why == Hold::kept;
+    }
 
     Open open_;
     std::chrono::seconds ttl_;
     size_t cap_;
     absl::Mutex mutex_;
     std::map<std::string, Held, std::less<>> held_ ABSL_GUARDED_BY(mutex_);
+    size_t holdersEvicted_ ABSL_GUARDED_BY(mutex_) = 0;
 };
 
 } // namespace nixgrpc

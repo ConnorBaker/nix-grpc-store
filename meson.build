@@ -478,6 +478,13 @@ if build_server
   )
   test('local-store', local_store_test)
 
+  test('session-roots', executable('session-roots-test',
+    sources : ['tests/session-roots-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : common_deps + absl_dep + [nix_store_dep, nix_util_dep],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+  ))
+
   # A placement nobody claims whose outputs the node's store has is settled
   # from that store by the daemon's own thread, while its client still waits.
   test('built-here', find_program('python3'),
