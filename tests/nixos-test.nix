@@ -222,6 +222,8 @@ pkgs.testers.runNixOSTest {
           "nix-grpc-certs.service"
         ];
         requires = [ "nix-grpc-certs.service" ];
+        # Like the module's unit: active once every listener is bound.
+        serviceConfig.Type = "notify";
         serviceConfig.ExecStart = ''
           ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50052 \
             --proxy-socket /nix/var/nix/daemon-socket/socket \
@@ -243,6 +245,7 @@ pkgs.testers.runNixOSTest {
           "nix-grpc-certs.service"
         ];
         requires = [ "nix-grpc-certs.service" ];
+        serviceConfig.Type = "notify";
         serviceConfig.ExecStart = ''
           ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50053 \
             --proxy-socket /nix/var/nix/daemon-socket/socket \
@@ -259,6 +262,7 @@ pkgs.testers.runNixOSTest {
           "nix-grpc-certs.service"
         ];
         requires = [ "nix-grpc-certs.service" ];
+        serviceConfig.Type = "notify";
         serviceConfig.ExecStart = ''
           ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50054 \
             --proxy-socket /nix/var/nix/daemon-socket/socket \
