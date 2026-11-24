@@ -792,3 +792,103 @@ pub mod failures {
         refused(&format!("echo $$ > {CGROUP_PROCS} && exec"), "another user");
     }
 }
+
+// tests/handover.nix's "gc": the farm's store loses an input between the
+// client's plan, which counted it present, and the build that needs it.
+pub mod gc {
+    use super::*;
+
+    // `input` of NGS_GC_EXPR for `tag`, built by the node itself: no farm
+    // session holds it. Returns its path.
+    fn input_built_here(tag: &str) -> String {
+        let expr = env("NGS_GC_EXPR");
+        succeed(&[
+            "nix", "build", "--no-link", "--print-out-paths", "-f", &expr, "--argstr", "tag", tag, "input",
+        ])
+        .trim()
+        .to_string()
+    }
+
+    // The client builds `consumer` in unit `tag`. Returns once the slow
+    // build it waits for runs: the client has planned, with the input
+    // present.
+    fn start_consumer(tag: &str) {
+        let expr = env("NGS_GC_EXPR");
+        let store = format!("{}&reschedule-retries=2", store());
+        let out = format!(r#""$@" > /root/{tag}.out"#);
+        succeed(&[
+            "systemd-run", "--unit", tag, "--setenv=PATH=/run/current-system/sw/bin", "sh", "-c", &out, "sh",
+            "nix", "build", "-L", "--no-link", "--print-out-paths", "--store", &store, "--eval-store", "local",
+            "-f", &expr, "--argstr", "tag", tag, "consumer",
+        ]);
+        retry(&[(MACHINE, tag)], "the slow build started", || starts(tag) > 0);
+    }
+
+    // The processes whose temp roots name `path` and that serve a
+    // connection of nix-grpc-daemon's (a nix-daemon worker whose unix
+    // socket's peer is in nix-grpc-daemon's unit), not a `nix` client's.
+    // `ss -xpn` fields: netid, state, queues, local path and inode, peer
+    // path and inode, process.
+    fn daemon_holders(path: &str) -> Vec<String> {
+        let served = query(
+            MACHINE,
+            &[
+                "bash",
+                "-c",
+                r#"set -o pipefail
+ss -xpn | awk -v ours=" $1 " '
+  match($0, /pid=[0-9]+/) { pid = substr($0, RSTART + 4, RLENGTH - 4); line[NR] = pid; local[NR] = $6
+    if (index(ours, " " pid " ")) theirs[$8] = 1 }
+  END { for (i = 1; i <= NR; i++) if ((i in line) && (local[i] in theirs)) print line[i] }'"#,
+                "sh",
+                &unit_pids().join(" "),
+            ],
+        );
+        let served: Vec<&str> = served.split_whitespace().collect();
+        holders(path).into_iter().filter(|p| served.contains(&p.as_str())).collect()
+    }
+
+    // The input goes as a garbage collector that wins the race takes it:
+    // the connections holding it end first, as a session's expiry would.
+    // Within 20 tries, else the test fails with what holds it.
+    fn collect(path: &str) {
+        let mut last = String::new();
+        for _ in 0..20 {
+            for p in daemon_holders(path) {
+                run(&["kill", "-9", &p]);
+            }
+            let out = run(&["nix-store", "--delete", path]);
+            if out.code == 0 {
+                return;
+            }
+            last = out.combined();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let roots = run(&["nix-store", "-q", "--roots", path]).combined();
+        panic!("{path} not deleted: {last}\nroots: {roots}\nnix-grpc-daemon's: {:?}", unit_pids());
+    }
+
+    fn log_of(tag: &str) -> String {
+        query(MACHINE, &["journalctl", "-u", tag])
+    }
+
+    // Built again on the one builder, with no cache to tell whether it was
+    // lost: given back unnamed, the client would ask the scheduler until
+    // its reschedule-retries ran out.
+    #[test]
+    fn an_input_collected_after_the_plan_is_built_again() {
+        let tag = "gc-lost";
+        let input = input_built_here(tag);
+        start_consumer(tag);
+        collect(&input);
+        let gate = format!("{tag}-gate");
+        retry(&[(MACHINE, tag)], "the slow build released", || try_release(&gate));
+        retry(&[], &format!("{tag} ended"), || ended(tag));
+        let log = log_of(tag);
+        assert!(log.contains(&format!("farm lacks '{input}'")), "not built again:\n{log}");
+        assert_eq!(unit_result(MACHINE, tag), "success", "{log}");
+        assert!(!log.contains("gave up after"), "{log}");
+        assert_eq!(log.matches(&format!("GC-INPUT-BUILT-{tag}")).count(), 1, "{log}");
+        succeed(&["nix-store", "--verify-path", &input]);
+    }
+}

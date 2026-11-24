@@ -66,9 +66,13 @@ What happens on a build:
   `reschedule-retries`: a cache that did not answer, or an input niks3
   does not list, which only another substituter offers or which niks3
   holds only inside another root's closure (niks3 lists closure roots
-  only). Any client that may build can ask for that check (header
-  `x-nix-cache-lost`); it costs an S3 lookup per object of the outputs'
-  closure.
+  only). A builder without `--niks3-cache-url` cannot tell, so it names
+  every input it cannot get, for example one its garbage collector took
+  after the client planned the build, unless its own disk is full: then
+  it gives the build back unnamed. (A builder with niks3 names an input
+  the cache lost even then.) Any client that may build can ask for that
+  check (header `x-nix-cache-lost`); it costs an S3 lookup per object of
+  the outputs' closure.
 
   Known limitation: nix keeps a narinfo it looked up for
   `narinfo-cache-positive-ttl` (30 days by default), even once the NAR

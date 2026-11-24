@@ -214,6 +214,14 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     part = "failures";
   };
 
+  handover-gc = import ../tests/handover.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+    part = "gc";
+  };
+
   handover-chain = import ../tests/handover.nix {
     e2eTests = pkgs.callPackage ../tests/e2e { };
     inherit pkgs;
