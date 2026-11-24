@@ -280,6 +280,7 @@ pkgs.testers.runNixOSTest {
         wantedBy = [ "multi-user.target" ];
         after = [ "nix-daemon-recorder.service" ];
         requires = [ "nix-daemon-recorder.service" ];
+        serviceConfig.Type = "notify";
         serviceConfig.ExecStart = ''
           ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50055 \
             --proxy-socket /run/nix-grpc-recorded/socket
@@ -297,6 +298,7 @@ pkgs.testers.runNixOSTest {
           "nix-daemon-recorder.service"
           "nix-grpc-certs.service"
         ];
+        serviceConfig.Type = "notify";
         serviceConfig.ExecStart = ''
           ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50056 \
             --proxy-socket /run/nix-grpc-recorded/socket \

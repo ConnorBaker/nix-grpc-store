@@ -30,6 +30,13 @@ server.listen(64)
 while True:
     client, _ = server.accept()
     daemon = socket.socket(socket.AF_UNIX)
-    daemon.connect(target)
+    try:
+        daemon.connect(target)
+    except OSError as err:
+        # nix-daemon is down: this client fails, later ones may not.
+        print(f"cannot reach {target}: {err}", file=sys.stderr, flush=True)
+        daemon.close()
+        client.close()
+        continue
     threading.Thread(target=pump, args=(client, daemon, True), daemon=True).start()
     threading.Thread(target=pump, args=(daemon, client, False), daemon=True).start()
