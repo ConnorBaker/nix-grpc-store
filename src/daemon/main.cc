@@ -371,15 +371,22 @@ private:
         return Rpc{.context = &context, .method = method, .caller = std::move(caller)};
     }
 
-    // Writers only: a session pins disk until it expires.
-    void holdForSession(const Rpc & rpc, const std::vector<nix::StorePath> & paths)
+    // Writers only: a session pins disk until it expires. Whether `paths`
+    // are held.
+    auto holdForSession(
+        const Rpc & rpc,
+        const std::vector<nix::StorePath> & paths,
+        nixgrpc::SessionRoots::Hold why = nixgrpc::SessionRoots::Hold::kept) -> bool
     {
         if (rpc.caller.role < nixgrpc::Role::write) {
-            return;
+            return false;
         }
-        if (auto const session = sessionOf(*rpc.context); !session.empty()) {
-            sessions.hold(session, paths);
+        auto const session = sessionOf(*rpc.context);
+        if (session.empty()) {
+            return false;
         }
+        sessions.hold(session, paths, why);
+        return true;
     }
 
     // The client's session, empty if it names none.
@@ -487,8 +494,13 @@ public:
             auto const substitute = request->substitute() && rpc.caller.role >= nixgrpc::Role::write;
             std::vector<std::string> valid;
             nixgrpc::Metrics::Phase phase(metrics, "QueryValidPaths", "query");
-            auto const here = localStore->queryValidPaths(paths, substitute ? nix::Substitute : nix::NoSubstitute);
-                holdForSession(rpc, {here.begin(), here.end()});
+            auto here = localStore->queryValidPaths(paths, substitute ? nix::Substitute : nix::NoSubstitute);
+            // Present only if still valid once held: the garbage collector
+            // may take a path between the query and the hold. Nix's goals,
+            // too, root a path before they check it.
+            if (holdForSession(rpc, {here.begin(), here.end()}, nixgrpc::SessionRoots::Hold::queried)) {
+                here = localStore->queryValidPaths(here, nix::NoSubstitute);
+            }
             for (const auto & path : here) {
                 reply->add_paths(std::string(path.to_string()));
                 valid.push_back(localStore->printStorePath(path));

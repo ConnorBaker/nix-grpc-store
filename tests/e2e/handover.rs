@@ -891,4 +891,109 @@ ss -xpn | awk -v ours=" $1 " '
         assert_eq!(log.matches(&format!("GC-INPUT-BUILT-{tag}")).count(), 1, "{log}");
         succeed(&["nix-store", "--verify-path", &input]);
     }
+
+    // The farm holds an input it told the client is present, for the
+    // client's session, from the plan on: as a local nix-daemon's goals
+    // root an output before they check it.
+    #[test]
+    fn an_input_the_plan_counted_present_stays_held() {
+        let tag = "gc-held";
+        let input = input_built_here(tag);
+        assert!(holders(&input).is_empty(), "{:?} hold {input} before the plan", holders(&input));
+        start_consumer(tag);
+        assert!(!daemon_holders(&input).is_empty(), "the plan left {input} unheld");
+        let deleted = run(&["nix-store", "--delete", &input]);
+        assert_ne!(deleted.code, 0, "{input} deleted although held");
+        assert!(deleted.combined().contains("still alive"), "{}", deleted.combined());
+        let gate = format!("{tag}-gate");
+        retry(&[(MACHINE, tag)], "the slow build released", || try_release(&gate));
+        retry(&[], &format!("{tag} ended"), || ended(tag));
+        let log = log_of(tag);
+        assert_eq!(unit_result(MACHINE, tag), "success", "{log}");
+        assert!(!log.contains("farm lacks"), "{log}");
+        assert!(!log.contains(&format!("GC-INPUT-BUILT-{tag}")), "built again: {log}");
+    }
+
+    // What the garbage collector takes between the worker's query and its
+    // hold is not answered present. A client copies PATHS paths the worker
+    // has, from a store of its own. The worker holds them for its session
+    // one temp root at a time, in store path order. Once it holds the
+    // first, the test stops its nix-daemon connection and the collector
+    // deletes the last 2000; then the connection goes on. (A connection
+    // stopped inside the collector's lock is let go and stopped again.)
+    // A path answered
+    // present but held only after it was gone is neither copied nor there
+    // afterwards. A path answered absent is copied, and is there.
+    #[test]
+    fn a_path_collected_before_it_is_held_is_not_answered_present() {
+        const PATHS: usize = 40000;
+        let script = r#"set -eu
+# In memory: the node's disk has too few inodes for these.
+n=$1; dir=/dev/shm/gc-race; mkdir -p $dir/files
+nonce=$(cat /proc/sys/kernel/random/uuid)
+i=0; while [ $i -lt $n ]; do echo "gc-race $nonce $i" > $dir/files/$i; i=$((i + 1)); done
+find $dir/files -type f | xargs nix-store --add | sort > $dir/paths
+nix copy --no-check-sigs --to "local?root=$dir/src" --stdin < $dir/paths
+roots=/nix/var/nix/temproots
+before=" $(ls $roots | tr '\n' ' ') "
+nix copy --no-check-sigs --from "local?root=$dir/src" --to "$2" --stdin < $dir/paths > $dir/copy.out 2>&1 &
+copy=$!
+# The worker's session opens its nix-daemon connection to hold the
+# first path; that connection's temp roots file is the one new here.
+# It stops at once, mid-hold, so the collector surely comes first for
+# the paths it holds last.
+polls=0; worker=
+while [ -z "$worker" ]; do
+  for f in $roots/*; do
+    [ -e "$f" ] || continue
+    case $before in *" ${f##*/} "*) ;; *) worker=${f##*/} ;; esac
+  done
+  polls=$((polls + 1))
+  kill -0 $copy 2>/dev/null || { echo "the copy ended before any hold"; cat $dir/copy.out; exit 1; }
+done
+sort -r $dir/paths | head -n 2000 > $dir/last
+# Stopped while it holds the garbage collector's lock (nix takes it
+# shared around adding temp roots), the connection keeps the collector
+# waiting: then it goes on for a moment and is stopped again.
+tries=0; waits=0; clear=0; : > $dir/delete.out
+while :; do
+  tries=$((tries + 1))
+  kill -STOP $worker
+  nix-store --delete $(cat $dir/last) >> $dir/delete.out 2>&1 &
+  gc=$!
+  w=0
+  while kill -0 $gc 2>/dev/null && [ $w -lt 50 ]; do sleep 0.1; w=$((w + 1)); done
+  waits=$((waits + w))
+  kill -0 $gc 2>/dev/null || { clear=1; break; }
+  kill $gc 2>/dev/null || true; wait $gc || true
+  kill -CONT $worker
+  [ $tries -lt 10 ] || break
+done
+held=$(tr '\0' '\n' < $roots/$worker | grep -c -F -f $dir/paths || true)
+kill -CONT $worker
+wait $gc || true
+copied=0; wait $copy || copied=$?
+lost=$(xargs nix-store --check-validity --print-invalid < $dir/paths | wc -l)
+echo "polls=$polls tries=$tries clear=$clear held=$held waits=$waits copy=$copied lost=$lost deleted=$(awk '/store paths deleted/ { n += $1 } END { print n + 0 }' $dir/delete.out)"
+"#;
+        let store = store();
+        let out = succeed(&["bash", "-c", script, "sh", &PATHS.to_string(), &store]);
+        println!("[e2e] gc race: {}", out.trim());
+        let field = |name: &str| -> usize {
+            out.split_whitespace()
+                .find_map(|f| f.strip_prefix(&format!("{name}=")))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in {out}"))
+        };
+        assert_eq!(field("copy"), 0, "{out}");
+        // Stopped inside the garbage collector's lock every time: the
+        // collector never ran beside the stopped hold.
+        assert_eq!(field("clear"), 1, "the connection held the collector's lock each time it stopped, so this proves nothing: {out}");
+        // The hold adds one temp root at a time, in path order, so a stop
+        // after its first leaves the last 2000 to the collector. A hold
+        // that added them all at once (addTempRoots) would leave none, and
+        // this test would prove nothing: it fails here instead.
+        assert!(field("deleted") > 0, "the collector took nothing, so this proves nothing: {out}");
+        assert_eq!(field("lost"), 0, "answered present, then gone: {out}");
+    }
 }

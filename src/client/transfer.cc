@@ -69,9 +69,14 @@ auto GrpcStore::queryValidPathsRouted(const StorePathSet & paths, SubstituteFlag
     request.add_paths(std::string(path.to_string()));
   }
   remote::QueryValidPathsReply reply;
+  // The farm holds what it answers present for our session, so its garbage
+  // collector cannot take an input we leave out of the build before the
+  // build that uses it starts. Routed calls carry it already
+  // (routingFor), with the same value, so both copies are our session.
   retrying("QueryValidPaths", [&] -> grpc::Status {
     nixgrpc::Call call;
     addHeaders(call.ctx(), headers);
+    call.ctx().AddMetadata("x-nix-session", session);
     reply.Clear();
     return stub->QueryValidPaths(&call.ctx(), request, &reply);
   });
