@@ -5,7 +5,8 @@
 # and tests/e2e/handover.rs. `part` picks the tests: "upgrade" (what a
 # reload hands over, and what a stop or idle timeout does after it),
 # "chain" (reloads while older generations still build) or "failures"
-# (takeovers that fail, crash or are refused).
+# (takeovers that fail, crash or are refused) or "gc" (inputs the garbage
+# collector takes between a client's plan and the build that needs them).
 {
   pkgs,
   nixPkgs,
@@ -28,6 +29,37 @@ let
       builder = "/bin/sh";
       PATH = builtins.storePath "${pkgs.coreutils}" + "/bin";
       args = [ "-c" "mkfifo release; echo SLOW-STARTED-''${tag} >&2; ''${if hold then "read x < release" else ":"}; echo ''${tag} > $out" ];
+    }
+  '';
+  # For "gc" (tests/e2e/handover.rs gc): `input`, fixed-output like a
+  # fetched crate, which the test builds on the node before the client
+  # plans; and `consumer`, of it and of a slow build, so the consumer starts
+  # only once the test releases that build.
+  gcExpr = pkgs.writeText "gc.nix" ''
+    { tag }:
+    let
+      PATH = builtins.storePath "${pkgs.coreutils}" + "/bin";
+      input = derivation {
+        name = "gc-input-''${tag}";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        inherit PATH;
+        args = [ "-c" "echo GC-INPUT-BUILT-''${tag} >&2; printf %s ''${tag} > $out" ];
+        outputHashMode = "flat";
+        outputHashAlgo = "sha256";
+        outputHash = builtins.hashString "sha256" tag;
+      };
+      gate = import ${slowExpr} { tag = "''${tag}-gate"; };
+    in
+    {
+      inherit input;
+      consumer = derivation {
+        name = "gc-consumer-''${tag}";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        inherit PATH;
+        args = [ "-c" "cat ''${input} ''${gate} > $out" ];
+      };
     }
   '';
 in
@@ -108,7 +140,7 @@ pkgs.testers.runNixOSTest {
       with subtest("${part}"):
           run_e2e(
               {"machine": machine},
-              {"NGS_SLOW_EXPR": "${slowExpr}", "NGS_BASE_SYSTEM": "${nodes.machine.system.build.toplevel}", "NGS_OLD_DAEMON": "${toString oldDaemon}"},
+              {"NGS_SLOW_EXPR": "${slowExpr}", "NGS_GC_EXPR": "${gcExpr}", "NGS_BASE_SYSTEM": "${nodes.machine.system.build.toplevel}", "NGS_OLD_DAEMON": "${toString oldDaemon}"},
               "handover::${part}::",
               "--test-threads=1",
           )

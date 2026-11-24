@@ -121,6 +121,18 @@ public:
         return (verify ? remote->verifyingPush : remote->push).pushWait(paths, cancelled);
     }
 
+    // The cache URL lost() asks, if niks3 and its cache URL are configured.
+    [[nodiscard]] auto lostUrl() const -> const std::string *
+    {
+        return remote && !remote->cacheUrl.empty() ? &remote->cacheUrl : nullptr;
+    }
+
+    // Whether lost() can tell.
+    [[nodiscard]] auto tellsLost() const -> bool
+    {
+        return lostUrl() != nullptr;
+    }
+
     // Whether the cache lost the path whose hash part is `hashPart`: niks3
     // says it can serve it (holds), and the bucket has no narinfo for it, or
     // the narinfo's NAR answers 404. False for a path niks3 does not list,
@@ -130,10 +142,11 @@ public:
     [[nodiscard]] auto lost(std::string_view hashPart) -> bool
     {
         constexpr long notFound = 404;
-        if (!remote || remote->cacheUrl.empty()) {
+        auto const * url = lostUrl();
+        if (url == nullptr) {
             return false;
         }
-        auto const cacheUrl = remote->cacheUrl;
+        auto const cacheUrl = *url;
         auto const key = std::string(hashPart) + ".narinfo";
         if (!holds({key}).contains(key)) {
             return false;

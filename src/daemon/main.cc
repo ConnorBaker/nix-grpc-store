@@ -896,7 +896,9 @@ public:
     }
 
     // Inputs may have been uploaded to, or built on, another worker. On
-    // failure, `missing` names the input if the cache lost it.
+    // failure, `missing` names the input if the cache lost it, or if this
+    // node has no cache that can tell (Cache::tellsLost) and its disk is
+    // not full.
     auto gatherInputs(
         nix::Store & localStore,
         const nix::BasicDerivation & drv,
@@ -942,9 +944,13 @@ public:
             // No worker can get an input the cache lost: named, the client
             // builds it. Past a cache or nix-daemon that failed, another
             // worker may: unnamed, the client asks the scheduler for one, up
-            // to its reschedule-retries.
+            // to its reschedule-retries. Without a cache that can tell, any
+            // input not got is named, as upstream does: else one the GC
+            // took after the client planned is never built.
             if (lost) {
                 metrics.event("input_lost");
+            }
+            if (fetching && (lost || !coord.cache.tellsLost())) {
                 missing = localStore.printStorePath(*fetching);
             }
             return {grpc::StatusCode::FAILED_PRECONDITION, workerName + ": input not substitutable: " + err.what()};
