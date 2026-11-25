@@ -90,10 +90,11 @@ Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
 | 60 | `farm-hold-planned-inputs` | `d4950b6128afc0156338f57bc9586eb2dd10c3bc` | `farm-name-lost-inputs` | its tests extend that topic's handover-gc part | Hold for the client's session the paths its planning queries were told are present; check them again once held; evict query-only sessions first |  |
 | 61 | `vm-test-units-notify` | `e0be9021d1f25c6d0b271d52b3b8692aa250740a` | upstream `main` `a40124f4` | changes the VM test's hand-written daemon units as upstream has them at `a40124f4` | Tests: the VM test's hand-written daemon units are Type=notify, active once the daemon listens | not opened (draft) |
 | 62 | `client-unfollow-bounced` | `49ee622cc42ef1c61795c21e203f5374f679fb72` | `integration` `addfe736` | changes the client's bounce handling (build.cc, executor.hh, store.hh, new bounce.hh) and its unit tests; its VM check `bounce` (tests/bounce.nix, tests/e2e/bounce.rs) runs its node with a niks3 cache and no substituter, so the worker gives the input it lost back unnamed also with `farm-name-lost-inputs` merged | Client: a bounced job it does not want again is cancelled, not left placed for it, unless its build may go on (a broken stream, a handover, another call building it) |  |
+| 63 | `wait-port-listening` | `767f4fc8130fc3011db272a08430370a0ce7477c` | upstream `main` `a40124f4` | changes upstream's tests/e2e/harness.rs and lifecycle.rs, whose waits integration has without a deadline | Tests: find a port open only when something listens on it |  |
 
 `build-client-session-name` is merged a second time after merge 61, at the head row 49 names, which adds `Type=notify` to its recorded daemon units and keeps its nix-daemon recorder alive across a refused connection. Its first merge (49) took `1b3840b7de501dcb9d139f48bd44b7e325b696e7`.
 
-23 of the 63 topic merges resolve overlaps (21 of the first 46, `farm-admission-by-machines` and `takeover-liveness-to-main`), and so do both upstream merges; each names its files in its message.
+24 of the 64 topic merges resolve overlaps (21 of the first 46, `farm-admission-by-machines`, `takeover-liveness-to-main` and `wait-port-listening`), and so do both upstream merges; each names its files in its message.
 
 The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
 
