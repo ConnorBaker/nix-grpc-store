@@ -35,7 +35,11 @@ inline auto notTaken(const grpc::Status & status) -> bool
 // or answered that it gave the build back (draining, out of space, a
 // transient failure, an input it could not get), and the scheduler places
 // the drv again at once.
-inline auto buildGoesOn(const grpc::Status & status) -> bool
+// `answered`: the worker's handler returned the status (build-answer.hh),
+// so the stream did not break under the call, whatever its message quotes
+// (a gRPC error the worker wraps, a build's log). Without the mark, from a
+// worker that predates it, only the message tells an answer.
+inline auto buildGoesOn(const grpc::Status & status, bool answered) -> bool
 {
     // Never with `refused`: the next Want names a refused placement, and
     // the scheduler revokes it, so no build goes on there for us.
@@ -44,13 +48,14 @@ inline auto buildGoesOn(const grpc::Status & status) -> bool
     }
     switch (status.error_code()) {
     case grpc::StatusCode::ABORTED:
+        return true;
     case grpc::StatusCode::CANCELLED:
     case grpc::StatusCode::UNKNOWN:
     case grpc::StatusCode::INTERNAL:
-        return true;
+        return !answered;
     case grpc::StatusCode::UNAVAILABLE:
         // Not an answer of the worker's that quotes a broken stream.
-        return streamBroken(status) && cutOff(status);
+        return !answered && streamBroken(status) && cutOff(status);
     default:
         return false;
     }
@@ -61,9 +66,13 @@ inline auto buildGoesOn(const grpc::Status & status) -> bool
 // places it elsewhere and revokes it there: only for a worker that does not
 // hold the build. `left` makes the first such bounce per worker free.
 // `held` keeps following a build that goes on (Executor::bounced).
-inline auto bounceOf(const grpc::Status & status) -> exec::Bounce
+// `answered` as buildGoesOn takes it.
+inline auto bounceOf(const grpc::Status & status, bool answered) -> exec::Bounce
 {
-    return {.refused = notTaken(status), .left = notTaken(status) || goneAway(status), .held = buildGoesOn(status)};
+    return {
+        .refused = notTaken(status),
+        .left = notTaken(status) || goneAway(status),
+        .held = buildGoesOn(status, answered)};
 }
 
 // The worker gave the build back for an input it lacked, which Run::recover

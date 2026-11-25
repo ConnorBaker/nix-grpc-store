@@ -76,8 +76,12 @@ pkgs.testers.runNixOSTest {
         substituters = lib.mkForce [ ];
       };
       system.extraDependencies = [ pkgs.coreutils ];
-      # Writes the held build's fifo without blocking.
-      environment.systemPackages = [ pkgs.python3 ];
+      # Writes the held build's fifo without blocking; calls the node's
+      # BuildDerivation itself.
+      environment.systemPackages = [
+        pkgs.python3
+        pkgs.grpcurl
+      ];
 
       programs.nix-grpc-store.enable = true;
       services.nix-grpc-daemon = {
@@ -112,6 +116,6 @@ pkgs.testers.runNixOSTest {
     wait_unit(machine, "niks3.service")
     wait_succeeds(machine, "nc -z localhost 5751")
 
-    run_e2e({"machine": machine}, {"NGS_BOUNCE_EXPR": "${bounceExpr}"}, "bounce::", "--test-threads=1")
+    run_e2e({"machine": machine}, {"NGS_BOUNCE_EXPR": "${bounceExpr}", "NGS_PROTO": "${../proto}"}, "bounce::", "--test-threads=1")
   '';
 }

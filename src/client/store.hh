@@ -392,8 +392,9 @@ public:
     }
 
     // Log lines stream, the result carries the output path infos.
+    // `answered`: the worker's handler returned the status (build-answer.hh).
         auto tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
-                            std::optional<BuildResult> & res, std::string & missingInput) -> grpc::Status;
+                            std::optional<BuildResult> & res, std::string & missingInput, bool & answered) -> grpc::Status;
 
     struct Job {
       StorePath drvPath;

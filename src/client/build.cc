@@ -47,6 +47,7 @@
 #include <nix/util/strings.hh>
 
 #include "bounce.hh"
+#include "build-answer.hh"
 #include "channel.hh"
 #include "executor.hh"
 #include "nix-compat.hh"
@@ -106,7 +107,7 @@ void GrpcStore::uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPa
 }
 
 auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
-                        std::optional<BuildResult> & res, std::string & missingInput) -> grpc::Status {
+                        std::optional<BuildResult> & res, std::string & missingInput, bool & answered) -> grpc::Status {
   // ^C cancels the stream so the worker stops the build at once.
   nixgrpc::Call call;
   addHeaders(call.ctx(), headers);
@@ -125,6 +126,7 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   if (auto const found = trailers.find("x-nix-missing-input"); found != trailers.end()) {
     missingInput.assign(found->second.data(), found->second.size());
   }
+  answered = nixgrpc::answered(call.ctx());
   return status;
 }
 
@@ -148,21 +150,24 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
   }
   std::optional<BuildResult> res;
   std::string missing;
-  auto status = tryBuildDerivation(request, headers, res, missing);
+  bool answered = false;
+  auto status = tryBuildDerivation(request, headers, res, missing, answered);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
     try {
       // Keeps the assignment there however long the upload takes.
       auto uploadHeaders = headers;
       uploadHeaders.emplace_back("x-nix-drv", request.drv_path());
       uploadDrvClosure(evalStore, {job.drvPath}, uploadHeaders);
-      status = tryBuildDerivation(request, headers, res, missing);
+      status = tryBuildDerivation(request, headers, res, missing, answered);
     } catch (GrpcStatusError & err) {
       // The upload goes to the assigned worker too, which may drain or die
-      // under it as under BuildDerivation: the same answers below.
+      // under it as under BuildDerivation: the same answers below. Its
+      // handlers do not mark their answers.
       if (!nixgrpc::workerLeft(err.status)) {
         throw;
       }
       status = err.status;
+      answered = false;
     }
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
@@ -172,12 +177,13 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
   if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION && !missing.empty()) {
     return MissingInput{.path = parseStorePath(missing)};
   }
+  // Another call builds it: followed on, said by the worker or not.
   if (status.error_code() == grpc::StatusCode::ABORTED) {
-    return nixgrpc::bounceOf(status);
+    return nixgrpc::bounceOf(status, answered);
   }
   if (nixgrpc::workerLeft(status)) {
     printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
-    return nixgrpc::bounceOf(status);
+    return nixgrpc::bounceOf(status, answered);
   }
   checkStatus(status, "BuildDerivation");
   if (!res) {
@@ -407,7 +413,8 @@ struct GrpcStore::Run {
         if (!nixgrpc::workerLeft(err.status)) {
           throw;
         }
-        return nixgrpc::bounceOf(err.status);
+        // An upload's answer is not marked (build-answer.hh).
+        return nixgrpc::bounceOf(err.status, false);
       }
       return nixgrpc::inputGivenBack();
     }
