@@ -443,7 +443,7 @@ pkgs.testers.runNixOSTest {
     wait_unit(client, "test-certs.service")
     wait_unit(lb, "niks3.service")
     wait_unit(lb, "envoy.service")
-    wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")
+    wait_listening(lb, 5751, 50051)
     for w in [worker1, worker2]:
         w.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 

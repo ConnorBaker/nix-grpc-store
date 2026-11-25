@@ -149,7 +149,7 @@ pkgs.testers.runNixOSTest {
     ${import ./lib/waits.nix}
     start_all()
     wait_unit(lb, "niks3.service")
-    wait_succeeds(lb, "nc -z localhost 5751 && nc -z localhost 50051")
+    wait_listening(lb, 5751, 50051)
     # The tunnels come from the daemon, not from its socket.
     single.execute("systemctl start nix-grpc-daemon.service", timeout=None)
 

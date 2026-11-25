@@ -99,6 +99,19 @@
       wait_until(f"{cmd} on {m.name}", ok, clients)
       return out[0]
 
+  def listening(*ports):
+      # A shell test that something listens on each of ports, as listening
+      # in tests/e2e/harness.rs. Not a connect (nc -z): a connect to a port
+      # in the ephemeral range (32768-60999 by default) that nothing listens
+      # on can be given that same port as its source and meet itself, a TCP
+      # simultaneous open, which finds the port open. Nor does it start a
+      # socket-activated service. If ss fails, so does the test, as when
+      # nothing listens.
+      return " && ".join(f"out=$(ss -Hltn 'sport = :{p}') && [ -n \"$out\" ]" for p in ports)
+
+  def wait_listening(m, *ports, clients=()):
+      wait_succeeds(m, listening(*ports), clients)
+
   def wait_unit(m, unit):
       # wait_for_unit's: failed, or inactive with no job to start it, ends it.
       def state():

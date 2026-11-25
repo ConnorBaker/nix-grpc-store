@@ -348,7 +348,7 @@ in
         worker.succeed("systemctl start tribuchet-worker")
         wait_succeeds(hub, "journalctl -u tribuchet-hub | grep -q 'worker registered'", clients=[(worker, "tribuchet-worker")])
         wait_unit(hub, "nix-grpc-daemon.service")
-        wait_succeeds(hub, "nc -z localhost 50051")
+        wait_listening(hub, 50051)
 
   ''
   + (

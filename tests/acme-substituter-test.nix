@@ -199,7 +199,7 @@ pkgs.testers.runNixOSTest {
     start_all()
     wait_unit(server, "step-ca.service")
     wait_unit(server, "nix-grpc-daemon.socket")
-    wait_succeeds(server, "nc -z localhost 50051")
+    wait_listening(server, 50051)
 
     run_e2e({"server": server, "host1": host1}, {}, "acme::", "--test-threads=4")
   '';
