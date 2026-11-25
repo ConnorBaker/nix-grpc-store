@@ -15,7 +15,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
-#include <ctime>
+#include <format>
 #include <initializer_list>
 #include <string>
 #include <string_view>
@@ -68,18 +68,13 @@ enum class LogLevel : std::uint8_t { info, debug };
 using LogField = std::pair<std::string_view, std::string>;
 
 // Append one logfmt line to `line`: ts=… level=… key=value …, with its
-// newline.
+// newline. Its time is UTC by std::chrono's arithmetic, not gmtime_r: glibc
+// takes its time-zone lock for that, which a child of fork has as the
+// thread that forked found it, held for good if another thread held it then
+// (logfmt-test's aChildForkedWhileTheTimeZoneIsReadLogs).
 inline void appendLogLine(std::string & line, LogLevel level, std::span<const LogField> fields)
 {
-    auto const now = std::chrono::system_clock::now();
-    auto const secs = std::chrono::system_clock::to_time_t(now);
-    std::tm utc{};
-    gmtime_r(&secs, &utc);
-    std::array<char, sizeof("2000-01-01T00:00:00Z")> timestamp{};
-    static_cast<void>(std::strftime(timestamp.data(), timestamp.size(), "%Y-%m-%dT%H:%M:%SZ", &utc));
-
-    line += "ts=";
-    line += timestamp.data();
+    line += std::format("ts={:%FT%TZ}", std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
     line += level == LogLevel::debug ? " level=debug" : " level=info";
     for (const auto & [key, value] : fields) {
         line += ' ';
