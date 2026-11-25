@@ -38,6 +38,11 @@ struct Bounce
     // The worker went away under the call, never got it or turned it down:
     // not the job's fault, so the first such bounce per worker is free.
     bool left = false;
+    // The build may go on for us there (nixgrpc::buildGoesOn): we follow it
+    // still, and the scheduler sends us back to it. Otherwise the worker
+    // does not build it for us, as after a refusal, a give-back or the
+    // upload of an input it lacked.
+    bool held = false;
 };
 
 enum class Outcome : uint8_t {
@@ -252,9 +257,27 @@ public:
         }
     }
 
+    // Jobs we stopped following and do not want again: a Cancel each.
     auto takeCancels() -> std::vector<JobId>
     {
+        std::erase_if(cancels, [&](JobId jid) -> bool { return jobs.at(jid).followed; });
         return std::exchange(cancels, {});
+    }
+
+    struct Batch
+    {
+        std::vector<JobId> wants;
+        std::vector<JobId> cancels;
+    };
+
+    // What to tell the scheduler next. Wants are taken first, so a bounced
+    // job that is wanted again at once is not cancelled: the scheduler keeps
+    // its entry, the placement it may have made for it already and the
+    // workers that gave it back.
+    auto takeBatch() -> Batch
+    {
+        auto wants = takeWants();
+        return {.wants = std::move(wants), .cancels = takeCancels()};
     }
 
     void onAssigned(JobId jid, Placement placement)
@@ -383,6 +406,15 @@ public:
             to(jid, state::Assigned{.at = std::move(placement)});
             ready.push_back(jid);
             return;
+        }
+        // Unless the build goes on for us, the scheduler places the drv
+        // again, at once if the worker gave it back, for a job that takes no
+        // placement until it is wanted again (onAssigned). Each placement
+        // would hold a slot until it expires unclaimed, again and again,
+        // while the jobs we do want wait. A build that goes on we follow,
+        // and the scheduler sends us back to it.
+        if (!why.held) {
+            unfollow(jid);
         }
         bool const free = why.left && job.leftBy.insert(run->at.addr).second;
         // Refunded if the scheduler sends us back to that very placement.

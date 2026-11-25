@@ -16,6 +16,7 @@
 
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
+#include "bounce.hh"
 #include "retry.hh"
 
 namespace {
@@ -94,6 +95,46 @@ void classifiesWhatAWorkerAnswersApartFromCutOffs()
     assert(!nixgrpc::streamBroken(unavailable("failed to connect to all addresses; last error: UNAVAILABLE: "
                                               "ipv4:127.0.0.1:50051: Socket closed")));
     assert(!nixgrpc::cutOff({grpc::StatusCode::PERMISSION_DENIED, "Socket closed"}));
+}
+
+// What a bounce means for its job, from how the call to the assigned worker
+// ended (bounce.hh, as build.cc reads it): whether the client follows the
+// build on (`held`) or cancels it unless it wants the job again at once
+// (Executor::bounced).
+void classifiesBounces()
+{
+    using nixgrpc::bounceOf;
+    // A stream that broke mid-build, in each code gRPC gives it: the worker
+    // builds on.
+    assert(bounceOf({grpc::StatusCode::UNKNOWN, "Stream removed (RST_STREAM (Received RST_STREAM with error code 2))"}).held);
+    assert(bounceOf({grpc::StatusCode::INTERNAL, "Received RST_STREAM with error code 2"}).held);
+    assert(bounceOf(unavailable("Stream removed (ping timeout)")).held);
+    assert(bounceOf(unavailable("Stream removed (recvmsg:Connection timed out (110))")).held);
+    // The worker shut down or handed over under the call.
+    assert(bounceOf({grpc::StatusCode::CANCELLED, "Cancelling all calls"}).held);
+    // Another call builds it.
+    assert(bounceOf({grpc::StatusCode::ABORTED, "superseded, another worker was already building this"}).held);
+    // The worker gave the build back, as main.cc answers.
+    for (auto const * msg :
+         {"worker shutting down: draining", "out of space: cannot add path: No space left on device",
+          "local nix-daemon connection lost: error", "transient failure",
+          "the build this call attached to did not finish, retry",
+          "node: publish failed: niks3 push: Stream removed"}) {
+        assert(!bounceOf(unavailable(msg)).held);
+        assert(!bounceOf(unavailable(msg)).refused);
+    }
+    // An input it could not get, unnamed, or a call it did not expect.
+    assert(!bounceOf({grpc::StatusCode::FAILED_PRECONDITION, "node: input not substitutable: error"}).held);
+    assert(bounceOf({grpc::StatusCode::FAILED_PRECONDITION, "not scheduled here: x.drv"}).refused);
+    // Never reached.
+    auto const unreached = bounceOf(unavailable("failed to connect to all addresses; last error: UNAVAILABLE: "
+                                                "ipv4:127.0.0.1:50051: connection failure"));
+    assert(unreached.refused && !unreached.held);
+    // Never both, whatever words gRPC puts together.
+    auto const both = bounceOf(unavailable("Stream removed (connection failure)"));
+    assert(both.refused && !both.held);
+    // An input recovered (Run::recover): uploaded again, or still missing.
+    assert(!nixgrpc::inputGivenBack().held);
 }
 
 // A store query stuck on the server the way the daemon's are when nix does
@@ -281,6 +322,7 @@ auto main() -> int
 try {
     classifiesFarmErrors();
     classifiesWhatAWorkerAnswersApartFromCutOffs();
+    classifiesBounces();
     callCutOffByALeavingWorkerIsRetried();
     classifiesAWorkerThatLeft();
     retriesACallNoHandlerTookAtShutdown();

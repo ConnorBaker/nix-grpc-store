@@ -46,6 +46,7 @@
 #include <nix/util/signals.hh>
 #include <nix/util/strings.hh>
 
+#include "bounce.hh"
 #include "channel.hh"
 #include "executor.hh"
 #include "nix-compat.hh"
@@ -127,31 +128,6 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   return status;
 }
 
-namespace {
-// The worker does not hold the build: it never got the call (the balancer
-// could not connect to it) or turned it down.
-auto notTaken(const grpc::Status & status) -> bool {
-  auto const & msg = status.error_message();
-  switch (status.error_code()) {
-  case grpc::StatusCode::FAILED_PRECONDITION: // not scheduled there
-    return true;
-  case grpc::StatusCode::UNAVAILABLE:
-    return msg.contains("connection failure") || msg.contains("connection timeout");
-  default:
-    return false;
-  }
-}
-
-// A worker that went away or would not take the call. `refused` names the
-// assignment in the next Want, so the scheduler places it elsewhere and
-// revokes it there: only for a worker that does not hold the build, as a
-// worker whose stream to us broke builds on and we attach again. `left`
-// makes the first such bounce per worker free (Executor::bounced).
-auto bounced(const grpc::Status & status) -> GrpcStore::Bounced {
-  return {.refused = notTaken(status), .left = notTaken(status) || nixgrpc::goneAway(status)};
-}
-} // namespace
-
 auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store & evalStore)
     -> Attempt {
   remote::BuildDerivationRequest request;
@@ -197,11 +173,11 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
     return MissingInput{.path = parseStorePath(missing)};
   }
   if (status.error_code() == grpc::StatusCode::ABORTED) {
-    return Bounced{};
+    return nixgrpc::bounceOf(status);
   }
   if (nixgrpc::workerLeft(status)) {
     printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
-    return bounced(status);
+    return nixgrpc::bounceOf(status);
   }
   checkStatus(status, "BuildDerivation");
   if (!res) {
@@ -318,8 +294,7 @@ struct GrpcStore::Run {
   // Under `mutex`. Batches stay below the server's receive limit.
   void flushLocked() {
     static constexpr size_t maxBatchBytes = 4UL << 20U;
-    auto const cancels = exe.takeCancels();
-    auto const wants = exe.takeWants();
+    auto const [wants, cancels] = exe.takeBatch();
     remote::ClientMsgs batch;
     size_t bytes = 0;
     std::vector<JobId> sent;
@@ -383,7 +358,7 @@ struct GrpcStore::Run {
         work->job->result = std::move(*result);
         exe.finished(work->jid, succeeded);
       } else if (const auto * bounce = std::get_if<Bounced>(&res)) {
-        exe.bounced(work->jid, std::chrono::steady_clock::now(), {.refused = bounce->refused, .left = bounce->left});
+        exe.bounced(work->jid, std::chrono::steady_clock::now(), *bounce);
       }
             flushLocked();
     }
@@ -418,7 +393,7 @@ struct GrpcStore::Run {
         // Placed again like after any bounce, within reschedule-retries.
         printError("%s: input '%s' is still missing on the farm, asking the scheduler again",
                    work.job->drvPath.to_string(), pathS);
-        return Bounced{};
+        return nixgrpc::inputGivenBack();
       }
     }
     auto const producer = producerOf(*work.job, path);
@@ -432,9 +407,9 @@ struct GrpcStore::Run {
         if (!nixgrpc::workerLeft(err.status)) {
           throw;
         }
-        return bounced(err.status);
+        return nixgrpc::bounceOf(err.status);
       }
-      return Bounced{};
+      return nixgrpc::inputGivenBack();
     }
     warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS, producer->to_string());
     auto const & drvPath = *producer;
