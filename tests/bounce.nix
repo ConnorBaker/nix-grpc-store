@@ -114,7 +114,7 @@ pkgs.testers.runNixOSTest {
     wait_unit(machine, "nix-daemon.socket")
     wait_unit(machine, "nix-grpc-daemon.socket")
     wait_unit(machine, "niks3.service")
-    wait_succeeds(machine, "nc -z localhost 5751")
+    wait_listening(machine, 5751)
 
     run_e2e({"machine": machine}, {"NGS_BOUNCE_EXPR": "${bounceExpr}", "NGS_PROTO": "${../proto}"}, "bounce::", "--test-threads=1")
   '';

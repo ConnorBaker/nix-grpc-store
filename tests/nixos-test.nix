@@ -340,6 +340,23 @@ pkgs.testers.runNixOSTest {
         "NGS_SIGNING_KEY": "${signingSecretKey}",
     }
   '' + pkgs.lib.optionalString (phase == "main") ''
+    with subtest("a port nothing listens on is not listening"):
+        # lifecycle::a_port_nothing_listens_on_is_not_open for the listening
+        # of tests/lib/waits.nix: the probe runs in a network namespace of
+        # its own whose ephemeral range is the one port it probes, so a probe
+        # that connects is given that port as its source. The socket unit
+        # listens on 50051.
+        machine.succeed(listening(50051))
+        port = 50057
+        # In the if, an ss that failed would read as closed; the ss before
+        # it, under set -e, ends the script first.
+        script = (
+            f"set -e; ip link set lo up; sysctl -qw net.ipv4.ip_local_port_range='{port} {port}'; ss -Hltn > /dev/null;"
+            + f" if {listening(port)}; then echo open; ss -Htan 'sport = :{port}'; else echo closed; fi"
+        )
+        out = machine.succeed(f"unshare -n bash -c {shlex.quote(script)}")
+        assert out.strip() == "closed", f"{port} found open, nothing listening:\n{out}"
+
     with subtest("daemon lifecycle"):
         run_e2e({"machine": machine}, env, "lifecycle::", "--test-threads=1")
 
