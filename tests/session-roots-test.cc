@@ -23,6 +23,7 @@
 #include <nix/util/error.hh>
 #include <nix/util/ref.hh>
 
+#include "logfmt.hh"
 #include "session-roots.hh"
 
 namespace {
@@ -50,17 +51,20 @@ auto stderrOf(const std::function<void()> & body) -> std::string
     if (::pipe(fds.data()) != 0) {
         throw std::runtime_error("pipe");
     }
+    nixgrpc::flushLog(); // what was logged before goes where stderr was
     (void)std::fflush(stderr);
     int const saved = ::dup(STDERR_FILENO);
     (void)::dup2(std::get<1>(fds), STDERR_FILENO);
     (void)::close(std::get<1>(fds));
     body();
+    nixgrpc::flushLog(); // what body logged is in the pipe before it closes
     (void)std::fflush(stderr);
     (void)::dup2(saved, STDERR_FILENO); // closes the pipe's last write end
     (void)::close(saved);
     std::string out;
     constexpr size_t chunk = 4096;
     std::array<char, chunk> buf{};
+    // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): flushLog let go of the queue's lock; the analyzer does not follow it through the wait.
     for (ssize_t got = 0; (got = ::read(std::get<0>(fds), buf.data(), buf.size())) > 0;) {
         out.append(buf.data(), static_cast<size_t>(got));
     }

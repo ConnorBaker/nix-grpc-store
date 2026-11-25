@@ -62,6 +62,7 @@ stdenv.mkDerivation {
         ../../tests/testdaemon.py
         ../../tests/testdaemon-test.py
         ../../tests/built-here-test.py
+        ../../tests/stalled-stderr-test.py
         ../../tests/client-keepalive-test.py
         ../../tests/keepalive-client.cc
         ../../tests/load-plugin.hh
@@ -82,6 +83,7 @@ stdenv.mkDerivation {
         ../../tests/sandbox-test.cc
         ../../tests/takeover-test.cc
         ../../tests/log-spill-test.cc
+        ../../tests/logfmt-test.cc
         ../../tests/push-test.cc
         ../../tests/daemon-probe-test.cc
         ../../tests/tunnel-test.cc

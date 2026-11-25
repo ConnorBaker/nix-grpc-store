@@ -2,11 +2,15 @@
 // The long-running `niks3 push --stdin` child and acknowledged publishing through it.
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -23,6 +27,9 @@
 #include <vector>
 
 #include <curl/curl.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <unistd.h>
 #include <nlohmann/json.hpp>
 
 #include <nix/util/error.hh>
@@ -54,6 +61,13 @@ class PushProcess
 {
 public:
     using Argv = std::vector<std::string>;
+
+    // For tests only: called by the reader once the child is reaped and
+    // what its stderr's pipe holds is measured, before that is copied, where
+    // a process left holding the pipe may write more. It runs under the
+    // State lock: a hook that called pushWait or pushLog would wait for
+    // that lock for good.
+    static inline std::atomic<void (*)()> afterStderrMeasured = nullptr;
 
     explicit PushProcess(Argv argv)
         : argv(std::move(argv))
@@ -264,9 +278,12 @@ private:
                 drvPath = std::move(logs.front());
                 logs.pop_front();
             }
+            // Any failure, not only Nix's: at a limit of threads the child's
+            // reader cannot start (std::system_error), and an exception that
+            // left this thread would end the process.
             try {
                 sendLog(drvPath);
-            } catch (nix::Error & err) {
+            } catch (std::exception & err) {
                 logLine(LogLevel::info, {{"event", "build_log_push_failed"}, {"drv", drvPath}, {"why", err.what()}});
             }
         }
@@ -304,13 +321,16 @@ private:
         }
         nix::Pipe toChild;
         nix::Pipe fromChild;
+        nix::Pipe childErr;
         toChild.create();
         fromChild.create();
+        childErr.create();
         // dieWithParent (PDEATHSIG) fires when the forking gRPC thread exits.
         lck->pid = nix::startProcess(
             [&] -> void {
                 if (dup2(toChild.readSide.get(), STDIN_FILENO) == -1
-                    || dup2(fromChild.writeSide.get(), STDOUT_FILENO) == -1) {
+                    || dup2(fromChild.writeSide.get(), STDOUT_FILENO) == -1
+                    || dup2(childErr.writeSide.get(), STDERR_FILENO) == -1) {
                     throw nix::SysError("dup2");
                 }
                 nix::Strings const args(argv.begin(), argv.end());
@@ -318,51 +338,164 @@ private:
                 throw nix::SysError("exec %s", argv.front());
             },
             {.dieWithParent = false});
+        // The reader before the child is published: at a limit of threads
+        // (EAGAIN) it cannot start, and the child is reaped and the push
+        // fails to its caller; the next push starts another child.
+        try {
+            reader = std::thread([this,
+                                  acks = std::make_shared<nix::AutoCloseFD>(std::move(fromChild.readSide)),
+                                  errs = std::make_shared<nix::AutoCloseFD>(std::move(childErr.readSide))] -> void {
+                readChild(acks->get(), errs->get());
+            });
+        } catch (...) {
+            lck->pid.kill();
+            throw;
+        }
         lck->stdinFd = std::make_shared<nix::AutoCloseFD>(std::move(toChild.writeSide));
-        reader = std::thread([this, acks = std::make_shared<nix::AutoCloseFD>(std::move(fromChild.readSide))] -> void {
-            readAcks(acks->get());
-        });
         logLine(LogLevel::info, {{"event", "niks3_push_started"}, {"pid", std::to_string(static_cast<pid_t>(lck->pid))}});
     }
 
-    void readAcks(int acksFd)
+    enum class Copied : std::uint8_t { some, failed, ended };
+
+    static constexpr size_t chunkBytes = 4096;
+
+    // Reads what `errFd` has, at most `most` bytes, and logs each line it
+    // completes; the rest of a line waits in `pending`. Called only where
+    // the pipe has something or has ended (poll said so, or FIONREAD), so
+    // the read does not block. A read that fails is said once, and what it
+    // would have read is lost. `ended` once every holder of the pipe is
+    // gone. `most` goes down by what was read.
+    static auto copyAvailable(int errFd, std::string & pending, bool & lost, size_t & most) -> Copied
     {
+        std::array<char, chunkBytes> chunk{};
+        auto const got = ::read(errFd, chunk.data(), std::min(chunk.size(), most));
+        if (got < 0) {
+            if (errno == EINTR) {
+                return Copied::some;
+            }
+            if (!lost) {
+                lost = true;
+                logLine(LogLevel::info, {{"event", "niks3_push_stderr_lost"}, {"why", nix::SysError("reading niks3 push's stderr").what()}});
+            }
+            return Copied::failed;
+        }
+        if (got == 0) {
+            return Copied::ended;
+        }
+        most -= static_cast<size_t>(got);
+        pending.append(chunk.data(), static_cast<size_t>(got));
+        for (auto end = pending.find('\n'); end != std::string::npos; end = pending.find('\n')) {
+            logText(pending.substr(0, end + 1));
+            pending.erase(0, end + 1);
+        }
+        return Copied::some;
+    }
+
+    // The child's stdout and stderr, read by the one thread. Its stdout has
+    // its acks. Its stderr (niks3 push: a line per path it uploads, before
+    // its ack) goes to ours as our lines do, through logText: a held-up
+    // stderr must hold up neither the child nor its acks; a last line
+    // without its newline gets one. A read of stderr that fails is said once
+    // and reading goes on, or the child would sleep once the pipe is full.
+    // Once its stdout ends, the child is reaped: what it wrote to its stderr
+    // is then in the pipe, and what the pipe holds then is copied, and no
+    // more, under the State lock: a process it started and left running
+    // (niks3's token command inherits its stderr) may hold the pipe for as
+    // long as it runs, and write to it as fast as it is read. What such a
+    // process writes after is lost, and once the reader is done, its writes
+    // there fail (EPIPE, or SIGPIPE unless it ignores that).
+    void readChild(int acksFd, int errFd)
+    {
+        std::string acked;
+        std::string logged;
+        bool lost = false;
+        bool errOpen = true;
         std::string why;
         try {
-            while (true) {
-                auto const line = nix::readLine(acksFd);
-                auto const ack = nlohmann::json::parse(line, nullptr, /*allow_exceptions=*/false);
-                if (!ack.is_object()) {
-                    continue;
+            while (why.empty()) {
+                std::array<pollfd, 2> fds{{{.fd = acksFd, .events = POLLIN, .revents = 0}, {.fd = errOpen ? errFd : -1, .events = POLLIN, .revents = 0}}};
+                if (::poll(fds.data(), fds.size(), -1) < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    throw nix::SysError("polling niks3 push's output");
                 }
-                auto lck = state.lock();
-                auto const found = lck->waiting.find(ack.value("id", uint64_t{0}));
-                if (found == lck->waiting.end()) {
-                    continue;
+                if (fds.at(1).revents != 0) {
+                    size_t most = chunkBytes;
+                    errOpen = copyAvailable(errFd, logged, lost, most) != Copied::ended;
                 }
-                if (found->second->ack(
-                        {.status = ack.value("status", "error"),
-                         .message = ack.value("message", ""),
-                         .path = ack.value("path", ""),
-                         .signatures = ack.value("signatures", std::set<std::string>{})})) {
-                    found->second->report();
-                    lck->waiting.erase(found);
+                if (fds.at(0).revents != 0) {
+                    why = readAcks(acksFd, acked);
                 }
             }
-        } catch (nix::EndOfFile &) {
-            why = "niks3 push exited";
         } catch (std::exception & err) {
             why = err.what();
         }
         auto lck = state.lock();
         lck->stdinFd.reset();
         int const status = lck->pid.kill();
+        int held = 0;
+        if (errOpen && ::ioctl(errFd, FIONREAD, &held) == 0) { // NOLINT(cppcoreguidelines-pro-type-vararg)
+            if (auto * const hook = afterStderrMeasured.load()) {
+                hook();
+            }
+            for (auto most = static_cast<size_t>(held); most > 0 && copyAvailable(errFd, logged, lost, most) == Copied::some;) {
+            }
+        }
+        if (!logged.empty()) {
+            logText(logged + "\n");
+        }
         logLine(LogLevel::info, {{"event", "niks3_push_exited"}, {"status", nix::statusToString(status)}, {"why", why}});
         for (auto & [reqId, pending] : lck->waiting) {
             pending->fail(why);
             pending->report();
         }
         lck->waiting.clear();
+    }
+
+    // Reads what `acksFd` has and takes each ack it completes; the rest of
+    // a line waits in `acked`. Why the child's stdout ended, once it has.
+    auto readAcks(int acksFd, std::string & acked) -> std::string
+    {
+        constexpr size_t chunkBytes = 4096;
+        std::array<char, chunkBytes> chunk{};
+        auto const got = ::read(acksFd, chunk.data(), chunk.size());
+        if (got < 0) {
+            if (errno == EINTR) {
+                return {};
+            }
+            throw nix::SysError("reading niks3 push's acks");
+        }
+        if (got == 0) {
+            return "niks3 push exited";
+        }
+        acked.append(chunk.data(), static_cast<size_t>(got));
+        for (auto end = acked.find('\n'); end != std::string::npos; end = acked.find('\n')) {
+            takeAck(acked.substr(0, end));
+            acked.erase(0, end + 1);
+        }
+        return {};
+    }
+
+    void takeAck(const std::string & line)
+    {
+        auto const ack = nlohmann::json::parse(line, nullptr, /*allow_exceptions=*/false);
+        if (!ack.is_object()) {
+            return;
+        }
+        auto lck = state.lock();
+        auto const found = lck->waiting.find(ack.value("id", uint64_t{0}));
+        if (found == lck->waiting.end()) {
+            return;
+        }
+        if (found->second->ack(
+                {.status = ack.value("status", "error"),
+                 .message = ack.value("message", ""),
+                 .path = ack.value("path", ""),
+                 .signatures = ack.value("signatures", std::set<std::string>{})})) {
+            found->second->report();
+            lck->waiting.erase(found);
+        }
     }
 };
 

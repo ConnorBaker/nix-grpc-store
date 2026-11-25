@@ -4,7 +4,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -179,7 +178,7 @@ Dispatcher::Lock::~Lock()
     logged.swap(disp.logged);
     disp.mutex.unlock();
     if (!logged.empty()) {
-        static_cast<void>(std::fputs(logged.c_str(), stderr));
+        logText(std::move(logged));
     }
     for (auto const & func : run) {
         // A destructor must not throw. Deferred work is stream I/O kick-off,

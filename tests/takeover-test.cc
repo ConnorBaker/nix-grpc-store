@@ -8,11 +8,16 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <ios>
+#include <sstream>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -20,9 +25,11 @@
 #include <sys/poll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <signal.h> // NOLINT(modernize-deprecated-headers): kill and SIGKILL are POSIX, not in <csignal>.
@@ -32,6 +39,7 @@
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 
+#include "logfmt.hh"
 #include "takeover.hh"
 
 using nixgrpc::takeover::Detached;
@@ -483,6 +491,119 @@ void theWaitForTheSocketsEndsWithTheReload()
     goOn.writeSide.close();
 }
 
+// A task's state and the system call it sleeps in, from /proc.
+auto sleepsIn(const std::string & task) -> long
+{
+    std::ifstream stat(task + "/stat");
+    std::string line;
+    std::getline(stat, line);
+    auto const end = line.rfind(')');
+    if (end == std::string::npos || end + 2 >= line.size() || line.at(end + 2) != 'S') {
+        return -1;
+    }
+    std::ifstream syscall(task + "/syscall");
+    long number = -1;
+    syscall >> number;
+    return number;
+}
+
+// What was logged before a reload detaches goes out first: the process that
+// detaches becomes systemd's control process, which leaves with _exit, and
+// the daemon, its grandchild, starts with none of it. With the reload's
+// stderr a full pipe, a line it logs just before is still queued. The pipe
+// is read once the reload is found waiting for stderr: asleep on a futex
+// (or writing) while a thread of it sleeps writing to stderr; or, if it forks
+// first (asleep waiting for its child or its verdict), once it is gone.
+// Either way the line must be on the pipe.
+void whatWasLoggedGoesOutBeforeTheReloadDetaches()
+{
+    nix::Pipe err;
+    err.create();
+    {
+        int const room = ::fcntl(err.writeSide.get(), F_GETPIPE_SZ); // NOLINT(cppcoreguidelines-pro-type-vararg)
+        assert(room > 0);
+        nix::writeFull(err.writeSide.get(), std::string(static_cast<size_t>(room), '\0'));
+    }
+    nix::Pipe ready;
+    ready.create();
+    nix::Pipe goOn;
+    goOn.create();
+    nixgrpc::flushLog();
+    auto const reload = spawn([&] -> bool {
+        if (::dup2(err.writeSide.get(), STDERR_FILENO) < 0) {
+            return false;
+        }
+        nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "before_detach"}});
+        Detached detached; // returns in the daemon only
+        char byte = 0;
+        assert(::write(ready.writeSide.get(), &byte, 1) == 1);
+        // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): flushLog let go of the queue's lock; the analyzer does not follow it through the wait.
+        assert(::read(goOn.readSide.get(), &byte, 1) == 1);
+        detached.report(true);
+        ::_exit(0);
+    });
+    err.writeSide.close();
+    ready.writeSide.close();
+    goOn.readSide.close();
+    auto const tasks = "/proc/" + std::to_string(reload) + "/task/";
+    auto const main = tasks + std::to_string(reload);
+    bool waitsForTheWriter = false;
+    bool forked = false;
+    constexpr int readings = 1'000'000;
+    for (int i = 0; i < readings && !waitsForTheWriter && !forked; i++) {
+        auto const sleeping = sleepsIn(main);
+        forked = sleeping == SYS_wait4 || sleeping == SYS_read;
+        bool writes = false;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(tasks, error), end; !error && it != end; it.increment(error)) {
+            std::istringstream fields([&] -> std::string {
+                std::ifstream syscall(it->path() / "syscall");
+                std::string line;
+                std::getline(syscall, line);
+                return line;
+            }());
+            long number = -1;
+            long descriptor = -1;
+            writes = writes
+                     || (sleepsIn(it->path().string()) == SYS_write && fields >> number >> std::hex >> descriptor
+                         && descriptor == STDERR_FILENO);
+        }
+        // Asleep on a futex: for its log writer; asleep writing: logging
+        // the line itself.
+        waitsForTheWriter = writes && (sleeping == SYS_futex || sleeping == SYS_write);
+        std::this_thread::yield();
+    }
+    std::string text;
+    auto const readAll = [&] -> void {
+        std::array<char, kMessage> chunk{};
+        for (ssize_t got = 0; (got = ::read(err.readSide.get(), chunk.data(), chunk.size())) > 0;) {
+            text.append(chunk.data(), static_cast<size_t>(got));
+        }
+    };
+    if (!waitsForTheWriter && !forked) {
+        ::kill(reload, SIGKILL);
+        exitStatus(reload);
+    }
+    assert((waitsForTheWriter || forked) && "the reload neither waited for stderr nor forked");
+    std::thread reader;
+    if (waitsForTheWriter) {
+        reader = std::thread(readAll);
+    }
+    char byte = 0;
+    bool const daemonUp = ::read(ready.readSide.get(), &byte, 1) == 1;
+    if (daemonUp) {
+        assert(::write(goOn.writeSide.get(), &byte, 1) == 1);
+    }
+    auto const status = exitStatus(reload);
+    if (!reader.joinable()) {
+        reader = std::thread(readAll);
+    }
+    reader.join();
+    assert(daemonUp && status == 0);
+    assert(waitsForTheWriter == !forked);
+    assert(text.contains("event=before_detach") && "a line logged before the reload detached is missing");
+}
+
 // systemd supervises a main process that is not its child as an alien: it
 // does not wait for it on stop. The daemon is the manager's child, which this
 // test plays as a subreaper, as systemd's user managers are.
@@ -655,5 +776,6 @@ auto main() -> int
     theWaitForTheSocketsEndsWithTheReload();
     theDaemonBecomesTheManagersChild();
     theOldProcessKeepsTheUnitIfTheSuccessorDiesBeforeSystemdTakesIt();
+    whatWasLoggedGoesOutBeforeTheReloadDetaches();
     return 0;
 }

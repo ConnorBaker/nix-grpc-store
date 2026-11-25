@@ -1697,7 +1697,7 @@ void becomeMain(takeover::Detached & detached, takeover::Predecessor & pred, std
         // The predecessor serves on. Leave at once, with the connections
         // we took: Server's destructor would wait for their calls.
         logLine(LogLevel::info, {{"event", "takeover_failed"}, {"error", err.what()}});
-        std::_Exit(1);
+        nixgrpc::exitLogged(1);
     }
     detached.report(true);
     logLine(LogLevel::info, {{"event", "took_over"}, {"pid", std::to_string(pred.pid())}});
@@ -2035,6 +2035,7 @@ try {
     act.sa_handler = [](int) -> void { reloadSignal = reloadSignal + 1; };
     sigaction(SIGHUP, &act, nullptr);
     // NOLINTEND(misc-include-cleaner)
+    nixgrpc::flushLogOnCrash();
 
     // Required before nix::openStore() in the native RPC handlers.
     nix::initLibStore();
@@ -2046,6 +2047,9 @@ try {
     auto detached = inherit(gen, options);
     auto const & listenFds = gen.listenFds;
     if (options.sandbox) {
+        // A thread running before the sandbox would escape it: the log
+        // writer, started by a line logged so far, starts again after.
+        nixgrpc::stopLogWriter();
         nixgrpc::sandbox::apply(sandboxPolicy(options, listenFds.empty()));
     }
     if (listenFds.empty() && options.idleTimeout) {
@@ -2168,17 +2172,19 @@ try {
     std::thread([] -> void {
         std::this_thread::sleep_for(shutdownGrace + std::chrono::seconds(1));
         nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "shutdown_forced"}});
-        std::_Exit(0);
+        // Not before what was logged is out: while our stderr's reader holds
+        // it up, the watchdog waits for it, as its own write did.
+        nixgrpc::exitLogged(0);
     }).detach();
     if (gen.goaway.joinable()) {
         // Shutdown() has been under way since the takeover; give what is left
-        // the same grace. _Exit: that thread may still use the server.
+        // the same grace. exitLogged, an _Exit: that thread may still use the server.
         std::thread([&server] -> void {
             std::this_thread::sleep_for(shutdownGrace);
             grpc_server_cancel_all_calls(server->c_server());
         }).detach();
         gen.goaway.join();
-        std::_Exit(0);
+        nixgrpc::exitLogged(0);
     }
     server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
     server->Wait();
@@ -2190,7 +2196,8 @@ try {
     return 0;
 } catch (const std::exception & err) {
     // Formatting or logging could itself throw and escape main; use plain
-    // C stdio which cannot.
+    // C stdio which cannot, after the lines logged before.
+    nixgrpc::flushLog();
     static_cast<void>(std::fputs("nix-grpc-daemon: ", stderr));
     static_cast<void>(std::fputs(err.what(), stderr));
     static_cast<void>(std::fputc('\n', stderr));

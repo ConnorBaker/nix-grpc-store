@@ -426,6 +426,10 @@ Detached::Detached()
     // The control process holds the write side: its exit hangs it up.
     nix::Pipe reloadPipe;
     reloadPipe.create();
+    // What was logged goes out before: this process becomes systemd's
+    // control process, which leaves with _exit; the daemon, its grandchild,
+    // starts with none of it.
+    flushLog();
     auto const child = ::fork();
     if (child < 0) {
         throw nix::SysError("takeover: fork");
@@ -439,6 +443,9 @@ Detached::Detached()
         }
         char byte = 1;
         for (;;) {
+            // flushLog above let go of the log queue's lock; the analyzer
+            // does not follow it through the condition variable's wait.
+            // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection)
             auto const len = ::read(verdictPipe.readSide.get(), &byte, 1);
             if (len < 0 && errno == EINTR) {
                 continue;

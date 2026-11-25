@@ -453,6 +453,16 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  # It reads its children's states from /proc.
+  if host_machine.system() == 'linux'
+    test('logfmt', executable('logfmt-test',
+      sources : ['tests/logfmt-test.cc'],
+      include_directories : [src_inc],
+      dependencies : [grpc_dep, threads_dep],
+      cpp_args : ['-UNDEBUG'],
+    ))
+  endif
+
   test('log-spill', executable('log-spill-test',
     sources : ['tests/log-spill-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
@@ -462,12 +472,16 @@ if build_server
 
   # It reads its threads' states from /proc.
   if host_machine.system() == 'linux'
-    test('push', executable('push-test',
+    push_test = executable('push-test',
       sources : ['tests/push-test.cc'],
       include_directories : [src_inc, include_directories('src/daemon')],
       dependencies : [nix_store_dep, nix_util_dep, json_dep, curl_dep, threads_dep],
       cpp_args : ['-UNDEBUG'],
-    ))
+    )
+    test('push', push_test)
+    # A push at a limit of threads, in a user namespace of its own: SKIP
+    # (exit 77) where one cannot be had, so that the gate shows whether it ran.
+    test('push-limit', push_test, args : ['at-the-limit'])
   endif
 
   local_store_test = executable('local-store-test',
@@ -487,6 +501,15 @@ if build_server
 
   # A placement nobody claims whose outputs the node's store has is settled
   # from that store by the daemon's own thread, while its client still waits.
+  # A call and the daemon's exit, with its stderr a full pipe nobody reads.
+  # It reads the daemon's threads from /proc.
+  if host_machine.system() == 'linux'
+    test('stalled-stderr', find_program('python3'),
+      args : [files('tests/stalled-stderr-test.py'), daemon_exe],
+      timeout : 120,
+    )
+  endif
+
   test('built-here', find_program('python3'),
     args : [files('tests/built-here-test.py'), daemon_exe, local_store_test],
     timeout : 120,

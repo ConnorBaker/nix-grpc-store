@@ -198,8 +198,9 @@ private:
     std::thread statsThread;
 
     [[nodiscard]] auto nowMs() const -> double;
-    // Log lines of the current critical section. Lock writes them once the
-    // mutex is released, so a slow stderr does not hold up scheduling.
+    // Log lines of the current critical section. Lock queues them for our
+    // stderr (logText) once the mutex is released, so a slow stderr does not
+    // hold up scheduling, nor the thread that releases it.
     std::string logged ABSL_GUARDED_BY(mutex);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void log(LogLevel level, std::span<const LogField> fields);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void log(LogLevel level, std::initializer_list<LogField> fields);
