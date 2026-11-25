@@ -155,6 +155,11 @@ public:
         if (!std::holds_alternative<state::Running>(job.state)) {
             return;
         }
+        // The worker gave the build back for the input. Re-placed while it
+        // waits for the input, the job could hold the only slot that can
+        // build that. With the input done already, it is cancelled as after
+        // any other give-back (bounced), unless wanted again in the same batch.
+        unfollow(jid);
         if (const auto * done = std::get_if<state::Done>(&jobs.at(input).state)) {
             if (!done->succeeded) {
                 job.failedInput = input;
@@ -165,9 +170,6 @@ public:
         }
         jobs.at(input).dependants.push_back(jid);
         job.refundable.reset();
-        // Re-placed while waiting, it could hold the only slot that can build
-        // the input.
-        unfollow(jid);
         to(jid, state::Blocked{.waiting = 1});
     }
 

@@ -391,6 +391,28 @@ void givenBackNotWantedAgainCancels(nixgrpc::exec::Bounce bounce)
     assert((batch.cancels == std::vector<JobId>{job}));
 }
 
+// A job given back for an input this run already has done (a Cached answer
+// whose output went later: Run::recover) is wanted again, and cancelled
+// unless that is at once, as after any other give-back.
+void doneInputNotWantedAgainCancels()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const input = exe.add(0, {});
+    exe.connected();
+    assert((exe.takeBatch().wants == std::vector<JobId>{input}));
+    exe.onCached(input);
+    auto const job = exe.add(1, {});
+    assert((exe.takeBatch().wants == std::vector<JobId>{job}));
+    auto const urgent = exe.add(9, {});
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    exe.blockOn(job, input);
+    assert(std::holds_alternative<st::Wantable>(exe.at(job)));
+    auto const batch = exe.takeBatch();
+    assert((batch.wants == std::vector<JobId>{urgent}));
+    assert((batch.cancels == std::vector<JobId>{job}));
+}
+
 // A bounced job wanted again in the same batch is not cancelled: the
 // scheduler keeps its entry, with the placement it may have made already.
 void bounceWantedAgainKeepsTheEntry()
@@ -432,6 +454,7 @@ auto main() -> int
         givenBackNotWantedAgainCancels({.refused = false, .left = true, .held = false}); // draining
         givenBackNotWantedAgainCancels({});                                              // re-upload
         bounceWantedAgainKeepsTheEntry();
+        doneInputNotWantedAgainCancels();
     } catch (const std::exception & err) {
         std::cerr << err.what() << "\n";
         return 1;
