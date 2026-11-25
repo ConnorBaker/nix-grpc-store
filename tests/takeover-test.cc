@@ -67,6 +67,23 @@ auto spawn(const std::function<bool()> & body) -> pid_t
     return pid;
 }
 
+// Closes every descriptor above stderr but `keep`, as a process that has
+// only what it was handed: none of this process's offer and links, which it
+// would otherwise keep up.
+void keepOnly(std::vector<int> keep)
+{
+    std::ranges::sort(keep);
+    unsigned from = 3;
+    for (int const kept : keep) {
+        auto const num = static_cast<unsigned>(kept);
+        if (num > from) {
+            ::close_range(from, num - 1, 0);
+        }
+        from = std::max(from, num + 1);
+    }
+    ::close_range(from, ~0U, 0);
+}
+
 auto exitStatus(pid_t pid) -> int
 {
     int status = 0;
@@ -195,9 +212,7 @@ void theSuccessorWatchesTheOlderGenerationsItIsPassed()
     auto const third = spawn([&] -> bool {
         // Only what a successor of its own has: not this process's side of
         // its link to `second`, which would keep that link up for it.
-        auto const keep = static_cast<unsigned>(report.writeSide.get());
-        ::close_range(3, keep - 1, 0);
-        ::close_range(keep + 1, ~0U, 0);
+        keepOnly({report.writeSide.get()});
         Predecessor pred(second);
         auto links = pred.ready();
         if (links.size() != 2 || links.front().pid() != second || links.back().pid() != self) {
@@ -429,14 +444,22 @@ void aDaemonWhoseReloadWasKilledGivesUp()
 
 // Nor does one still waiting for the sockets when systemd kills its reload:
 // the wait ends with the reload ('g'), not otherwise ('t'), as when its own
-// time runs out.
+// time runs out. Its daemon, which nobody waits for, may outlive the test's
+// offer; the next offer of this process listens even so.
 void theWaitForTheSocketsEndsWithTheReload()
 {
-    Offer offer;
+    auto offer = std::make_unique<Offer>();
     auto const self = ::getpid();
     nix::Pipe said;
     said.create();
+    nix::Pipe goOn; // closed: the daemon exits
+    goOn.create();
     auto const reload = spawn([&] -> bool {
+        // Its daemon must see the test let it go, whatever else it holds.
+        goOn.writeSide.close();
+        // As ExecReload runs it: a process of its own, not a fork of the
+        // main process holding that one's offer.
+        keepOnly({said.writeSide.get(), goOn.readSide.get()});
         Detached const detached;
         char verdict = 'p';
         try {
@@ -445,13 +468,19 @@ void theWaitForTheSocketsEndsWithTheReload()
             verdict = std::string(err.what()).contains("gave up on the reload") ? 'g' : 't';
         }
         assert(::write(said.writeSide.get(), &verdict, 1) == 1);
+        char byte = 0;
+        (void) ::read(goOn.readSide.get(), &byte, 1);
         ::_exit(0);
     });
-    assert(next(offer, reload) == Event::requested);
+    goOn.readSide.close();
+    assert(next(*offer, reload) == Event::requested);
     ::kill(reload, SIGKILL);
     exitStatus(reload);
     assert(verdictOf(said) == 'g');
-    offer.reject();
+    offer->reject();
+    offer.reset();
+    offer = std::make_unique<Offer>(); // while that daemon lives
+    goOn.writeSide.close();
 }
 
 // systemd supervises a main process that is not its child as an alien: it
