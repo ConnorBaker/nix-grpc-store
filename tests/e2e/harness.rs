@@ -215,11 +215,17 @@ pub fn wait_for_unit(node: Node, unit: &str) {
     }
 }
 
+/// A shell test that something listens on `port`. Not a connect: a connect
+/// to a port in the ephemeral range (32768-60999 by default) that nothing
+/// listens on can be given that same port as its source and meet itself, a
+/// TCP simultaneous open, which finds the port open. If `ss` fails, so does
+/// the test, as when nothing listens.
+pub fn listening(port: u16) -> String {
+    format!("out=$(ss -Hltn 'sport = :{port}') && [ -n \"$out\" ]")
+}
+
 pub fn wait_for_open_port(node: Node, port: u16) {
-    wait_until_succeeds(
-        node,
-        &["bash", "-c", &format!(": < /dev/tcp/127.0.0.1/{port}")],
-    );
+    wait_until_succeeds(node, &["bash", "-c", &listening(port)]);
 }
 
 pub fn unit_state(node: Node, unit: &str) -> String {

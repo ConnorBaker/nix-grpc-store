@@ -1,5 +1,26 @@
 use crate::fixtures::*;
-use crate::harness::{MACHINE, journal_count, query, retry, unit_result};
+use crate::harness::{MACHINE, journal_count, listening, query, retry, unit_result};
+
+/// A port nothing listens on is not open, even when the kernel gives the
+/// probe that same port as its source. The probe runs in a network namespace
+/// of its own whose ephemeral range is that one port, so the narrowing
+/// reaches nothing else and needs no undoing.
+#[test]
+fn a_port_nothing_listens_on_is_not_open() {
+    // The daemon's socket unit listens on 50051.
+    succeed(&["bash", "-c", &listening(50051)]);
+    let port = 50057;
+    // In the namespace, an ss that failed in the if would read as closed; the
+    // ss before it, under set -e, ends the script first.
+    let script = format!(
+        "set -e; ip link set lo up; sysctl -qw net.ipv4.ip_local_port_range='{port} {port}'; \
+         ss -Hltn > /dev/null; \
+         if {}; then echo open; ss -Htan 'sport = :{port}'; else echo closed; fi",
+        listening(port)
+    );
+    let out = succeed(&["unshare", "-n", "bash", "-c", &script]);
+    assert_eq!(out.trim(), "closed", "{port} found open, nothing listening:\n{out}");
+}
 
 #[test]
 fn idle_exit_and_socket_activation() {
