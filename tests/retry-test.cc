@@ -17,6 +17,8 @@
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "bounce.hh"
+#include "build-answer.hh"
+#include "executor.hh"
 #include "retry.hh"
 
 namespace {
@@ -103,7 +105,11 @@ void classifiesWhatAWorkerAnswersApartFromCutOffs()
 // (Executor::bounced).
 void classifiesBounces()
 {
-    using nixgrpc::bounceOf;
+    // Unmarked (build-answer.hh): gRPC ended the call, or a worker that
+    // predates the mark answered.
+    auto const bounceOf = [](const grpc::Status & status) -> nixgrpc::exec::Bounce {
+        return nixgrpc::bounceOf(status, false);
+    };
     // A stream that broke mid-build, in each code gRPC gives it: the worker
     // builds on.
     assert(bounceOf({grpc::StatusCode::UNKNOWN, "Stream removed (RST_STREAM (Received RST_STREAM with error code 2))"}).held);
@@ -135,6 +141,22 @@ void classifiesBounces()
     assert(both.refused && !both.held);
     // An input recovered (Run::recover): uploaded again, or still missing.
     assert(!nixgrpc::inputGivenBack().held);
+    // Marked: the worker's own answer, whatever its message quotes. A worker
+    // shutting down that wraps a gRPC error, a build's log in a transient
+    // failure, a handler's error, in each code gRPC also ends a cut-off call
+    // with: given back. Unmarked, their text reads as a broken stream.
+    for (auto const & answer :
+         {unavailable("node: worker shutting down: cannot fetch: Stream removed"),
+          unavailable("node: builder for '/nix/store/x.drv' failed; last 1 log lines:\n> Stream removed"),
+          grpc::Status{grpc::StatusCode::INTERNAL, "node: Received RST_STREAM with error code 2"},
+          grpc::Status{grpc::StatusCode::UNKNOWN, "node: Stream removed"},
+          grpc::Status{grpc::StatusCode::CANCELLED, "Cancelling all calls"}}) {
+        assert(!nixgrpc::bounceOf(answer, true).held);
+        assert(bounceOf(answer).held);
+    }
+    // Another call builds it, said by the worker.
+    assert(nixgrpc::bounceOf({grpc::StatusCode::ABORTED, "superseded, another worker was already building this"}, true)
+               .held);
 }
 
 // A store query stuck on the server the way the daemon's are when nix does
@@ -208,6 +230,65 @@ void callCutOffByALeavingWorkerIsRetried()
         // `progressed`, so a store query retries within its first window.
         assert(nixgrpc::cutOff(status));
     }
+}
+
+// A worker whose BuildDerivation answers that it gives the build back, in
+// words that quote a broken stream; marked as main.cc marks its answers,
+// unless `marks` is off, as a worker that predates the mark.
+class GivesBack final : public nix::remote::NixRemote::Service
+{
+public:
+    explicit GivesBack(bool marks)
+        : marks(marks)
+    {
+    }
+
+    auto BuildDerivation(grpc::ServerContext * ctx, const nix::remote::BuildDerivationRequest * /*request*/,
+                         grpc::ServerWriter<nix::remote::BuildDerivationChunk> * /*writer*/) -> grpc::Status override
+    {
+        if (marks) {
+            nixgrpc::markAnswered(*ctx);
+        }
+        return unavailable("node: worker shutting down: cannot fetch: Stream removed");
+    }
+
+private:
+    bool marks;
+};
+
+// How a BuildDerivation the worker answers ends, over gRPC, as build.cc reads it.
+auto answeredBounce(bool marks) -> nixgrpc::exec::Bounce
+{
+    GivesBack service(marks);
+    grpc::ServerBuilder builder;
+    int port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    assert(server);
+    auto const stub = nix::remote::NixRemote::NewStub(
+        grpc::CreateChannel("127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
+    grpc::ClientContext ctx;
+    nix::remote::BuildDerivationRequest const request;
+    auto reader = stub->BuildDerivation(&ctx, request);
+    nix::remote::BuildDerivationChunk chunk;
+    while (reader->Read(&chunk)) {
+    }
+    auto const status = reader->Finish();
+    assert(status.error_code() == grpc::StatusCode::UNAVAILABLE);
+    assert(status.error_message().contains("Stream removed"));
+    server->Shutdown();
+    return nixgrpc::bounceOf(status, nixgrpc::answered(ctx));
+}
+
+// A worker's answer that gives the build back is not followed on, whatever
+// it quotes: the scheduler places the drv again at once.
+void aMarkedAnswerIsNoBrokenStream()
+{
+    assert(!answeredBounce(true).held);
+    // From a worker that predates the mark, the text alone reads as a
+    // broken stream.
+    assert(answeredBounce(false).held);
 }
 
 // An upload to the assigned worker that ends with one of these sends the
@@ -323,6 +404,7 @@ try {
     classifiesFarmErrors();
     classifiesWhatAWorkerAnswersApartFromCutOffs();
     classifiesBounces();
+    aMarkedAnswerIsNoBrokenStream();
     callCutOffByALeavingWorkerIsRetried();
     classifiesAWorkerThatLeft();
     retriesACallNoHandlerTookAtShutdown();

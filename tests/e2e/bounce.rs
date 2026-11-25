@@ -165,3 +165,19 @@ fn a_bounced_job_s_placements_do_not_starve_the_job_wanted_instead() {
 fn held_started(tag: &str) -> bool {
     run(&["pgrep", "-f", &format!("^sh -c mkfifo release; echo HELD-STARTED-{tag} ")]).code == 0
 }
+
+/// The worker marks every status its BuildDerivation handler returns
+/// (src/build-answer.hh), so its client tells a give-back whose message
+/// quotes a broken stream from a stream that broke (nixgrpc::buildGoesOn).
+/// Here one it refuses, a call in a protocol it does not speak.
+#[test]
+fn a_worker_marks_its_build_answers() {
+    let proto = env("NGS_PROTO");
+    let out = run(&[
+        "grpcurl", "-plaintext", "-v", "-import-path", &proto, "-proto", "nix_remote.proto", "-d",
+        r#"{"protocol": 0}"#, "127.0.0.1:50051", "nix.remote.NixRemote/BuildDerivation",
+    ]);
+    let text = out.combined();
+    assert!(text.contains("unsupported build protocol or mode"), "not the handler's answer: {text}");
+    assert!(text.contains("x-nix-answered: 1"), "the answer is not marked: {text}");
+}

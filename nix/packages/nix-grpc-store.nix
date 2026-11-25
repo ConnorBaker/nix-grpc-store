@@ -42,6 +42,7 @@ stdenv.mkDerivation {
         ../../meson.options
         ../../pch/client_pch.hh
         ../../proto/nix_remote.proto
+        ../../src/build-answer.hh
         ../../src/client
         ../../src/keepalive.hh
         ../../src/macro-compat.hh

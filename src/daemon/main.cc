@@ -81,6 +81,7 @@
 #include <nix/util/unix-domain-socket.hh>
 #include <nix/util/util.hh>
 
+#include "build-answer.hh"
 #include "build-log.hh"
 #include "acl.hh"
 #include "auth.hh"
@@ -1393,7 +1394,7 @@ public:
         const nix::remote::BuildDerivationRequest * request,
         BuildWriter * writer) -> grpc::Status override
     {
-        return guarded([&] -> grpc::Status {
+        auto status = guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "BuildDerivation", nixgrpc::Role::write, request->build_mode());
             // The whole call, attachers too: the drain waits for it.
             nixgrpc::Metrics::Held const inflight(metrics, "BuildDerivation");
@@ -1472,6 +1473,10 @@ public:
                  {"input_s", std::to_string(static_cast<int>(inputs.seconds))}});
             return grpc::Status::OK;
         });
+        // So the client tells this answer from a stream that broke under the
+        // call, whatever its message quotes (nixgrpc::buildGoesOn).
+        nixgrpc::markAnswered(*context);
+        return status;
     }
 
     auto FetchNars(
