@@ -13,7 +13,7 @@
 # may still be in its shutdown grace when the pipe is read. Readings and
 # steps, not a clock, bound every wait; the one for the startup line ends at
 # the line, the daemon's exit, or its sleep with nothing logged,
-# IDLE_READINGS readings of a tenth of a second running. The test holds the pipe's write
+# testdaemon.IDLE_READINGS readings of a tenth of a second running. The test holds the pipe's write
 # end for the filler, so the daemon's exit is seen from its pidfd, not from
 # the pipe's end.
 #
@@ -38,26 +38,6 @@ ka = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ka)
 
 STEPS = 1_000_000
-# Readings of a daemon asleep, every thread of it, with nothing new on its
-# stderr, after which it is taken never to log its startup line.
-IDLE_READINGS = 100
-
-
-def asleep(pid):
-    """Every thread of `pid` asleep (none, once it is gone)."""
-    try:
-        names = os.listdir(f"/proc/{pid}/task")
-    except OSError:
-        return False
-    states = []
-    for name in names:
-        try:
-            with open(f"/proc/{pid}/task/{name}/stat") as f:
-                line = f.readline()
-        except OSError:
-            continue
-        states.append(line[line.rfind(")") + 2])
-    return bool(states) and all(s == "S" for s in states)
 SYS_WRITE = {"x86_64": 1, "aarch64": 64}[os.uname().machine]
 
 
@@ -125,8 +105,8 @@ def main():
                 if gone in ready:
                     print(f"SETUP FAIL: the daemon exited ({proc.wait()}) before its startup line\n{out.decode(errors='replace')}")
                     return 2
-                idle = idle + 1 if asleep(proc.pid) else 0
-                if idle >= IDLE_READINGS:
+                idle = idle + 1 if testdaemon.asleep(proc.pid) else 0
+                if idle >= testdaemon.IDLE_READINGS:
                     print(f"SETUP FAIL: the daemon sleeps with no startup line\n{out.decode(errors='replace')}")
                     return 2
                 continue

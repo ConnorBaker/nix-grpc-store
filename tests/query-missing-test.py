@@ -38,7 +38,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.request
 
 import testdaemon
@@ -46,7 +45,6 @@ import testdaemon
 CHAIN = 200
 BUILT = 100
 BUDGET = 64  # topDownBudget in src/top-down.hh
-SETUP_S = 30
 CLIENT_S = 120
 
 
@@ -86,7 +84,7 @@ def main():
         env=nix_env(os.path.join(tmp, "daemon-home")),
     )
     try:
-        ports = testdaemon.bound(proc, log, time.monotonic() + SETUP_S)
+        ports = testdaemon.bound(proc, log)
         if ports is None:
             print(f"SETUP FAIL: no startup line with the bound ports; daemon exit {proc.poll()}")
             return 2

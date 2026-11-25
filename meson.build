@@ -308,6 +308,10 @@ if build_server
   test('testdaemon', find_program('python3'),
     args : [files('tests/testdaemon-test.py')],
   )
+  # Nor does it wait for good on a daemon that never logs its startup line.
+  test('testdaemon-bound', find_program('python3'),
+    args : [files('tests/testdaemon-bound-test.py')],
+  )
 
   # A client that vanished without closing its connection must not keep its
   # builds wanted: the daemon ends its Schedule stream, and the build only
