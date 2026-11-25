@@ -9,10 +9,12 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -34,9 +36,11 @@
 #include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h> // NOLINT(modernize-deprecated-headers): tzset is POSIX, not in <ctime>.
 #include <unistd.h>
 
 #include <signal.h> // NOLINT(modernize-deprecated-headers): kill is POSIX, not in <csignal>.
@@ -837,6 +841,73 @@ void aChildForkedWhileTheWriterGoesLogs()
     std::filesystem::remove_all(dir);
 }
 
+// glibc's gmtime_r takes its time-zone lock, and a child of fork has that
+// lock as the thread that forked found it: held for good, if another thread
+// held it then. The daemon's child of a takeover is the daemon that goes on,
+// and logs. A thread of ours reads a time zone from a fifo nobody writes,
+// holding that lock while it waits to open it; once it is found so, we fork,
+// and the child logs. Its line must go out, and its time be the one gmtime_r
+// gives for the clock the line reads, read before and after.
+void aChildForkedWhileTheTimeZoneIsReadLogs()
+{
+    auto const dir = freshDir();
+    auto const file = dir / "stderr";
+    auto const zone = dir / "zone";
+    assert(mkfifo(zone.c_str(), 0600) == 0);
+    auto const utcNow = [] -> std::string {
+        std::time_t const now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm utc{};
+        gmtime_r(&now, &utc);
+        std::array<char, sizeof("ts=2000-01-01T00:00:00Z")> text{};
+        static_cast<void>(std::strftime(text.data(), text.size(), "ts=%Y-%m-%dT%H:%M:%SZ", &utc));
+        return text.data();
+    };
+    auto const before = utcNow();
+    assert(setenv("TZ", zone.c_str(), 1) == 0); // NOLINT(concurrency-mt-unsafe): no other thread reads the environment.
+    std::atomic<pid_t> readerTid = 0;
+    std::thread reader([&] -> void {
+        readerTid = gettid();
+        tzset();
+    });
+    bool opening = false;
+    for (int i = 0; i < steps && !opening; i++) {
+        auto const task = "/proc/self/task/" + std::to_string(readerTid.load());
+        std::istringstream fields(firstLine(task + "/syscall"));
+        long number = -1;
+        opening = readerTid != 0 && state(task) == 'S' && fields >> number && number == SYS_openat;
+        std::this_thread::yield();
+    }
+    assert(opening && "the time zone's reader was not found opening it");
+    pid_t const child = fork();
+    if (child == 0) {
+        int const out = open(file.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600); // NOLINT(cppcoreguidelines-pro-type-vararg)
+        if (out < 0 || dup2(out, STDERR_FILENO) < 0) {
+            std::_Exit(2);
+        }
+        nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "childs"}});
+        nixgrpc::flushLog();
+        std::_Exit(0);
+    }
+    int status = 0;
+    bool const exited = child > 0 && exitedUnstuck(child, status);
+    // The reader opens the fifo, finds it empty, and lets the lock go.
+    close(open(zone.c_str(), O_WRONLY | O_CLOEXEC)); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    reader.join();
+    // TZ stays the fifo's: nothing after reads the time zone anew.
+    auto const after = utcNow();
+    auto const text = textOf(file);
+    auto const stamp = text.substr(0, text.find(' '));
+    std::println("logfmt-test: forked while the time zone is read: exited={} status={:#x} line={}", exited, status, text.substr(0, text.find('\n')));
+    static_cast<void>(std::fflush(stdout)); // before an assertion ends us
+    assert(child > 0);
+    assert(exited && "a child of fork waited for good for the time-zone lock its parent held");
+    // NOLINTNEXTLINE(misc-include-cleaner): <sys/wait.h> has them.
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(text.contains("event=childs") && "a line a child of fork logged is missing");
+    assert(stamp.size() == before.size() && before <= stamp && stamp <= after && "a line's time is not the one gmtime_r gives");
+    std::filesystem::remove_all(dir);
+}
+
 // The log writer holds no lock while our stderr's reader holds up its
 // write: a thread that writes to stderr itself (Nix's logger, gRPC's) then
 // waits in a write of its own, not on a lock behind the writer. With our
@@ -1301,6 +1372,7 @@ try {
     aForkedChildsWriterWakes(true, "stalled");
     aLineLoggedWhileTheWriterGoesWaits();
     aChildForkedWhileTheWriterGoesLogs();
+    aChildForkedWhileTheTimeZoneIsReadLogs();
     aCrashInsideMallocStillLeaves();
     leavesWithItsLines(Leave::exit, "exit");
     leavesWithItsLines(Leave::exitLogged, "exitLogged");
