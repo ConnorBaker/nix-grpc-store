@@ -101,10 +101,11 @@ Base `main` commit: `01cabbdb45165d355cae4e0c16053d0581dfba71`
 | 66 | `client-bounce-residuals` | `6c08d5100390c7b5d6aa06a5e85f7e4d1c78850b` | `integration` `4ffd5d0c` | changes the client's bounce handling (bounce.hh, build.cc, executor.hh, store.hh), marks the daemon's BuildDerivation answers (main.cc, new src/build-answer.hh, listed in nix/packages/nix-grpc-store.nix for the plugin), and extends the unit tests and the VM check `bounce` | Client: cancel a job given back for an input this run has done; tell a worker's answer from a broken stream by a mark the worker sets |  |
 | 67 | `vm-tests-wait-listening` | `138ad2440f8d37c6e224ca88f630d262b6887e73` | `integration` `f896337a` | changes tests/lib/waits.nix and the VM tests that wait with it, which upstream `main` does not have (its tests use the driver's `wait_for_open_port`) | Tests: wait for a VM's port until something listens on it |  |
 | 68 | `log-time-without-tz-lock` | `2ea9de0bfa114c0241e79472db0c5f8c129fde03` | `integration` `18fdbe55` | its test is in tests/logfmt-test.cc, which `daemon-stderr-own-threads` adds and upstream `main` does not have | Logging: format a line's time without glibc's time-zone lock, so that a child of fork whose parent held that lock can log |  |
+| 69 | `startup-line-idle-bound` | `22de7279ce903006ec98562ea0f5fea4f8a77141` | `integration` `18fdbe55` | changes tests/testdaemon.py, its callers and stalled-stderr-test.py, which upstream `main` does not have | Tests: end the wait for a daemon's startup line once every thread of the daemon sleeps with its log unchanged |  |
 
 `build-client-session-name` is merged a second time after merge 61, at the head row 49 names, which adds `Type=notify` to its recorded daemon units and keeps its nix-daemon recorder alive across a refused connection. Its first merge (49) took `1b3840b7de501dcb9d139f48bd44b7e325b696e7`.
 
-25 of the 69 topic merges resolve overlaps (21 of the first 46, `farm-admission-by-machines`, `takeover-liveness-to-main`, `wait-port-listening` and `daemon-stderr-own-threads`), and so do both upstream merges; each names its files in its message.
+25 of the 70 topic merges resolve overlaps (21 of the first 46, `farm-admission-by-machines`, `takeover-liveness-to-main`, `wait-port-listening` and `daemon-stderr-own-threads`), and so do both upstream merges; each names its files in its message.
 
 The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
 
