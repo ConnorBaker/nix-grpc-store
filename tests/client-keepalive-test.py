@@ -36,7 +36,6 @@
 #
 # usage: client-keepalive-test.py <nix-grpc-daemon> <keepalive-client> <store-query-client> <plugin>
 # exit 0: pass, 1: fail, 2: the test never reached the state it tests.
-import math
 import re
 import socket
 import struct
@@ -308,7 +307,7 @@ def main():
 
     try:
         # Its startup line names the ports it bound: wait for it, or its exit.
-        ports = testdaemon.bound(proc, log, math.inf)
+        ports = testdaemon.bound(proc, log)
         if ports is None:
             return setup_fail(f"no startup line with the bound ports; daemon exit {proc.poll()}")
         port, mport = ports

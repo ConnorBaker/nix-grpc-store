@@ -16,7 +16,6 @@
 # usage: built-here-test.py <nix-grpc-daemon> <local-store-test>
 # exit 0: pass, 1: fail, 2: the test never reached the state it tests.
 import importlib.util
-import math
 import os
 import socket
 import struct
@@ -58,7 +57,7 @@ def main():
         return 1
 
     try:
-        ports = testdaemon.bound(proc, log, math.inf)
+        ports = testdaemon.bound(proc, log)
         if ports is None:
             return setup_fail(f"no startup line with the bound ports; daemon exit {proc.poll()}")
         port, mport = ports

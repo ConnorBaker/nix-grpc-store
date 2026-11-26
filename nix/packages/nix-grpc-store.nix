@@ -62,6 +62,7 @@ stdenv.mkDerivation {
         ../../tests/keepalive-test.py
         ../../tests/testdaemon.py
         ../../tests/testdaemon-test.py
+        ../../tests/testdaemon-bound-test.py
         ../../tests/built-here-test.py
         ../../tests/stalled-stderr-test.py
         ../../tests/client-keepalive-test.py

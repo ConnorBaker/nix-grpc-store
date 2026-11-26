@@ -24,7 +24,6 @@
 #
 # usage: keepalive-test.py <nix-grpc-daemon>
 # exit 0: pass, 1: fail, 2: the test never reached the state it tests.
-import math
 import os
 import re
 import socket
@@ -228,7 +227,7 @@ def main():
 
     try:
         # Its startup line names the ports it bound: wait for it, or its exit.
-        ports = testdaemon.bound(proc, log, math.inf)
+        ports = testdaemon.bound(proc, log)
         if ports is None:
             return setup_fail(f"no startup line with the bound ports; daemon exit {proc.poll()}")
         port, mport = ports
